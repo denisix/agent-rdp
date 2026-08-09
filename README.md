@@ -72,7 +72,7 @@ agent-rdp screenshot --output desktop.png
 agent-rdp --json screenshot --output desktop.png
 ```
 
-> Note: the CLI no longer has `screenshot --base64`. For agent pipelines, write a file and encode it yourself, or use the Node.js API (`rdp.screenshot()`), which still returns `{ base64, width, height }`.
+> Note: the CLI no longer has `screenshot --base64`. For agent pipelines, write a file and encode it yourself, or use the Node.js API's `rdp.screenshot({ path })`, which writes to disk and returns `{ path, width, height }` without materializing base64 — prefer this over the default `rdp.screenshot()` (which returns `{ base64, width, height }`) when the caller doesn't need the raw bytes, since echoing a base64 image into an LLM context is expensive.
 
 ### Mouse Operations
 
@@ -339,8 +339,12 @@ await rdp.connect({
   enableWinAutomation: true,  // Enable UI Automation
 });
 
-// Screenshot
-const { base64, width, height } = await rdp.screenshot({ format: 'png' });
+// Screenshot - prefer `path` so a large base64 string never has to be
+// held in memory or echoed into an agent's context
+const { path, width, height } = await rdp.screenshot({ format: 'png', path: 'screenshot.png' });
+
+// Or get raw base64 directly (e.g. for further in-process processing)
+const { base64 } = await rdp.screenshot({ format: 'png' });
 
 // Mouse
 await rdp.mouse.click({ x: 100, y: 200 });

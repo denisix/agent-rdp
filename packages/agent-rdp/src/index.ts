@@ -15,13 +15,14 @@
  *   password: 'secret',
  * });
  *
- * const { base64 } = await rdp.screenshot();
+ * const { path, width, height } = await rdp.screenshot({ path: 'screenshot.png' });
  * await rdp.mouse.click({ x: 100, y: 200 });
  * await rdp.keyboard.type({ text: 'Hello World' });
  * await rdp.disconnect();
  * ```
  */
 
+import * as fs from 'node:fs';
 import { IpcClient } from './client.js';
 import { DaemonManager } from './daemon.js';
 import { AutomationController } from './automation.js';
@@ -30,6 +31,7 @@ import {
   ConnectResult,
   ScreenshotOptions,
   ScreenshotResult,
+  ScreenshotFileResult,
   SessionInfo,
   MappedDrive,
   MouseClickOptions,
@@ -258,8 +260,18 @@ export class RdpSession {
 
   /**
    * Take a screenshot.
+   *
+   * Pass `path` to write the image to disk and get back just the path and
+   * dimensions, instead of a base64 string. Prefer `path` when the caller
+   * (e.g. an AI agent) doesn't need the raw bytes in memory — returning
+   * base64 to a caller that echoes results into an LLM context can burn a
+   * large number of tokens for a single screenshot.
    */
-  async screenshot(options: ScreenshotOptions = {}): Promise<ScreenshotResult> {
+  async screenshot(options: ScreenshotOptions & { path: string }): Promise<ScreenshotFileResult>;
+  async screenshot(options?: ScreenshotOptions): Promise<ScreenshotResult>;
+  async screenshot(
+    options: ScreenshotOptions = {},
+  ): Promise<ScreenshotResult | ScreenshotFileResult> {
     const response = await this._send({
       type: 'screenshot',
       format: options.format ?? 'png',
@@ -272,6 +284,16 @@ export class RdpSession {
       format: string;
       base64: string;
     };
+
+    if (options.path) {
+      fs.writeFileSync(options.path, Buffer.from(data.base64, 'base64'));
+      return {
+        path: options.path,
+        width: data.width,
+        height: data.height,
+        format: data.format,
+      };
+    }
 
     return {
       base64: data.base64,

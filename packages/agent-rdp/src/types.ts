@@ -89,9 +89,25 @@ export interface ConnectResult {
 /** Options for taking a screenshot. */
 export interface ScreenshotOptions {
   format?: 'png' | 'jpeg';
+  /**
+   * Write the image to this file path instead of returning it as base64.
+   * Use this when the caller doesn't need the raw image bytes in memory
+   * (e.g. an AI agent that only needs the path/dimensions) — it avoids
+   * materializing a large base64 string that would otherwise burn a lot
+   * of tokens if echoed back into an LLM context.
+   */
+  path?: string;
 }
 
-/** Result of a screenshot operation. */
+/** Result of a screenshot operation saved to disk (see `ScreenshotOptions.path`). */
+export interface ScreenshotFileResult {
+  path: string;
+  width: number;
+  height: number;
+  format: string;
+}
+
+/** Result of a screenshot operation returned as base64. */
 export interface ScreenshotResult {
   base64: string;
   width: number;
