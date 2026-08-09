@@ -534,18 +534,25 @@ function Invoke-Run {
     param($Params)
 
     $command = $Params.command
-    $commandArgs = if ($Params.args) { $Params.args -join " " } else { "" }
+    # Quote each argument as a PowerShell single-quoted string literal (doubling
+    # embedded single quotes) so args containing spaces or quotes survive as one
+    # token when re-parsed by the -Command string below.
+    $commandArgs = if ($Params.args) {
+        ($Params.args | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join " "
+    } else { "" }
     $wait = if ($null -ne $Params.wait) { $Params.wait } else { $false }
     $hidden = if ($null -ne $Params.hidden) { $Params.hidden } else { $false }
     $timeoutMs = if ($Params.timeout_ms) { [int]$Params.timeout_ms } else { 10000 }
+    $shell = if ($Params.shell) { $Params.shell } else { "powershell.exe" }
+    $stream = if ($null -ne $Params.stream) { $Params.stream } else { $false }
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = "powershell.exe"
+    $startInfo.FileName = $shell
     $startInfo.Arguments = "-NoProfile -Command `"$command $commandArgs`""
     $startInfo.WorkingDirectory = $env:USERPROFILE
     $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardOutput = $wait
-    $startInfo.RedirectStandardError = $wait
+    $startInfo.RedirectStandardOutput = $wait -or $stream
+    $startInfo.RedirectStandardError = $wait -or $stream
     $startInfo.CreateNoWindow = $hidden
 
     $process = [System.Diagnostics.Process]::Start($startInfo)
@@ -571,10 +578,91 @@ function Invoke-Run {
             stdout = $stdoutTask.Result
             stderr = $stderrTask.Result
         }
+    } elseif ($stream) {
+        # Buffer output as it arrives via events so Invoke-RunPoll can hand back
+        # incremental chunks without blocking on the process exiting.
+        $state = [PSCustomObject]@{
+            Process    = $process
+            StdoutBuf  = [System.Text.StringBuilder]::new()
+            StderrBuf  = [System.Text.StringBuilder]::new()
+            Lock       = [System.Object]::new()
+        }
+
+        $stdoutAction = {
+            if ($null -ne $Event.SourceEventArgs.Data) {
+                $s = $Event.MessageData
+                [System.Threading.Monitor]::Enter($s.Lock)
+                try { [void]$s.StdoutBuf.AppendLine($Event.SourceEventArgs.Data) }
+                finally { [System.Threading.Monitor]::Exit($s.Lock) }
+            }
+        }
+        $stderrAction = {
+            if ($null -ne $Event.SourceEventArgs.Data) {
+                $s = $Event.MessageData
+                [System.Threading.Monitor]::Enter($s.Lock)
+                try { [void]$s.StderrBuf.AppendLine($Event.SourceEventArgs.Data) }
+                finally { [System.Threading.Monitor]::Exit($s.Lock) }
+            }
+        }
+
+        Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -MessageData $state -Action $stdoutAction | Out-Null
+        Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -MessageData $state -Action $stderrAction | Out-Null
+        $process.BeginOutputReadLine()
+        $process.BeginErrorReadLine()
+
+        if ($null -eq $script:StreamedProcesses) {
+            $script:StreamedProcesses = @{}
+        }
+        $script:StreamedProcesses[$process.Id] = $state
+
+        return @{
+            pid = $process.Id
+        }
     } else {
         return @{
             pid = $process.Id
         }
+    }
+}
+
+function Invoke-RunPoll {
+    param($Params)
+
+    $targetPid = [int]$Params.pid
+
+    if ($null -eq $script:StreamedProcesses -or -not $script:StreamedProcesses.ContainsKey($targetPid)) {
+        throw "No streamed process with pid $targetPid (either it was never started with run --stream, or it has already been fully polled after exit)"
+    }
+
+    $state = $script:StreamedProcesses[$targetPid]
+    $process = $state.Process
+
+    [System.Threading.Monitor]::Enter($state.Lock)
+    try {
+        $stdoutChunk = $state.StdoutBuf.ToString()
+        $stderrChunk = $state.StderrBuf.ToString()
+        [void]$state.StdoutBuf.Clear()
+        [void]$state.StderrBuf.Clear()
+    } finally {
+        [System.Threading.Monitor]::Exit($state.Lock)
+    }
+
+    $exited = $process.HasExited
+    $exitCode = $null
+    if ($exited) {
+        $exitCode = $process.ExitCode
+        # Process has exited and this poll drained the final buffered output;
+        # forget it so future polls with the same (recycled) pid don't return
+        # stale state.
+        $script:StreamedProcesses.Remove($targetPid)
+    }
+
+    return @{
+        pid = $targetPid
+        stdout_chunk = $stdoutChunk
+        stderr_chunk = $stderrChunk
+        exited = $exited
+        exit_code = $exitCode
     }
 }
 

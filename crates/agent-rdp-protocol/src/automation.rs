@@ -151,6 +151,22 @@ pub enum AutomateRequest {
         #[serde(default = "default_run_timeout")]
         #[ts(type = "number")]
         timeout_ms: u64,
+        /// Shell executable to run the command through (default: powershell.exe).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        shell: Option<String>,
+        /// Redirect stdout/stderr and keep the process alive for incremental
+        /// retrieval via `RunPoll`, instead of waiting for exit or discarding
+        /// output. Ignored if `wait` is also true.
+        #[serde(default)]
+        stream: bool,
+    },
+
+    /// Poll a process previously started with `Run { stream: true, .. }` for
+    /// output produced since the last poll.
+    RunPoll {
+        /// Process ID returned by the initial `Run` call.
+        pid: u32,
     },
 
     /// Wait for an element to reach a state.
@@ -381,6 +397,26 @@ pub struct RunResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub pid: Option<u32>,
+}
+
+/// Incremental output from a process started with `Run { stream: true, .. }`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct RunPollResult {
+    /// Process ID that was polled.
+    pub pid: u32,
+    /// Standard output produced since the last poll.
+    #[serde(default)]
+    pub stdout_chunk: String,
+    /// Standard error produced since the last poll.
+    #[serde(default)]
+    pub stderr_chunk: String,
+    /// Whether the process has exited.
+    pub exited: bool,
+    /// Exit code, present once `exited` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub exit_code: Option<i32>,
 }
 
 /// Click action result.

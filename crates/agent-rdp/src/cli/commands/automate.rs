@@ -107,13 +107,19 @@ pub async fn run(
             wait,
             hidden,
             process_timeout,
+            shell,
+            stream,
         } => AutomateRequest::Run {
             command,
             args: cmd_args,
             wait,
             hidden,
             timeout_ms: process_timeout.unwrap_or(10000),
+            shell,
+            stream,
         },
+
+        AutomateAction::RunPoll { pid } => AutomateRequest::RunPoll { pid },
 
         AutomateAction::WaitFor {
             selector,

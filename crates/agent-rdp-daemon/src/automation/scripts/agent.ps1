@@ -69,7 +69,7 @@ function Start-Agent {
     $capabilities = @(
         "snapshot", "click", "select", "toggle", "expand", "collapse",
         "context_menu", "focus", "get", "fill", "clear",
-        "scroll", "window", "run", "wait_for", "status"
+        "scroll", "window", "run", "run_poll", "wait_for", "status"
     )
 
     try {
@@ -130,6 +130,7 @@ function Start-Agent {
                     "scroll"       { Invoke-Scroll -Params $request.params }
                     "window"       { Invoke-Window -Params $request.params }
                     "run"          { Invoke-Run -Params $request.params }
+                    "run_poll"     { Invoke-RunPoll -Params $request.params }
                     "wait_for"     { Invoke-WaitFor -Params $request.params }
                     "status"       { Get-AgentStatus }
                     default        { throw "Unknown command: $($request.command)" }

@@ -5,6 +5,7 @@ import type { ClickResult } from "./ClickResult.js";
 import type { ElementValue } from "./ElementValue.js";
 import type { LocateResult } from "./LocateResult.js";
 import type { MappedDrive } from "./MappedDrive.js";
+import type { RunPollResult } from "./RunPollResult.js";
 import type { RunResult } from "./RunResult.js";
 import type { SessionInfo } from "./SessionInfo.js";
 import type { SessionSummary } from "./SessionSummary.js";
@@ -57,4 +58,4 @@ sessions: Array<SessionSummary>, } | { "type": "pong" } | { "type": "snapshot" }
 /**
  * List of windows.
  */
-windows: Array<WindowInfo>, } | { "type": "automation_status" } & AutomationStatus | { "type": "run_result" } & RunResult | { "type": "click_result" } & ClickResult | { "type": "locate_result" } & LocateResult;
+windows: Array<WindowInfo>, } | { "type": "automation_status" } & AutomationStatus | { "type": "run_result" } & RunResult | { "type": "run_poll_result" } & RunPollResult | { "type": "click_result" } & ClickResult | { "type": "locate_result" } & LocateResult;

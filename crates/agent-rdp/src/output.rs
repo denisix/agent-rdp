@@ -160,6 +160,24 @@ impl Output {
                     println!("Process ID: {}", pid);
                 }
             }
+            ResponseData::RunPollResult(result) => {
+                if !result.stdout_chunk.is_empty() {
+                    println!("{}", result.stdout_chunk);
+                }
+                if !result.stderr_chunk.is_empty() {
+                    eprintln!("{}", result.stderr_chunk);
+                }
+                if result.exited {
+                    println!(
+                        "Process {} exited{}",
+                        result.pid,
+                        result
+                            .exit_code
+                            .map(|c| format!(" (code {})", c))
+                            .unwrap_or_default()
+                    );
+                }
+            }
             ResponseData::LocateResult(result) => {
                 if result.matches.is_empty() {
                     println!("No matches found ({} words detected)", result.total_words);

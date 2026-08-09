@@ -9,6 +9,7 @@ import type {
   AutomationWindowInfo,
   AutomationStatus,
   AutomationRunResult,
+  AutomationRunPollResult,
   AutomationClickResult,
 } from './types.js';
 
@@ -56,6 +57,14 @@ export interface RunOptions {
   hidden?: boolean;
   /** Process timeout in milliseconds when waiting (default: 10000). */
   processTimeout?: number;
+  /** Shell executable to run the command through (default: powershell.exe). */
+  shell?: string;
+  /**
+   * Redirect output and keep the process alive for incremental retrieval via
+   * `automation.runPoll(pid)`, instead of waiting for exit or discarding
+   * output. Ignored if `wait` is also true.
+   */
+  stream?: boolean;
 }
 
 export interface WaitForOptions {
@@ -346,8 +355,23 @@ export class AutomationController {
       wait: options.wait ?? false,
       hidden: options.hidden ?? true,
       timeout_ms: options.processTimeout ?? 10000,
+      shell: options.shell,
+      stream: options.stream ?? false,
     });
     return response.data as unknown as AutomationRunResult;
+  }
+
+  /**
+   * Poll a process previously started with `run(cmd, { stream: true })` for
+   * output produced since the last poll.
+   */
+  async runPoll(pid: number): Promise<AutomationRunPollResult> {
+    const response = await this.rdp._send({
+      type: 'automate' as const,
+      op: 'run_poll' as const,
+      pid,
+    });
+    return response.data as unknown as AutomationRunPollResult;
   }
 
   /**

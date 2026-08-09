@@ -30,6 +30,7 @@ export type { OcrMatch } from './OcrMatch.js';
 export type { Request } from './Request.js';
 export type { Response } from './Response.js';
 export type { ResponseData } from './ResponseData.js';
+export type { RunPollResult } from './RunPollResult.js';
 export type { RunResult } from './RunResult.js';
 export type { ScreenshotRequest } from './ScreenshotRequest.js';
 export type { ScrollDirection } from './ScrollDirection.js';

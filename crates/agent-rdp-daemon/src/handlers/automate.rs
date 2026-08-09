@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use agent_rdp_protocol::{
     AccessibilityElement, AccessibilitySnapshot, AutomateRequest, AutomationStatus, ClickResult,
-    ElementBounds, ElementValue, ErrorCode, Response, ResponseData, RunResult, WindowInfo,
+    ElementBounds, ElementValue, ErrorCode, Response, ResponseData, RunPollResult, RunResult,
+    WindowInfo,
 };
 use tokio::sync::Mutex;
 use tracing::error;
@@ -117,6 +118,16 @@ fn convert_response(request: AutomateRequest, data: serde_json::Value) -> Respon
                 match parse_run_response(data) {
                     Ok(result) => Response::success(ResponseData::RunResult(result)),
                     Err(_) => Response::ok(),
+                }
+            }
+        }
+
+        AutomateRequest::RunPoll { .. } => {
+            match parse_run_poll_response(data) {
+                Ok(result) => Response::success(ResponseData::RunPollResult(result)),
+                Err(e) => {
+                    error!("Failed to parse run_poll response: {}", e);
+                    Response::error(ErrorCode::AutomationError, e.to_string())
                 }
             }
         }
@@ -315,6 +326,25 @@ fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
         stdout,
         stderr,
         pid,
+    })
+}
+
+/// Parse run_poll response from PowerShell agent.
+fn parse_run_poll_response(data: serde_json::Value) -> anyhow::Result<RunPollResult> {
+    let pid = data["pid"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("run_poll response missing pid"))? as u32;
+    let stdout_chunk = data["stdout_chunk"].as_str().unwrap_or("").to_string();
+    let stderr_chunk = data["stderr_chunk"].as_str().unwrap_or("").to_string();
+    let exited = data["exited"].as_bool().unwrap_or(false);
+    let exit_code = data["exit_code"].as_i64().map(|v| v as i32);
+
+    Ok(RunPollResult {
+        pid,
+        stdout_chunk,
+        stderr_chunk,
+        exited,
+        exit_code,
     })
 }
 

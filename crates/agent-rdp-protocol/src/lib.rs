@@ -223,6 +223,8 @@ mod codegen {
                     wait: false,
                     hidden: false,
                     timeout_ms: 10000,
+                    shell: None,
+                    stream: false,
                 },
             ),
             (
@@ -233,6 +235,8 @@ mod codegen {
                     wait: true,
                     hidden: true,
                     timeout_ms: 5000,
+                    shell: Some("pwsh.exe".to_string()),
+                    stream: false,
                 },
             ),
             (
@@ -340,6 +344,7 @@ mod codegen {
             AutomateRequest::Scroll { .. } => "scroll",
             AutomateRequest::Window { .. } => "window",
             AutomateRequest::Run { .. } => "run",
+            AutomateRequest::RunPoll { .. } => "run_poll",
             AutomateRequest::WaitFor { .. } => "wait_for",
             AutomateRequest::Status => "status",
         }

@@ -473,6 +473,22 @@ pub enum AutomateAction {
         /// Process timeout in milliseconds when waiting (default: 10000)
         #[arg(long = "process-timeout")]
         process_timeout: Option<u64>,
+
+        /// Shell executable to run the command through (default: powershell.exe)
+        #[arg(long)]
+        shell: Option<String>,
+
+        /// Redirect output and keep the process alive for incremental
+        /// retrieval via `automate run-poll <pid>`, instead of waiting for
+        /// exit or discarding output. Ignored if --wait is also set.
+        #[arg(long)]
+        stream: bool,
+    },
+
+    /// Poll a process started with `run --stream` for output produced since the last poll
+    RunPoll {
+        /// Process ID returned by the initial `run --stream` call
+        pid: u32,
     },
 
     /// Wait for an element to reach a state

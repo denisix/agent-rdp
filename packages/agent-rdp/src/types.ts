@@ -177,6 +177,9 @@ export type { WindowInfo as AutomationWindowInfo } from './generated/index.js';
 /** Run command result (alias for RunResult). */
 export type { RunResult as AutomationRunResult } from './generated/index.js';
 
+/** Incremental run-poll result (alias for RunPollResult). */
+export type { RunPollResult as AutomationRunPollResult } from './generated/index.js';
+
 /** Click result (alias for ClickResult). */
 export type { ClickResult as AutomationClickResult } from './generated/index.js';
 

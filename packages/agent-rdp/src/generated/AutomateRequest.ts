@@ -130,7 +130,21 @@ hidden: boolean,
 /**
  * Timeout in milliseconds when waiting.
  */
-timeout_ms: number, } | { "op": "wait_for", 
+timeout_ms: number, 
+/**
+ * Shell executable to run the command through (default: powershell.exe).
+ */
+shell?: string, 
+/**
+ * Redirect stdout/stderr and keep the process alive for incremental
+ * retrieval via `RunPoll`, instead of waiting for exit or discarding
+ * output. Ignored if `wait` is also true.
+ */
+stream: boolean, } | { "op": "run_poll", 
+/**
+ * Process ID returned by the initial `Run` call.
+ */
+pid: number, } | { "op": "wait_for", 
 /**
  * Element selector.
  */
