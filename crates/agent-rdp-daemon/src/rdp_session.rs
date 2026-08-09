@@ -345,7 +345,29 @@ impl RdpSession {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
         };
 
-        let tls_stream = connector.connect(server_name, stream).await?;
+        let tls_stream = connector.connect(server_name, stream).await.map_err(|e| {
+            // rustls deliberately never implements TLS below 1.2, so a peer that
+            // resets the connection during the handshake is commonly a legacy
+            // server (e.g. Windows Server 2008 R2 / TLS 1.0-only) rejecting our
+            // ClientHello, not a transient network glitch. Surface that distinction
+            // instead of the generic "Connection reset by peer" message.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "TLS handshake was reset by the server ({e}). This usually means the \
+                         target only supports TLS 1.0/1.1 or legacy cipher suites, which agent-rdp \
+                         (via rustls) does not support. Legacy Windows targets (e.g. Server 2008 R2) \
+                         are not currently supported; see agent-rdp issue #73 for status."
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
 
         // Get peer certificate
         let (_, server_conn) = tls_stream.get_ref();
