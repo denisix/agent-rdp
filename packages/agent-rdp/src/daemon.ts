@@ -21,7 +21,7 @@ const require = createRequire(import.meta.url);
 function getPlatformPackage(): string {
   const platform = process.platform; // 'darwin', 'linux', 'win32'
   const arch = process.arch; // 'arm64', 'x64'
-  return `@agent-rdp/${platform}-${arch}`;
+  return `@denisix/agent-rdp-${platform}-${arch}`;
 }
 
 /**

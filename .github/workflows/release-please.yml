@@ -240,7 +240,7 @@ jobs:
             const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
             for (const [name, range] of Object.entries(pkg.optionalDependencies || {})) {
               if (!range.startsWith('workspace:')) continue;
-              const platform = name.replace('@agent-rdp/', '');
+              const platform = name.replace('@denisix/agent-rdp-', '');
               const depPkg = JSON.parse(fs.readFileSync(path.join('packages', platform, 'package.json'), 'utf8'));
               pkg.optionalDependencies[name] = '^' + depPkg.version;
             }
@@ -250,7 +250,7 @@ jobs:
       - name: Publish platform packages
         run: |
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64 win32-arm64; do
-            echo "Publishing @agent-rdp/$platform..."
+            echo "Publishing @denisix/agent-rdp-$platform..."
             npm publish --access public --provenance packages/$platform
           done
 

@@ -136,7 +136,7 @@ ci: CI changes               # No version bump, hidden from changelog
 4. Tag creation triggers the release workflow:
    - Builds binaries for all platforms
    - Creates GitHub release with binaries
-   - Publishes platform packages (`@agent-rdp/{platform}-{arch}`) to npm
-   - Publishes main package (`agent-rdp`) to npm with provenance
+   - Publishes platform packages (`@denisix/agent-rdp-{platform}-{arch}`) to npm
+   - Publishes main package (`@denisix/agent-rdp`) to npm with provenance
 
 **Manual Release**: If release-please fails to create a release, you can manually trigger the workflow via `workflow_dispatch` with a tag name, or push a tag matching `agent-rdp-v*`.

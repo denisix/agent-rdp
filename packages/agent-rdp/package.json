@@ -1,12 +1,16 @@
 {
-  "name": "agent-rdp",
+  "name": "@denisix/agent-rdp",
   "version": "0.6.5",
   "description": "CLI tool for AI agents to control Windows Remote Desktop sessions",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/thisnick/agent-rdp.git",
+    "url": "git+https://github.com/denisix/agent-rdp.git",
     "directory": "packages/agent-rdp"
   },
+  "author": "denisix",
+  "contributors": [
+    "Nick Yu (original author) <wiseyu@gmail.com> (https://github.com/thisnick/agent-rdp)"
+  ],
   "license": "MIT OR Apache-2.0",
   "type": "module",
   "main": "dist/index.js",
@@ -39,15 +43,15 @@
     "agent"
   ],
   "bugs": {
-    "url": "https://github.com/thisnick/agent-rdp/issues"
+    "url": "https://github.com/denisix/agent-rdp/issues"
   },
-  "homepage": "https://github.com/thisnick/agent-rdp#readme",
+  "homepage": "https://github.com/denisix/agent-rdp#readme",
   "optionalDependencies": {
-    "@agent-rdp/darwin-arm64": "workspace:*",
-    "@agent-rdp/darwin-x64": "workspace:*",
-    "@agent-rdp/linux-x64": "workspace:*",
-    "@agent-rdp/linux-arm64": "workspace:*",
-    "@agent-rdp/win32-x64": "workspace:*",
-    "@agent-rdp/win32-arm64": "workspace:*"
+    "@denisix/agent-rdp-darwin-arm64": "workspace:*",
+    "@denisix/agent-rdp-darwin-x64": "workspace:*",
+    "@denisix/agent-rdp-linux-x64": "workspace:*",
+    "@denisix/agent-rdp-linux-arm64": "workspace:*",
+    "@denisix/agent-rdp-win32-x64": "workspace:*",
+    "@denisix/agent-rdp-win32-arm64": "workspace:*"
   }
 }

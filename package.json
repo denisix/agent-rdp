@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "bun run build:rust && bun run build:ts",
-    "build:ts": "bun run --filter agent-rdp build:ts",
+    "build:ts": "bun run --filter '@denisix/agent-rdp' build:ts",
     "build:rust": "cargo build --release && node scripts/copy-native.cjs",
     "build:all": "node scripts/build-all.cjs",
     "install:local": "bun run build:rust && node scripts/install-local.cjs",

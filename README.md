@@ -26,19 +26,19 @@ https://github.com/user-attachments/assets/91892b39-4edb-412b-b265-55ccd75d7421
 ### From npm
 
 ```bash
-npm install -g agent-rdp
+npm install -g @denisix/agent-rdp
 ```
 
 ### As a Claude Code skill
 
 ```bash
-npx add-skill https://github.com/thisnick/agent-rdp
+npx add-skill https://github.com/denisix/agent-rdp
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/thisnick/agent-rdp
+git clone https://github.com/denisix/agent-rdp
 cd agent-rdp
 bun install
 bun run build      # Build native binary
@@ -178,7 +178,7 @@ On the remote Windows machine, mapped drives appear in File Explorer as network 
 
 Interact with Windows applications programmatically via the Windows UI Automation API using native patterns (InvokePattern, SelectionItemPattern, TogglePattern, etc.). When enabled, a PowerShell agent is injected into the remote session that captures the accessibility tree and performs actions. Communication between the CLI and the agent uses a Dynamic Virtual Channel (DVC) for fast bidirectional IPC.
 
-For detailed documentation, see [AUTOMATION.md](https://github.com/thisnick/agent-rdp/blob/main/docs/AUTOMATION.md).
+For detailed documentation, see [AUTOMATION.md](https://github.com/denisix/agent-rdp/blob/main/docs/AUTOMATION.md).
 
 ```bash
 # Connect with automation enabled
@@ -419,7 +419,7 @@ await rdp.connect({...});
 const streamUrl = rdp.getStreamUrl(); // "ws://localhost:9224"
 ```
 
-For the complete WebSocket protocol specification (message types, clipboard flow, input handling), see [WEBSOCKET.md](https://github.com/thisnick/agent-rdp/blob/main/docs/WEBSOCKET.md).
+For the complete WebSocket protocol specification (message types, clipboard flow, input handling), see [WEBSOCKET.md](https://github.com/denisix/agent-rdp/blob/main/docs/WEBSOCKET.md).
 
 ## Architecture
 
@@ -462,6 +462,10 @@ If you need vision-based coordinate detection with Claude, implement your own ha
 - Rust 1.75 or later
 - Target RDP server with Network Level Authentication (NLA) enabled
 - Target RDP server must support TLS 1.2 or later. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1, so legacy targets (e.g. Windows Server 2008 R2) are not currently supported and will fail with a TLS handshake error.
+
+## Credits
+
+Originally created by [Nick Yu](https://github.com/thisnick) ([thisnick/agent-rdp](https://github.com/thisnick/agent-rdp)). This fork ([denisix/agent-rdp](https://github.com/denisix/agent-rdp), published to npm as [`@denisix/agent-rdp`](https://www.npmjs.com/package/@denisix/agent-rdp)) is maintained independently with additional fixes and features; see [CHANGELOG.md](packages/agent-rdp/CHANGELOG.md) for what's changed.
 
 ## License
 
