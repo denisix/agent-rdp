@@ -70,33 +70,26 @@ jobs:
               - 'packages/agent-rdp/package.json'
               - 'packages/agent-rdp/tsconfig.json'
               - 'package.json'
-              - 'pnpm-lock.yaml'
-              - 'pnpm-workspace.yaml'
+              - 'bun.lock'
               - '.github/workflows/ci.yml'
 
-      - name: Setup Node.js
+      - name: Setup Bun
         if: steps.filter.outputs.ts == 'true'
-        uses: actions/setup-node@v4
+        uses: oven-sh/setup-bun@v2
         with:
-          node-version: '20'
-
-      - name: Install pnpm
-        if: steps.filter.outputs.ts == 'true'
-        uses: pnpm/action-setup@v2
-        with:
-          version: 9
+          bun-version: latest
 
       - name: Install dependencies
         if: steps.filter.outputs.ts == 'true'
-        run: pnpm install --ignore-scripts
+        run: bun install --ignore-scripts
 
       - name: Lint
         if: steps.filter.outputs.ts == 'true'
-        run: pnpm run lint
+        run: bun run lint
 
       - name: TypeScript check
         if: steps.filter.outputs.ts == 'true'
-        run: pnpm run build:ts
+        run: bun run build:ts
 
       - name: Skip message
         if: steps.filter.outputs.ts != 'true'

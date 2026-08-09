@@ -12,13 +12,14 @@ cargo test            # Run all tests
 cargo test -p agent-rdp-daemon  # Test specific crate
 cargo test test_name  # Run single test
 
-# npm/pnpm
-pnpm install          # Install dependencies
-pnpm build            # Build native binary + copy to bin/
-pnpm build:ts         # Build TypeScript only
-pnpm build:all        # Cross-compile all platforms (needs `cross`)
-pnpm cli              # Run the CLI (uses local platform binary)
-pnpm example          # Run example script
+# bun
+bun install           # Install dependencies
+bun run build         # Build native binary + copy to bin/
+bun run build:ts      # Build TypeScript only
+bun run build:all     # Cross-compile all platforms (needs `cross`)
+bun run install:local # Build + symlink the binary to ~/.local/bin/agent-rdp (no npm involved)
+bun run cli           # Run the CLI (uses local platform binary)
+bun run example       # Run example script
 ```
 
 ## Architecture
@@ -33,7 +34,7 @@ agent-rdp is a CLI tool for AI agents to control Windows Remote Desktop sessions
 
 ### Monorepo Structure
 
-This is a pnpm workspace monorepo:
+This is a bun workspace monorepo:
 
 - **packages/agent-rdp/** - Main npm package with TypeScript SDK and CLI entry point
 - **packages/{platform}-{arch}/** - Platform-specific packages containing native binaries (e.g., `darwin-arm64`, `linux-x64`, `win32-x64`)

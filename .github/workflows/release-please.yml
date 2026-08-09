@@ -216,25 +216,45 @@ jobs:
       - name: Update npm for OIDC support
         run: npm install -g npm@latest
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v2
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
         with:
-          version: 9
+          bun-version: latest
 
       - name: Install dependencies
-        run: pnpm install --ignore-scripts
+        run: bun install --ignore-scripts
 
       - name: Build TypeScript
-        run: pnpm --filter agent-rdp run build:ts
+        run: bun run build:ts
+
+      # bun publish doesn't support --provenance yet, so publishing still goes
+      # through `npm publish`. npm publish does not reliably rewrite
+      # "workspace:*" ranges on its own, so resolve them to real versions
+      # first.
+      - name: Resolve workspace protocol dependencies for publish
+        run: |
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const pkgPath = 'packages/agent-rdp/package.json';
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            for (const [name, range] of Object.entries(pkg.optionalDependencies || {})) {
+              if (!range.startsWith('workspace:')) continue;
+              const platform = name.replace('@agent-rdp/', '');
+              const depPkg = JSON.parse(fs.readFileSync(path.join('packages', platform, 'package.json'), 'utf8'));
+              pkg.optionalDependencies[name] = '^' + depPkg.version;
+            }
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+          "
 
       - name: Publish platform packages
         run: |
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64 win32-arm64; do
             echo "Publishing @agent-rdp/$platform..."
-            pnpm --filter "@agent-rdp/$platform" publish --access public --provenance --no-git-checks
+            npm publish --access public --provenance packages/$platform
           done
 
       - name: Publish main package
         run: |
           cp README.md packages/agent-rdp/
-          pnpm --filter agent-rdp publish --access public --provenance --no-git-checks
+          npm publish --access public --provenance packages/agent-rdp

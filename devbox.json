@@ -4,7 +4,7 @@
     "rustup@latest",
     "direnv@latest",
     "nodejs@latest",
-    "pnpm@latest",
+    "bun@latest",
     "powershell@latest"
   ],
   "shell": {

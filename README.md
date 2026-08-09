@@ -40,9 +40,9 @@ npx add-skill https://github.com/thisnick/agent-rdp
 ```bash
 git clone https://github.com/thisnick/agent-rdp
 cd agent-rdp
-pnpm install
-pnpm build      # Build native binary
-pnpm build:ts   # Build TypeScript
+bun install
+bun run build      # Build native binary
+bun run build:ts   # Build TypeScript
 ```
 
 ## Usage
