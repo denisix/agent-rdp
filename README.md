@@ -213,6 +213,11 @@ agent-rdp automate window focus "~*Notepad*"
 # Run PowerShell commands
 agent-rdp automate run "Get-Process" --wait
 agent-rdp automate run "Get-Process" --wait --process-timeout 5000  # With 5s timeout
+agent-rdp automate run "$PSVersionTable" --wait --shell pwsh.exe    # Run through PowerShell 7 instead of Windows PowerShell
+
+# Stream output from a long-running command instead of waiting for it to exit
+agent-rdp automate run "ping -t 127.0.0.1" --stream   # Returns immediately with a pid
+agent-rdp automate run-poll <pid>                      # Repeat to drain output incrementally; reports exit once the process ends
 ```
 
 **Selector Types:**
@@ -452,6 +457,7 @@ If you need vision-based coordinate detection with Claude, implement your own ha
 
 - Rust 1.75 or later
 - Target RDP server with Network Level Authentication (NLA) enabled
+- Target RDP server must support TLS 1.2 or later. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1, so legacy targets (e.g. Windows Server 2008 R2) are not currently supported and will fail with a TLS handshake error.
 
 ## License
 

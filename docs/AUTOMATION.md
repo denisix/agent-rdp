@@ -158,14 +158,16 @@ When `--enable-win-automation` is specified:
 5. Register drive mapping with RDPDR channel as `agent-automation`
 6. Set up DVC channel (`AgentRdp::Automation`) via DrdynvcClient
 7. Wait 2-3 seconds for Windows desktop stabilization
-8. Send Win+R keystroke to open Run dialog
-9. Type PowerShell launch command:
+8. Set the PowerShell launch command on the remote clipboard:
    ```
    powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "\\TSCLIENT\agent-automation\scripts\agent.ps1"
    ```
-10. Press Enter
-11. Wait for DVC handshake message
-12. Return success or timeout error
+9. Send Win+R keystroke to open Run dialog
+10. Wait 2000ms for the Run dialog to appear and grab focus (a foreground app such as a maximized browser or game can otherwise steal keystrokes typed too early)
+11. Paste the launch command into the Run dialog via Ctrl+V, instead of typing it character-by-character
+12. Press Enter
+13. Wait for DVC handshake message
+14. Return success or timeout error
 
 **Note**: RDPDR drive mapping is still used for bootstrapping (launching the agent), but all subsequent IPC uses DVC.
 
