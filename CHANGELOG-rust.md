@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.4](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.3...agent-rdp-rust-v0.7.4) (2026-08-14)
+
+
+### Bug Fixes
+
+* keep the daemon alive when an RDP connection drops ([c6ee009](https://github.com/denisix/agent-rdp/commit/c6ee009a6534e9504e1fda24c4d55f9fe8b98c2c))
+
 ## [0.7.3](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.2...agent-rdp-rust-v0.7.3) (2026-08-14)
 
 
