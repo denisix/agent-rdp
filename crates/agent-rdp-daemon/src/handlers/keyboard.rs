@@ -16,37 +16,27 @@ pub async fn handle(
     rdp_session: &Arc<Mutex<Option<RdpSession>>>,
     action: KeyboardRequest,
 ) -> Response {
-    // For typing text, send one character at a time with delays for reliability
-    if let KeyboardRequest::Type { ref text } = action {
-        debug!("Typing {} characters: {:?}", text.len(), text);
+    // Typing is batched into as few PDUs as possible; sending (and sleeping)
+    // per character made even short strings take tens of seconds.
+    if let KeyboardRequest::Type {
+        ref text,
+        delay_ms,
+    } = action
+    {
+        debug!("Typing {} characters", text.chars().count());
 
-        const CHAR_DELAY_MS: u64 = 100;
-
-        for ch in text.chars() {
-            let code = ch as u16;
-            let events = vec![
-                FastPathInputEvent::UnicodeKeyboardEvent(KeyboardFlags::empty(), code),
-                FastPathInputEvent::UnicodeKeyboardEvent(KeyboardFlags::RELEASE, code),
-            ];
-
-            {
-                let session = rdp_session.lock().await;
-                let rdp = match session.as_ref() {
-                    Some(rdp) => rdp,
-                    None => {
-                        return Response::error(
-                            ErrorCode::NotConnected,
-                            "Not connected to an RDP server",
-                        );
-                    }
-                };
-                if let Err(e) = rdp.send_input(events).await {
-                    return Response::error(ErrorCode::InternalError, e.to_string());
-                }
+        let session = rdp_session.lock().await;
+        let rdp = match session.as_ref() {
+            Some(rdp) => rdp,
+            None => {
+                return Response::error(ErrorCode::NotConnected, "Not connected to an RDP server");
             }
-            sleep(Duration::from_millis(CHAR_DELAY_MS)).await;
-        }
-        return Response::ok();
+        };
+
+        return match rdp.send_text(text, delay_ms).await {
+            Ok(()) => Response::ok(),
+            Err(e) => Response::error(ErrorCode::InternalError, e.to_string()),
+        };
     }
 
     // For key combinations, release lock between each key event

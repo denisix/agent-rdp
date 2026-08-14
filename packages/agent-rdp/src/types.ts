@@ -147,6 +147,12 @@ export interface ScrollOptions {
 export interface KeyboardTypeOptions {
   /** Text to type. */
   text: string;
+  /**
+   * Pause in milliseconds between batches of characters. Only needed for remote
+   * applications that drop input arriving too quickly; omitted sends as fast as
+   * the connection allows.
+   */
+  delayMs?: number;
 }
 
 /** Options for keyboard press operations. */

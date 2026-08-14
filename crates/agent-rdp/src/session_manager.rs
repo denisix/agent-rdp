@@ -11,6 +11,28 @@ use tracing::{debug, info, warn};
 
 use crate::ipc_client::IpcClient;
 
+/// Path to the daemon's log file for a session.
+///
+/// The daemon runs detached, so this is the only place its output - including
+/// a panic backtrace - is recorded.
+pub fn daemon_log_path(session: &str) -> PathBuf {
+    get_session_dir(session).join("daemon.log")
+}
+
+/// Message for when no daemon is running.
+///
+/// A session can vanish mid-run if the daemon exits unexpectedly, so point at
+/// both the fix (reconnect) and the evidence (the daemon log) rather than just
+/// stating the fact.
+pub fn daemon_not_running_message(session: &str) -> String {
+    format!(
+        "No daemon running for this session. Reconnect with `agent-rdp connect ...`. \
+         If the session was previously connected, the daemon exited unexpectedly - \
+         see {} for why.",
+        daemon_log_path(session).display()
+    )
+}
+
 /// Session manager handles daemon lifecycle.
 pub struct SessionManager {
     session: String,
@@ -150,6 +172,20 @@ impl SessionManager {
         // Get path to current executable (the daemon is the same binary with a subcommand)
         let exe = std::env::current_exe()?;
 
+        // Capture the daemon's output. It runs detached, so discarding stderr
+        // means a panic leaves no trace at all and an unexpected exit is
+        // undiagnosable after the fact. Appending keeps history across restarts.
+        let log_path = crate::session_manager::daemon_log_path(&self.session);
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let open_log = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+        };
+
         // Fork daemon process
         #[cfg(unix)]
         {
@@ -162,8 +198,8 @@ impl SessionManager {
                 .arg("session")
                 .arg("daemon") // Internal command to run as daemon
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .stdout(open_log().map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
+                .stderr(open_log().map(Stdio::from).unwrap_or_else(|_| Stdio::null()));
 
             // Detach from parent process group
             unsafe {
@@ -189,8 +225,8 @@ impl SessionManager {
                 .arg("session")
                 .arg("daemon")
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(open_log().map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
+                .stderr(open_log().map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
                 .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
                 .spawn()?;
         }

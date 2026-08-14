@@ -15,14 +15,17 @@ pub async fn run(
     let manager = SessionManager::new(session.to_string());
 
     if !manager.is_daemon_alive() {
-        output.print_error("daemon_not_running", "No daemon running for this session");
+        output.print_error(
+            "daemon_not_running",
+            &crate::session_manager::daemon_not_running_message(session),
+        );
         std::process::exit(1);
     }
 
     let mut client = manager.ensure_daemon().await?;
 
     let keyboard_request = match args.action {
-        KeyboardAction::Type { text } => KeyboardRequest::Type { text },
+        KeyboardAction::Type { text, delay } => KeyboardRequest::Type { text, delay_ms: delay },
         KeyboardAction::Press { keys } => KeyboardRequest::Press { keys },
     };
 

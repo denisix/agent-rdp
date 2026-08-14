@@ -482,18 +482,47 @@ impl RdpSession {
     }
 
     /// Send text input as Unicode characters.
-    pub async fn send_text(&self, text: &str) -> Result<(), RdpError> {
+    /// Type Unicode text.
+    ///
+    /// Characters are batched into as few input PDUs as possible rather than
+    /// one round-trip (plus a sleep) per character, which is what made typing
+    /// a short string take tens of seconds.
+    ///
+    /// `delay_ms` inserts a pause between batches for remote apps that drop
+    /// input when it arrives too fast; it defaults to none.
+    pub async fn send_text(&self, text: &str, delay_ms: Option<u64>) -> Result<(), RdpError> {
         use ironrdp::pdu::input::fast_path::KeyboardFlags;
         use std::time::Duration;
 
-        for ch in text.chars() {
-            let code = ch as u16;
-            let events = vec![
-                FastPathInputEvent::UnicodeKeyboardEvent(KeyboardFlags::empty(), code),
-                FastPathInputEvent::UnicodeKeyboardEvent(KeyboardFlags::RELEASE, code),
-            ];
+        // Two events (press + release) per character. FastPath encodes the
+        // event count in a single byte, so stay well under 255 per PDU.
+        const CHARS_PER_BATCH: usize = 64;
+
+        let chars: Vec<char> = text.chars().collect();
+        let mut first = true;
+
+        for chunk in chars.chunks(CHARS_PER_BATCH) {
+            if !first {
+                if let Some(ms) = delay_ms {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+            }
+            first = false;
+
+            let mut events = Vec::with_capacity(chunk.len() * 2);
+            for &ch in chunk {
+                let code = ch as u16;
+                events.push(FastPathInputEvent::UnicodeKeyboardEvent(
+                    KeyboardFlags::empty(),
+                    code,
+                ));
+                events.push(FastPathInputEvent::UnicodeKeyboardEvent(
+                    KeyboardFlags::RELEASE,
+                    code,
+                ));
+            }
+
             self.send_input(events).await?;
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         Ok(())

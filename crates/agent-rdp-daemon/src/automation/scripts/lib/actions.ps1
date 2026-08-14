@@ -234,14 +234,33 @@ function Invoke-Get {
     }
 
     if ($property -eq "all" -or $property -eq "value") {
+        $value = $null
+
         try {
             $valuePattern = $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
             if ($valuePattern) {
-                $result["value"] = $valuePattern.Current.Value
+                $value = $valuePattern.Current.Value
             }
         } catch {
-            $result["value"] = $null
+            $value = $null
         }
+
+        # Multiline edits (Notepad's editor, rich text controls) do not implement
+        # ValuePattern, only TextPattern - without this fallback they report no
+        # text at all and there is no way to read back what was typed.
+        if ($null -eq $value) {
+            try {
+                $textPattern = $element.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+                if ($textPattern) {
+                    # -1 means the whole document.
+                    $value = $textPattern.DocumentRange.GetText(-1)
+                }
+            } catch {
+                $value = $null
+            }
+        }
+
+        $result["value"] = $value
     }
 
     if ($property -eq "all" -or $property -eq "states") {

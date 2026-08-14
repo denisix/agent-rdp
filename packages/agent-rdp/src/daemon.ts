@@ -146,10 +146,19 @@ export class DaemonManager {
     }
     args.push('session', 'daemon');
 
+    // Capture the daemon's output. It runs detached, so discarding stderr means
+    // a panic leaves no trace and an unexpected exit is undiagnosable.
+    let out: number | 'ignore' = 'ignore';
+    try {
+      out = fs.openSync(path.join(this.sessionDir, 'daemon.log'), 'a');
+    } catch {
+      // Fall back to discarding rather than failing to start the daemon.
+    }
+
     // Spawn daemon in background
     const child = spawn(binary, args, {
       detached: true,
-      stdio: 'ignore',
+      stdio: ['ignore', out, out],
       env: {
         ...process.env,
         AGENT_RDP_MODELS_DIR: process.env.AGENT_RDP_MODELS_DIR ?? findModelsDir(),

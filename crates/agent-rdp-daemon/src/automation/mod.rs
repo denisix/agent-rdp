@@ -13,7 +13,7 @@ pub use dvc_channel::{
     new_shared_dvc_state, AutomationDvc, DvcCommandReceiver, DvcCommandSender, DvcHandshake,
     DvcSendCommand, SharedDvcState, CHANNEL_NAME,
 };
-pub use dvc_ipc::DvcIpc;
+pub use dvc_ipc::{DvcIndeterminate, DvcIpc};
 
 use std::path::PathBuf;
 use std::sync::Arc;

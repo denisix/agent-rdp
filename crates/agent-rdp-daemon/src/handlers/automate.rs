@@ -62,6 +62,12 @@ pub async fn handle(
     match ipc.send_request(&request).await {
         Ok(data) => convert_response(request, data),
         Err(e) => {
+            // A lost reply is not the same as a failed action - surface it under
+            // its own code so callers can avoid retrying into a double-apply.
+            if e.downcast_ref::<crate::automation::DvcIndeterminate>().is_some() {
+                error!("Automation request outcome unknown: {}", e);
+                return Response::error(ErrorCode::AutomationIndeterminate, e.to_string());
+            }
             error!("Automation request failed: {}", e);
             Response::error(ErrorCode::AutomationError, e.to_string())
         }

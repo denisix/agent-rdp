@@ -223,7 +223,15 @@ pub enum MouseButton {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum KeyboardRequest {
     /// Type a text string (Unicode).
-    Type { text: String },
+    Type {
+        text: String,
+        /// Pause in milliseconds between batches of characters. Only needed for
+        /// remote applications that drop input arriving too quickly; omitted
+        /// means send as fast as the connection allows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        delay_ms: Option<u64>,
+    },
 
     /// Press a key combination (e.g., "ctrl+c", "alt+tab", or single key like "enter").
     Press { keys: String },

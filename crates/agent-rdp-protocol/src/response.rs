@@ -317,6 +317,12 @@ pub enum ErrorCode {
     #[error("automation error")]
     AutomationError,
 
+    /// The request reached the automation agent but no reply came back, so
+    /// whether it took effect is unknown. Distinct from `AutomationError`
+    /// because retrying is unsafe: the action may already have been applied.
+    #[error("automation indeterminate")]
+    AutomationIndeterminate,
+
     /// Element not found.
     #[error("element not found")]
     ElementNotFound,

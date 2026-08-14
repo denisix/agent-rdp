@@ -117,7 +117,12 @@ export class KeyboardController {
 
   /** Type a text string (Unicode). */
   async type(options: KeyboardTypeOptions): Promise<void> {
-    await this.rdp._send({ type: 'keyboard', action: 'type', text: options.text });
+    await this.rdp._send({
+      type: 'keyboard',
+      action: 'type',
+      text: options.text,
+      delay_ms: options.delayMs,
+    });
   }
 
   /** Press a key combination (e.g., 'ctrl+c', 'alt+tab') or single key (e.g., 'enter'). */

@@ -17,9 +17,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Command timeout in milliseconds
-    #[arg(long, default_value = "30000", global = true)]
-    pub timeout: u64,
+    /// Command timeout in milliseconds. Defaults to 30000 for ordinary
+    /// commands and 90000 for `connect`, which additionally has to cover the
+    /// TLS/CredSSP handshake and the automation agent bootstrap
+    #[arg(long, global = true)]
+    pub timeout: Option<u64>,
 
     /// WebSocket streaming port (0 = disabled, enables browser viewer for debugging)
     #[arg(long, default_value = "0", env = "AGENT_RDP_STREAM_PORT", global = true)]
@@ -216,6 +218,11 @@ pub enum KeyboardAction {
     Type {
         /// Text to type
         text: String,
+
+        /// Pause in milliseconds between batches of characters. Only needed for
+        /// remote apps that drop input arriving too fast
+        #[arg(long)]
+        delay: Option<u64>,
     },
 
     /// Press a key combination (e.g., "ctrl+c", "alt+tab") or single key (e.g., "enter")

@@ -15,7 +15,10 @@ pub async fn run(
     let manager = SessionManager::new(session.to_string());
 
     if !manager.is_daemon_alive() {
-        output.print_error("daemon_not_running", "No daemon running for this session");
+        output.print_error(
+            "daemon_not_running",
+            &crate::session_manager::daemon_not_running_message(session),
+        );
         std::process::exit(1);
     }
 

@@ -14,8 +14,25 @@ use uuid::Uuid;
 
 use super::dvc_channel::{DvcError, DvcProtocolMessage, DvcSendCommand, SharedDvcState};
 
-/// Number of consecutive failures before suggesting reconnection.
+/// Number of consecutive failures before the channel is reported as unresponsive.
 const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
+
+/// A request was sent to the automation agent but no reply arrived.
+///
+/// This is deliberately *not* a failure: the agent may have carried the action
+/// out and only the acknowledgement was lost. Callers must not blindly retry -
+/// doing so is what turns a lost ack into a duplicated action (typing the same
+/// text twice, clicking a button twice). Check the current state first.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "no response from the automation agent, so it is unknown whether this action was applied \
+     (request {request_id}, {consecutive_failures} consecutive without reply). \
+     Check the current state before retrying - retrying may apply it twice."
+)]
+pub struct DvcIndeterminate {
+    pub request_id: String,
+    pub consecutive_failures: u32,
+}
 
 /// DVC-based IPC client for communicating with the PowerShell agent.
 #[derive(Debug, Clone)]
@@ -151,20 +168,19 @@ impl DvcIpc {
                 response
             }
             Ok(Err(_)) => {
-                // Channel closed
+                // Channel closed before a reply arrived. As with a timeout the
+                // request had already been sent, so the outcome is unknown.
                 let failures = self.increment_failures();
                 if failures >= CONSECUTIVE_FAILURE_THRESHOLD {
                     error!(
-                        "DVC request failed {} consecutive times. Channel may be dead.",
-                        failures
-                    );
-                    anyhow::bail!(
-                        "DVC channel appears to be dead ({} consecutive failures). \
-                        Please reconnect with --enable-win-automation.",
+                        "DVC request failed {} consecutive times; channel is unresponsive.",
                         failures
                     );
                 }
-                anyhow::bail!("Response channel closed unexpectedly");
+                return Err(anyhow::Error::new(DvcIndeterminate {
+                    request_id,
+                    consecutive_failures: failures,
+                }));
             }
             Err(_) => {
                 // Timeout - remove pending request
@@ -173,18 +189,22 @@ impl DvcIpc {
                     state.pending.remove(&request_id);
                 }
                 let failures = self.increment_failures();
+
+                // The request was written to the channel, so the agent may well
+                // have executed it and only the reply was lost. Report that as
+                // indeterminate rather than as a failure: a caller that treats
+                // this as "did not happen" and retries will apply the action
+                // twice.
                 if failures >= CONSECUTIVE_FAILURE_THRESHOLD {
                     error!(
-                        "DVC request timed out {} consecutive times. Channel may be dead.",
-                        failures
-                    );
-                    anyhow::bail!(
-                        "DVC channel appears to be dead ({} consecutive failures). \
-                        Please reconnect with --enable-win-automation.",
+                        "DVC request timed out {} consecutive times; channel is unresponsive.",
                         failures
                     );
                 }
-                anyhow::bail!("Timeout waiting for DVC response");
+                return Err(anyhow::Error::new(DvcIndeterminate {
+                    request_id,
+                    consecutive_failures: failures,
+                }));
             }
         };
 
