@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.0...agent-rdp-rust-v0.7.1) (2026-08-14)
+
+
+### Bug Fixes
+
+* repair npm publish invocation and OIDC auth in release workflow ([79243e1](https://github.com/denisix/agent-rdp/commit/79243e1df4286087dd7014efb179b929d6e79dce))
+
 ## [0.7.0](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.6.5...agent-rdp-rust-v0.7.0) (2026-08-14)
 
 
