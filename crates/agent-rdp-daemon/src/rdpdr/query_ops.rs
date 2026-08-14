@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use super::helpers::{
     get_creation_time, get_disk_space, get_file_attributes, get_last_access_time,
-    get_last_write_time,
+    get_last_write_time, safe_join,
 };
 use super::MultiDriveBackend;
 
@@ -378,43 +378,49 @@ pub fn query_directory(
                     // Wildcard query - list directory contents
                     let query_path = req_inner.path.replace('\\', "/");
                     let len = query_path.len();
-                    // Strip the trailing * and any leading slashes
-                    let dir_path_str = query_path[..len - 1].trim_start_matches('/');
-                    let dir_path = if dir_path_str.is_empty() {
-                        base_path.clone()
-                    } else {
-                        base_path.join(dir_path_str)
-                    };
-
-                    if let Ok(read_dir) = fs::read_dir(&dir_path) {
-                        let mut iter = read_dir;
-                        // Find first non-. and non-.. entry
-                        while let Some(Ok(entry)) = iter.next() {
-                            let name = entry.file_name();
-                            let name_str = name.to_string_lossy();
-                            if name_str != "." && name_str != ".." {
-                                find_file_path = Some(entry.path());
-                                break;
+                    // Strip the trailing *
+                    let dir_path_str = &query_path[..len - 1];
+                    // The path comes from the remote server, so it must be
+                    // confined to the mapped drive - see safe_join. A rejected
+                    // path leaves find_file_path unset, which answers
+                    // NO_SUCH_FILE.
+                    match safe_join(&base_path, dir_path_str) {
+                        None => warn!(
+                            "Rejected directory query escaping mapped drive: {:?}",
+                            req_inner.path
+                        ),
+                        Some(dir_path) => {
+                            if let Ok(mut iter) = fs::read_dir(&dir_path) {
+                                // Find first non-. and non-.. entry
+                                while let Some(Ok(entry)) = iter.next() {
+                                    let name = entry.file_name();
+                                    let name_str = name.to_string_lossy();
+                                    if name_str != "." && name_str != ".." {
+                                        find_file_path = Some(entry.path());
+                                        break;
+                                    }
+                                }
+                                backend.file_dir_map.insert(
+                                    req_inner.device_io_request.file_id,
+                                    DirIterState {
+                                        iter,
+                                        base_path: dir_path,
+                                    },
+                                );
                             }
                         }
-                        backend.file_dir_map.insert(
-                            req_inner.device_io_request.file_id,
-                            DirIterState {
-                                iter,
-                                base_path: dir_path,
-                            },
-                        );
                     }
                 } else {
-                    // Specific file query
-                    let query_path = req_inner.path.replace('\\', "/");
-                    let query_path = query_path.trim_start_matches('/');
-                    let full_path = if query_path.is_empty() {
-                        base_path.clone()
-                    } else {
-                        base_path.join(query_path)
-                    };
-                    find_file_path = Some(full_path);
+                    // Specific file query. Same untrusted-path rules apply; a
+                    // rejected path leaves find_file_path unset, which answers
+                    // NO_SUCH_FILE.
+                    find_file_path = safe_join(&base_path, &req_inner.path);
+                    if find_file_path.is_none() {
+                        warn!(
+                            "Rejected file query escaping mapped drive: {:?}",
+                            req_inner.path
+                        );
+                    }
                 }
 
                 make_query_dir_resp(

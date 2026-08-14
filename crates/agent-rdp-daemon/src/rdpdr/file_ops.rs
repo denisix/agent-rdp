@@ -9,6 +9,7 @@ use ironrdp_rdpdr::pdu::RdpdrPdu;
 use ironrdp_svc::SvcMessage;
 use tracing::{debug, warn};
 
+use super::helpers::safe_join;
 use super::MultiDriveBackend;
 
 /// Handle device write request.
@@ -195,13 +196,24 @@ pub fn create_drive(
         }
     };
 
-    // Convert backslashes and strip leading slashes to prevent join from replacing base path
-    let req_path = req_inner.path.replace('\\', "/");
-    let req_path = req_path.trim_start_matches('/');
-    let path = if req_path.is_empty() {
-        base_path.clone()
-    } else {
-        base_path.join(req_path)
+    // The path comes from the remote server, so it must be confined to the
+    // mapped drive - see safe_join.
+    let path = match safe_join(&base_path, &req_inner.path) {
+        Some(p) => p,
+        None => {
+            warn!(
+                "Rejected path escaping mapped drive: device={}, path={:?}",
+                device_id, req_inner.path
+            );
+            let io_response =
+                DeviceIoResponse::new(req_inner.device_io_request, NtStatus::ACCESS_DENIED);
+            let res = RdpdrPdu::DeviceCreateResponse(DeviceCreateResponse {
+                device_io_reply: io_response,
+                file_id,
+                information: Information::empty(),
+            });
+            return Ok(vec![SvcMessage::from(res)]);
+        }
     };
     debug!("create_drive resolved: base={:?}, full_path={:?}", base_path, path);
 

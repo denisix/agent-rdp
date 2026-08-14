@@ -1,9 +1,52 @@
 //! Platform-specific helper functions for RDPDR.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use ironrdp_rdpdr::pdu::efs::FileAttributes;
+
+/// Join a client-supplied path onto a mapped drive's root, refusing anything
+/// that would escape it.
+///
+/// Paths here come from the remote RDP server, which is not trusted: a
+/// malicious or compromised host can send `..` segments to reach files outside
+/// the directory the user chose to share. Returns `None` if the path escapes,
+/// in which case the caller must fail the request.
+///
+/// Normalization is lexical because the target often does not exist yet (file
+/// creation). When it does exist we additionally canonicalize, so symlinks
+/// inside the drive that point outside it are caught too.
+pub fn safe_join(base: &Path, requested: &str) -> Option<PathBuf> {
+    let requested = requested.replace('\\', "/");
+    let mut relative = PathBuf::new();
+
+    for component in Path::new(&requested).components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            // A leading separator just means "from the drive root", and `.` is
+            // a no-op; neither escapes the base.
+            Component::RootDir | Component::CurDir => {}
+            // Refuse to climb above the drive root.
+            Component::ParentDir => {
+                if !relative.pop() {
+                    return None;
+                }
+            }
+            // Windows drive letters / UNC prefixes would replace the base path.
+            Component::Prefix(_) => return None,
+        }
+    }
+
+    let joined = base.join(relative);
+
+    if let (Ok(real), Ok(real_base)) = (joined.canonicalize(), base.canonicalize()) {
+        if !real.starts_with(&real_base) {
+            return None;
+        }
+    }
+
+    Some(joined)
+}
 
 /// Get file attributes from metadata.
 pub fn get_file_attributes(meta: &fs::Metadata, file_name: &str) -> FileAttributes {
@@ -153,5 +196,55 @@ pub fn get_disk_space(path: &Path) -> std::io::Result<(u64, u64)> {
         Ok((total_bytes, free_bytes))
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> PathBuf {
+        PathBuf::from("/srv/share")
+    }
+
+    #[test]
+    fn safe_join_allows_paths_inside_the_drive() {
+        // RDPDR sends Windows-style separators, usually with a leading one.
+        assert_eq!(
+            safe_join(&base(), r"\docs\notes.txt"),
+            Some(base().join("docs/notes.txt"))
+        );
+        assert_eq!(safe_join(&base(), ""), Some(base()));
+        assert_eq!(safe_join(&base(), r"\"), Some(base()));
+        // Interior `..` that stays within the drive is fine.
+        assert_eq!(
+            safe_join(&base(), r"\docs\..\notes.txt"),
+            Some(base().join("notes.txt"))
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_traversal_above_the_drive() {
+        for evil in [
+            r"..\..\..\etc\passwd",
+            "../../etc/passwd",
+            r"\..\outside.txt",
+            // Climbs back out after descending.
+            r"\docs\..\..\outside.txt",
+        ] {
+            assert_eq!(safe_join(&base(), evil), None, "should reject {evil:?}");
+        }
+    }
+
+    #[test]
+    fn safe_join_rejects_windows_prefixes() {
+        // Only parsed as a Prefix on Windows; elsewhere it stays a normal
+        // component and is therefore confined to the drive either way.
+        let joined = safe_join(&base(), r"C:\Windows\System32\config\SAM");
+        if cfg!(windows) {
+            assert_eq!(joined, None);
+        } else {
+            assert!(joined.unwrap().starts_with(base()));
+        }
     }
 }

@@ -8,6 +8,7 @@ use ironrdp_rdpdr::pdu::RdpdrPdu;
 use ironrdp_svc::SvcMessage;
 use tracing::{debug, warn};
 
+use super::helpers::safe_join;
 use super::MultiDriveBackend;
 
 /// Handle set information request (rename, delete, truncate, etc.).
@@ -49,9 +50,25 @@ pub fn set_information(
                         }
                     };
 
-                    let new_path = info.file_name.replace('\\', "/");
-                    let new_path = new_path.trim_start_matches('/');
-                    let to = base_path.join(new_path);
+                    // The destination comes from the remote server, so it must
+                    // be confined to the mapped drive - see safe_join.
+                    let to = match safe_join(&base_path, &info.file_name) {
+                        Some(p) => p,
+                        None => {
+                            warn!(
+                                "Rejected rename escaping mapped drive: device={}, to={:?}",
+                                device_id, info.file_name
+                            );
+                            let res = RdpdrPdu::ClientDriveSetInformationResponse(
+                                ClientDriveSetInformationResponse::new(
+                                    &req_inner,
+                                    NtStatus::ACCESS_DENIED,
+                                )
+                                .map_err(|e| encode_err!(e))?,
+                            );
+                            return Ok(vec![SvcMessage::from(res)]);
+                        }
+                    };
 
                     if let Err(error) = fs::rename(file_path, &to) {
                         warn!(
