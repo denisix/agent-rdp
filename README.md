@@ -26,7 +26,7 @@ https://github.com/user-attachments/assets/91892b39-4edb-412b-b265-55ccd75d7421
 ### From npm
 
 ```bash
-npm install -g @denisix/agent-rdp
+npm install -g @denisixnpm/agent-rdp
 ```
 
 ### As a Claude Code skill
@@ -81,7 +81,7 @@ cat >> AGENTS.md <<'EOF'
 
 ## Remote Windows control
 
-Use the `agent-rdp` CLI (npm i -g @denisix/agent-rdp) to control Windows machines via RDP:
+Use the `agent-rdp` CLI (npm i -g @denisixnpm/agent-rdp) to control Windows machines via RDP:
 connect, screenshot, mouse/keyboard input, and UI Automation. See
 https://github.com/denisix/agent-rdp for the full command reference.
 EOF
@@ -518,7 +518,7 @@ If you need vision-based coordinate detection with Claude, implement your own ha
 
 ## Credits
 
-Originally created by [Nick Yu](https://github.com/thisnick) ([thisnick/agent-rdp](https://github.com/thisnick/agent-rdp)). This fork ([denisix/agent-rdp](https://github.com/denisix/agent-rdp), published to npm as [`@denisix/agent-rdp`](https://www.npmjs.com/package/@denisix/agent-rdp)) is maintained independently with additional fixes and features; see [CHANGELOG.md](packages/agent-rdp/CHANGELOG.md) for what's changed.
+Originally created by [Nick Yu](https://github.com/thisnick) ([thisnick/agent-rdp](https://github.com/thisnick/agent-rdp)). This fork ([denisix/agent-rdp](https://github.com/denisix/agent-rdp), published to npm as [`@denisixnpm/agent-rdp`](https://www.npmjs.com/package/@denisixnpm/agent-rdp)) is maintained independently with additional fixes and features; see [CHANGELOG.md](packages/agent-rdp/CHANGELOG.md) for what's changed.
 
 ## License
 

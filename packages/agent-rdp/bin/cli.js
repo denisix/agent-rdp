@@ -16,7 +16,7 @@ const require = createRequire(import.meta.url);
 const platform = process.platform; // darwin, linux, win32
 const arch = process.arch;         // arm64, x64
 const ext = platform === 'win32' ? '.exe' : '';
-const platformPackage = `@denisix/agent-rdp-${platform}-${arch}`;
+const platformPackage = `@denisixnpm/agent-rdp-${platform}-${arch}`;
 
 let binaryPath;
 

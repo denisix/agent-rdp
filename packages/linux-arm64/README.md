@@ -1,11 +1,11 @@
-# @denisix/agent-rdp-linux-arm64
+# @denisixnpm/agent-rdp-linux-arm64
 
 Native binary package for Linux ARM64.
 
 This is a platform-specific package that contains the native binary for agent-rdp. You should not install this package directly - instead, install the main package:
 
 ```bash
-npm install @denisix/agent-rdp
+npm install @denisixnpm/agent-rdp
 ```
 
 The main package will automatically install the correct platform-specific binary for your system.

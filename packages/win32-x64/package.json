@@ -1,5 +1,5 @@
 {
-  "name": "@denisix/agent-rdp-win32-x64",
+  "name": "@denisixnpm/agent-rdp-win32-x64",
   "version": "0.6.5",
   "description": "agent-rdp native binary for Windows x64",
   "repository": {

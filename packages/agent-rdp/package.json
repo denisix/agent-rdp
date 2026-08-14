@@ -1,5 +1,5 @@
 {
-  "name": "@denisix/agent-rdp",
+  "name": "@denisixnpm/agent-rdp",
   "version": "0.6.5",
   "description": "CLI tool for AI agents to control Windows Remote Desktop sessions",
   "repository": {
@@ -48,11 +48,11 @@
   },
   "homepage": "https://github.com/denisix/agent-rdp#readme",
   "optionalDependencies": {
-    "@denisix/agent-rdp-darwin-arm64": "workspace:*",
-    "@denisix/agent-rdp-darwin-x64": "workspace:*",
-    "@denisix/agent-rdp-linux-x64": "workspace:*",
-    "@denisix/agent-rdp-linux-arm64": "workspace:*",
-    "@denisix/agent-rdp-win32-x64": "workspace:*",
-    "@denisix/agent-rdp-win32-arm64": "workspace:*"
+    "@denisixnpm/agent-rdp-darwin-arm64": "workspace:*",
+    "@denisixnpm/agent-rdp-darwin-x64": "workspace:*",
+    "@denisixnpm/agent-rdp-linux-x64": "workspace:*",
+    "@denisixnpm/agent-rdp-linux-arm64": "workspace:*",
+    "@denisixnpm/agent-rdp-win32-x64": "workspace:*",
+    "@denisixnpm/agent-rdp-win32-arm64": "workspace:*"
   }
 }

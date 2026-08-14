@@ -33,7 +33,7 @@ function findModelsDir(): string {
 function getPlatformPackage(): string {
   const platform = process.platform; // 'darwin', 'linux', 'win32'
   const arch = process.arch; // 'arm64', 'x64'
-  return `@denisix/agent-rdp-${platform}-${arch}`;
+  return `@denisixnpm/agent-rdp-${platform}-${arch}`;
 }
 
 /**

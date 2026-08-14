@@ -1,5 +1,5 @@
 {
-  "name": "@denisix/agent-rdp-darwin-arm64",
+  "name": "@denisixnpm/agent-rdp-darwin-arm64",
   "version": "0.6.5",
   "description": "agent-rdp native binary for macOS ARM64 (Apple Silicon)",
   "repository": {

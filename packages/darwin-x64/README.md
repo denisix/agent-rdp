@@ -1,11 +1,11 @@
-# @denisix/agent-rdp-darwin-x64
+# @denisixnpm/agent-rdp-darwin-x64
 
 Native binary package for macOS x64 (Intel).
 
 This is a platform-specific package that contains the native binary for agent-rdp. You should not install this package directly - instead, install the main package:
 
 ```bash
-npm install @denisix/agent-rdp
+npm install @denisixnpm/agent-rdp
 ```
 
 The main package will automatically install the correct platform-specific binary for your system.
