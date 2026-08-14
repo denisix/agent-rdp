@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/denisix/agent-rdp/compare/win32-x64-v0.7.0...win32-x64-v0.7.1) (2026-08-14)
+
+
+### Miscellaneous Chores
+
+* **win32-x64:** Synchronize agent-rdp packages versions
+
 ## [0.7.0](https://github.com/denisix/agent-rdp/compare/win32-x64-v0.6.5...win32-x64-v0.7.0) (2026-08-14)
 
 
