@@ -1,5 +1,11 @@
 # agent-rdp
 
+[![npm](https://img.shields.io/npm/v/@denisixnpm/agent-rdp.svg)](https://www.npmjs.com/package/@denisixnpm/agent-rdp)
+[![CI](https://github.com/denisix/agent-rdp/actions/workflows/ci.yml/badge.svg)](https://github.com/denisix/agent-rdp/actions/workflows/ci.yml)
+[![Release](https://github.com/denisix/agent-rdp/actions/workflows/release-please.yml/badge.svg)](https://github.com/denisix/agent-rdp/actions/workflows/release-please.yml)
+[![license](https://img.shields.io/npm/l/@denisixnpm/agent-rdp.svg)](#license)
+[![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-informational)](#installation)
+
 A CLI tool for AI agents to control Windows Remote Desktop sessions, built on [IronRDP](https://github.com/Devolutions/IronRDP).
 
 ## Demo
