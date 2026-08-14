@@ -205,11 +205,16 @@ jobs:
         run: |
           gh release upload "$TAG_NAME" release/* --clobber
 
+      # Deliberately no registry-url: it makes setup-node write an .npmrc
+      # containing _authToken=${NODE_AUTH_TOKEN}, and with no token supplied
+      # that resolves to setup-node's dummy value. npm would then try that
+      # bogus token instead of performing the OIDC exchange. Publishing here
+      # authenticates purely via trusted publishing (id-token: write), and the
+      # default registry is already registry.npmjs.org.
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Update npm for OIDC support
         run: npm install -g npm@latest
@@ -245,11 +250,14 @@ jobs:
             fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
           "
 
+      # Publish from inside each directory. `npm publish packages/<name>`
+      # parses the bare owner/repo-shaped argument as a GitHub shorthand
+      # rather than a path, and fails with EALLOWGIT.
       - name: Publish platform packages
         run: |
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64 win32-arm64; do
             echo "Publishing @denisixnpm/agent-rdp-$platform..."
-            npm publish --access public --provenance packages/$platform
+            ( cd "packages/$platform" && npm publish --access public --provenance )
           done
 
       - name: Publish main package
@@ -259,4 +267,4 @@ jobs:
           # than being duplicated into all six platform packages.
           mkdir -p packages/agent-rdp/models
           cp models/*.rten packages/agent-rdp/models/
-          npm publish --access public --provenance packages/agent-rdp
+          ( cd packages/agent-rdp && npm publish --access public --provenance )
