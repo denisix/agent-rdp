@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.7.0](https://github.com/denisix/agent-rdp/compare/win32-arm64-v0.6.5...win32-arm64-v0.7.0) (2026-08-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* publish under the @denisixnpm npm scope
+* publish under @denisix/agent-rdp scope with credit to original author
+* restructure to pnpm workspaces with platform-specific packages ([#33](https://github.com/denisix/agent-rdp/issues/33))
+
+### Features
+
+* restructure to pnpm workspaces with platform-specific packages ([#33](https://github.com/denisix/agent-rdp/issues/33)) ([79f6474](https://github.com/denisix/agent-rdp/commit/79f647472479fc19db33383278116f03097d30ce))
+
+
+### Bug Fixes
+
+* add README files to platform packages and fix relative refs in main README ([#65](https://github.com/denisix/agent-rdp/issues/65)) ([86390fd](https://github.com/denisix/agent-rdp/commit/86390fdd87b44a1418693ff46dfd32e1c8d3a211))
+* bundle models in platform packages and use pnpm publish ([#37](https://github.com/denisix/agent-rdp/issues/37)) ([1010de2](https://github.com/denisix/agent-rdp/commit/1010de2410b0e4881f3cfe39ebbd729b6fc19210))
+* configure release-please to manage all platform packages ([#36](https://github.com/denisix/agent-rdp/issues/36)) ([34b7fe5](https://github.com/denisix/agent-rdp/commit/34b7fe5b4d81ad94501ec76c2ad152c547e975e3))
+* restore binary exec bit at runtime and dedupe OCR models ([53276fc](https://github.com/denisix/agent-rdp/commit/53276fccec8bfb815265bfe02fd6718f0cda906c))
+
+
+### Miscellaneous Chores
+
+* publish under @denisix/agent-rdp scope with credit to original author ([57e825e](https://github.com/denisix/agent-rdp/commit/57e825e33f5c4594dca542c17e107c765789ff86))
+* publish under the [@denisixnpm](https://github.com/denisixnpm) npm scope ([5db752e](https://github.com/denisix/agent-rdp/commit/5db752e3acf917f25c5af6a1f9330638f7817ce7))
+
 ## [0.6.5](https://github.com/thisnick/agent-rdp/compare/win32-arm64-v0.6.4...win32-arm64-v0.6.5) (2026-02-26)
 
 

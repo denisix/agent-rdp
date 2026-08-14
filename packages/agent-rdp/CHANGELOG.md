@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.7.0](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.6.5...agent-rdp-v0.7.0) (2026-08-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* publish under the @denisixnpm npm scope
+* publish under @denisix/agent-rdp scope with credit to original author
+* restructure to pnpm workspaces with platform-specific packages ([#33](https://github.com/denisix/agent-rdp/issues/33))
+
+### Features
+
+* add IPC schema type generation with ts-rs ([#48](https://github.com/denisix/agent-rdp/issues/48)) ([2f2953a](https://github.com/denisix/agent-rdp/commit/2f2953a3abe816b71b8d43252af622ac22a5ec5d))
+* add path option to Node SDK screenshot() to avoid base64 overhead ([a66e33e](https://github.com/denisix/agent-rdp/commit/a66e33ea02c6b929d438853ad080c7af2351adc7))
+* restructure to pnpm workspaces with platform-specific packages ([#33](https://github.com/denisix/agent-rdp/issues/33)) ([79f6474](https://github.com/denisix/agent-rdp/commit/79f647472479fc19db33383278116f03097d30ce))
+
+
+### Bug Fixes
+
+* bind stream server to loopback and restrict IPC socket perms ([f52322c](https://github.com/denisix/agent-rdp/commit/f52322c61c62c9ffe97902dcaa4f1248b840b9a8))
+* bundle models in platform packages and use pnpm publish ([#37](https://github.com/denisix/agent-rdp/issues/37)) ([1010de2](https://github.com/denisix/agent-rdp/commit/1010de2410b0e4881f3cfe39ebbd729b6fc19210))
+* honour stream_fps and stream_port from connect requests ([94c96a3](https://github.com/denisix/agent-rdp/commit/94c96a396738df56366b5116c85e531225d87fa8))
+* quote automate run arguments, support --shell, add streaming output ([f2a7907](https://github.com/denisix/agent-rdp/commit/f2a790793a5aa41cc19b778c33ca4561bae423b8))
+* restore binary exec bit at runtime and dedupe OCR models ([53276fc](https://github.com/denisix/agent-rdp/commit/53276fccec8bfb815265bfe02fd6718f0cda906c))
+
+
+### Maintenance
+
+* publish under @denisix/agent-rdp scope with credit to original author ([57e825e](https://github.com/denisix/agent-rdp/commit/57e825e33f5c4594dca542c17e107c765789ff86))
+* publish under the [@denisixnpm](https://github.com/denisixnpm) npm scope ([5db752e](https://github.com/denisix/agent-rdp/commit/5db752e3acf917f25c5af6a1f9330638f7817ce7))
+
 ## [0.6.5](https://github.com/thisnick/agent-rdp/compare/agent-rdp-v0.6.4...agent-rdp-v0.6.5) (2026-02-26)
 
 
