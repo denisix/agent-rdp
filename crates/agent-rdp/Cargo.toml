@@ -38,8 +38,6 @@ anyhow = { workspace = true }
 
 # Platform utilities
 glob = { workspace = true }
-shellexpand = "3"
-open = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

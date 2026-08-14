@@ -78,7 +78,7 @@ fn parse_drive_mappings(drives: &[String], output: &Output) -> anyhow::Result<Ve
             }
 
             // Expand ~ to home directory and verify path exists
-            let expanded_path = shellexpand::tilde(path);
+            let expanded_path = expand_tilde(path);
             let path_ref = Path::new(expanded_path.as_ref());
 
             if !path_ref.exists() {
@@ -114,6 +114,28 @@ fn parse_drive_mappings(drives: &[String], output: &Output) -> anyhow::Result<Ve
     }
 
     Ok(result)
+}
+
+/// Expand a leading `~` to the user's home directory, without depending on
+/// the `shellexpand` crate. Falls back to the original path unchanged if it
+/// doesn't start with `~` or the home directory can't be resolved.
+fn expand_tilde(path: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    if path != "~" && !path.starts_with("~/") {
+        return Cow::Borrowed(path);
+    }
+
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var("HOME");
+
+    match home {
+        Ok(home) if path == "~" => Cow::Owned(home),
+        Ok(home) => Cow::Owned(format!("{}{}", home, &path[1..])),
+        Err(_) => Cow::Borrowed(path),
+    }
 }
 
 /// Get password from command line, environment, or stdin.

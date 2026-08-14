@@ -6,11 +6,16 @@ members = [
     "crates/agent-rdp-protocol",
 ]
 
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
 [workspace.package]
 version = "0.6.5" # x-release-please-version
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/anthropics/agent-rdp"
+repository = "https://github.com/denisix/agent-rdp"
 rust-version = "1.75"
 
 [workspace.dependencies]
@@ -26,7 +31,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "io-util", "sync", "time", "signal"] }
 
 # IronRDP - use umbrella crate with features
 ironrdp = { version = "0.14", features = ["connector", "session", "input", "graphics"] }
