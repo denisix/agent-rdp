@@ -35,6 +35,45 @@ npm install -g @denisixnpm/agent-rdp
 npx add-skill https://github.com/denisix/agent-rdp
 ```
 
+### From a GitHub release
+
+Each release attaches a standalone binary per platform, plus the OCR models as
+`agent-rdp-models.tar.gz` / `agent-rdp-models.zip`. The models are
+architecture-independent, so they ship once rather than inside every archive.
+
+The binary alone covers everything except `locate`; that command needs the
+models, so extract them too and point `AGENT_RDP_MODELS_DIR` at them.
+
+**macOS / Linux**
+
+```bash
+tar -xzf agent-rdp-linux-x64.tar.gz -C ~/.local/bin      # or agent-rdp-darwin-arm64.tar.gz
+chmod +x ~/.local/bin/agent-rdp
+mkdir -p ~/.local/share/agent-rdp/models
+tar -xzf agent-rdp-models.tar.gz -C ~/.local/share/agent-rdp/models
+export AGENT_RDP_MODELS_DIR="$HOME/.local/share/agent-rdp/models"   # add to your shell rc to persist
+```
+
+On macOS the release binaries are unsigned, so Gatekeeper quarantines anything
+downloaded from a browser. If you get *"cannot be opened because the developer
+cannot be verified"*, clear the flag:
+
+```bash
+xattr -d com.apple.quarantine ~/.local/bin/agent-rdp
+```
+
+**Windows (PowerShell)**
+
+```powershell
+Expand-Archive agent-rdp-win32-x64.zip -DestinationPath "$env:LOCALAPPDATA\agent-rdp"
+Expand-Archive agent-rdp-models.zip -DestinationPath "$env:LOCALAPPDATA\agent-rdp\models"
+# persist for future sessions (restart the terminal afterwards)
+setx AGENT_RDP_MODELS_DIR "$env:LOCALAPPDATA\agent-rdp\models"
+```
+
+Installing from npm needs none of this — the models ship inside
+`@denisixnpm/agent-rdp` and are located automatically.
+
 ### From source
 
 ```bash

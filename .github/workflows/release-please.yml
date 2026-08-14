@@ -189,6 +189,14 @@ jobs:
           for platform in win32-x64 win32-arm64; do
             (cd packages/$platform/bin && zip ../../../release/agent-rdp-$platform.zip agent-rdp.exe)
           done
+          # OCR models, shipped once because they are architecture-independent.
+          # The platform archives carry only the binary, so anyone installing
+          # from a release (rather than npm, where the models ride along in the
+          # main package) needs this to use `locate`. Provided in both formats
+          # to match the per-platform archives: .tar.gz for macOS/Linux, .zip
+          # for Windows.
+          tar -czvf release/agent-rdp-models.tar.gz -C models .
+          (cd models && zip ../release/agent-rdp-models.zip ./*.rten)
           ls -la release/
 
       - name: Create GitHub Release if needed
