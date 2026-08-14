@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.1...agent-rdp-v0.7.2) (2026-08-14)
+
+
+### Maintenance
+
+* **agent-rdp:** Synchronize agent-rdp packages versions
+
 ## [0.7.1](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.0...agent-rdp-v0.7.1) (2026-08-14)
 
 

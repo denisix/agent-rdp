@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.1...agent-rdp-rust-v0.7.2) (2026-08-14)
+
+
+### Features
+
+* ship OCR models as a release asset for non-npm installs ([3beba1e](https://github.com/denisix/agent-rdp/commit/3beba1e581c1ffd6215035469e7d73fa7ae052cf))
+
 ## [0.7.1](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.0...agent-rdp-rust-v0.7.1) (2026-08-14)
 
 
