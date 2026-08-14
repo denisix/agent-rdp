@@ -6,7 +6,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.1.
+Tested against agent-rdp 0.7.3.
 
 If `agent-rdp` is not on PATH, install it first — this is expected on a fresh
 machine and needs no confirmation:
@@ -28,6 +28,60 @@ agent-rdp disconnect
 Prefer `automate fill`/`automate click` over raw `keyboard type`/`mouse click` when `--enable-win-automation` is set: lossless and ref-based, no coordinate guessing.
 
 After connecting, wait ~5s before the first input — immediate input can be dropped while the desktop stabilizes: `agent-rdp wait 5000`.
+
+## Reliability rules (learned from real failures)
+
+**A DVC timeout does NOT mean the action failed.** `automation indeterminate`
+means the request reached the agent but the reply was lost — it may well have
+been applied. Never blindly retry: check state first, or you double-apply
+(text typed twice, a button clicked twice).
+
+```bash
+agent-rdp automate get "@e2"        # read back before retrying
+```
+
+**"Channel unresponsive" is usually transient.** It recovers on its own. Re-probe
+with `automate status` before reconnecting; a needless reconnect re-issues all
+refs and, combined with a retry, is what corrupts state.
+
+**Verify with `automate get`, not OCR.** `get` now returns `Value:` for text
+controls including multiline editors. OCR (`locate`) misreads confidently —
+it read "Hello World!" as "Hel1o Worldi", so `locate "Hello"` found nothing.
+Use OCR only when UI Automation cannot see the element.
+
+**Wildcards search the whole desktop, including the taskbar.** `~*Notepad*`
+matches the taskbar button before the window. Get the exact title first:
+
+```bash
+agent-rdp automate window list              # -> "Untitled - Notepad"
+agent-rdp automate snapshot -s "Untitled - Notepad"
+```
+
+**Concurrency:** parallelise only read-only commands (`session info`, `status`,
+`screenshot`, `snapshot`) and keep it to ~4. Never run input events
+concurrently — they race and reorder in the remote UI. Always handle
+`daemon_not_running`: if the daemon exited, `<session>/daemon.log` says why.
+
+## Speed
+
+The dominant cost of a short command is ~140ms of process startup, not the
+network (a round-trip incl. a full screenshot is ~85ms). So:
+
+- **Make fewer tool calls.** Batch independent commands into one shell
+  invocation with `;` — five commands in one call costs one round-trip, not five.
+- **Block server-side.** `automate wait-for <sel> --timeout 15000` returns the
+  moment the condition holds. Never poll `screenshot` in a loop.
+- **Reuse refs.** They stay stable while the window is unchanged; re-snapshot
+  only after the UI actually changes. They are NOT stable across reconnects.
+- **Use the Node API for long sequences** — it pays process startup once.
+- `-i` / `-c` on snapshots cut *output size*, not time. Use them to save
+  context, not to go faster.
+- `automate run --wait` beats `run` + repeated `run-poll` unless the command is
+  genuinely long-running.
+
+`keyboard type` is batched and fast (dozens of characters in one round-trip),
+so it no longer needs a clipboard workaround. If a remote app drops fast input,
+pace it with `--delay 20` rather than falling back to clipboard.
 
 ## Core workflow
 
@@ -63,7 +117,8 @@ agent-rdp mouse move 100 200
 agent-rdp mouse drag 100 100 500 500
 
 # Keyboard
-agent-rdp keyboard type "Hello World"      # Unicode-safe
+agent-rdp keyboard type "Hello World"      # Unicode-safe, batched into one round-trip
+agent-rdp keyboard type "text" --delay 20  # pace it only if the remote app drops fast input
 agent-rdp keyboard press "ctrl+c"          # use "press", not "key"
 agent-rdp keyboard press "win+r"
 agent-rdp keyboard press enter
@@ -73,6 +128,7 @@ agent-rdp scroll up 3
 agent-rdp scroll down 5 --at 600 400
 
 # Clipboard (first use can block during remote channel init; wrap in a timeout)
+# Note: no longer needed as a fast path for bulk text - `keyboard type` is batched
 agent-rdp clipboard set "text"
 agent-rdp clipboard get
 
@@ -104,7 +160,7 @@ agent-rdp automate expand "@e3"
 agent-rdp automate collapse "@e3"
 agent-rdp automate context-menu "@e5"
 agent-rdp automate focus <selector>
-agent-rdp automate get <selector>
+agent-rdp automate get <selector>            # includes Value: for text/multiline edits
 agent-rdp automate fill <selector> "text"
 agent-rdp automate clear <selector>
 agent-rdp automate scroll <selector> --direction down --amount 3

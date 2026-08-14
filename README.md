@@ -564,6 +564,20 @@ If you need vision-based coordinate detection with Claude, implement your own ha
 - Target RDP server with Network Level Authentication (NLA) enabled
 - Target RDP server must support TLS 1.2 or later. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1, so legacy targets (e.g. Windows Server 2008 R2) are not currently supported and will fail with a TLS handshake error.
 
+If the server has NLA **and** TLS disabled it offers only Standard RDP Security,
+which IronRDP refuses outright, and `connect` fails with *"server only supports
+Standard RDP Security"*. Enable NLA on the host to fix it:
+
+```powershell
+Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name SecurityLayer -Value 2
+Restart-Service TermService -Force
+```
+
+Standard RDP Security uses RC4 with a well-known key derivation, so credentials
+sent over it are trivially recoverable — this is worth fixing on the host rather
+than working around.
+
 ## Credits
 
 Originally created by [Nick Yu](https://github.com/thisnick) ([thisnick/agent-rdp](https://github.com/thisnick/agent-rdp)). This fork ([denisix/agent-rdp](https://github.com/denisix/agent-rdp), published to npm as [`@denisixnpm/agent-rdp`](https://www.npmjs.com/package/@denisixnpm/agent-rdp)) is maintained independently with additional fixes and features; see [CHANGELOG.md](packages/agent-rdp/CHANGELOG.md) for what's changed.
