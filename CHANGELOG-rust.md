@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.3](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.2...agent-rdp-rust-v0.7.3) (2026-08-14)
+
+
+### Bug Fixes
+
+* batch keystrokes, surface indeterminate automation results, read back text ([18cc802](https://github.com/denisix/agent-rdp/commit/18cc802cde422d5df43017f13cd1688371b0a436))
+* drop redundant postinstall so installs stop warning ([fdadcc7](https://github.com/denisix/agent-rdp/commit/fdadcc7736dca840fbf275910456cdb3ca4d21e9))
+
 ## [0.7.2](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.1...agent-rdp-rust-v0.7.2) (2026-08-14)
 
 
