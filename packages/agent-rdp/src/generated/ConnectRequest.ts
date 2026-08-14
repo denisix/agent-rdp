@@ -46,6 +46,14 @@ enable_win_automation: boolean,
  */
 stream_port: number, 
 /**
+ * Address the streaming server binds to (default: 127.0.0.1).
+ *
+ * The stream grants full mouse/keyboard/clipboard control of the session
+ * and has no authentication, so it stays on loopback unless explicitly
+ * widened (e.g. to 0.0.0.0 inside a trusted network).
+ */
+stream_bind: string, 
+/**
  * Streaming frame rate (default: 10).
  */
 stream_fps: number, 

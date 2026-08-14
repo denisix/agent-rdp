@@ -22,6 +22,7 @@ pub async fn handle(
 ) -> Response {
     let enable_automation = params.enable_win_automation;
     let stream_port = params.stream_port;
+    let stream_bind = params.stream_bind.clone();
     let stream_fps = params.stream_fps;
     let stream_quality = params.stream_quality;
     let serve_viewer = params.serve_viewer;
@@ -130,6 +131,7 @@ pub async fn handle(
         if ws.is_none() {
             let config = WsServerConfig {
                 port: stream_port,
+                bind: stream_bind.clone(),
                 fps: stream_fps,
                 jpeg_quality: stream_quality,
                 serve_viewer,
@@ -137,7 +139,10 @@ pub async fn handle(
             let ws_server = WsServer::new(config);
             match ws_server.start(Arc::clone(rdp_session)).await {
                 Ok(handle) => {
-                    info!("WebSocket streaming enabled on port {}", stream_port);
+                    info!(
+                        "WebSocket streaming enabled on {}:{}",
+                        stream_bind, stream_port
+                    );
                     *ws = Some(handle);
 
                     // Set up clipboard change notification channel

@@ -25,6 +25,17 @@ pub struct Cli {
     #[arg(long, default_value = "0", env = "AGENT_RDP_STREAM_PORT", global = true)]
     pub stream_port: u16,
 
+    /// Address the streaming server binds to. The stream is unauthenticated and
+    /// grants full control of the session, so it stays on loopback unless you
+    /// explicitly widen it (e.g. 0.0.0.0 on a trusted network)
+    #[arg(
+        long,
+        default_value = "127.0.0.1",
+        env = "AGENT_RDP_STREAM_BIND",
+        global = true
+    )]
+    pub stream_bind: String,
+
     #[command(subcommand)]
     pub command: Commands,
 }

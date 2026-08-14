@@ -74,6 +74,7 @@ type ClientId = u64;
 /// WebSocket server for desktop streaming.
 pub struct WsServer {
     port: u16,
+    bind: String,
     jpeg_quality: u8,
     serve_viewer: bool,
     /// Active clients (by ID).
@@ -85,6 +86,10 @@ pub struct WsServer {
 /// Configuration for the WebSocket server.
 pub struct WsServerConfig {
     pub port: u16,
+    /// Address to bind to. Defaults to loopback: the stream is unauthenticated
+    /// and grants full input/clipboard control, so it must not be exposed to
+    /// the network unless the operator explicitly asks for it.
+    pub bind: String,
     pub fps: u32,
     pub jpeg_quality: u8,
     /// Serve the embedded HTML viewer on HTTP requests.
@@ -95,6 +100,7 @@ impl Default for WsServerConfig {
     fn default() -> Self {
         Self {
             port: 9224,
+            bind: "127.0.0.1".to_string(),
             fps: 10,
             jpeg_quality: 80,
             serve_viewer: false,
@@ -107,6 +113,7 @@ impl WsServer {
     pub fn new(config: WsServerConfig) -> Self {
         Self {
             port: config.port,
+            bind: config.bind,
             jpeg_quality: config.jpeg_quality,
             serve_viewer: config.serve_viewer,
             clients: Arc::new(Mutex::new(HashSet::new())),
@@ -121,7 +128,7 @@ impl WsServer {
         &self,
         rdp_session: Arc<tokio::sync::Mutex<Option<RdpSession>>>,
     ) -> anyhow::Result<WsServerHandle> {
-        let addr = format!("0.0.0.0:{}", self.port);
+        let addr = format!("{}:{}", self.bind, self.port);
         let listener = TcpListener::bind(&addr).await?;
         info!("WebSocket server listening on ws://{}", addr);
 

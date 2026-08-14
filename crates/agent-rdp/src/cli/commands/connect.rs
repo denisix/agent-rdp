@@ -15,6 +15,7 @@ pub async fn run(
     output: &Output,
     timeout_ms: u64,
     stream_port: u16,
+    stream_bind: String,
 ) -> anyhow::Result<()> {
     // Get password from args, env, or stdin
     let password = get_password(&args, output)?;
@@ -36,6 +37,7 @@ pub async fn run(
         drives,
         enable_win_automation: args.enable_win_automation,
         stream_port,
+        stream_bind,
         // CLI enables the viewer HTML when streaming is enabled
         serve_viewer: stream_port > 0,
         ..Default::default()

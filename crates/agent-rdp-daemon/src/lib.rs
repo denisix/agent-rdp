@@ -77,9 +77,16 @@ pub fn cleanup_session(session: &str) {
 pub async fn run_server(session: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
-    // Create session directory
+    // Create session directory. It lives under a world-traversable /tmp and
+    // holds the IPC socket, which grants full control of the session, so it is
+    // restricted to the owner rather than left to the umask.
     let session_dir = get_session_dir(session);
     std::fs::create_dir_all(&session_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
 
     // Write PID file
     let pid_path = get_pid_path(session);

@@ -34,7 +34,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Connect(args) => {
-            cli::commands::connect::run(&cli.session, args, &output, cli.timeout, cli.stream_port).await
+            cli::commands::connect::run(
+                &cli.session,
+                args,
+                &output,
+                cli.timeout,
+                cli.stream_port,
+                cli.stream_bind.clone(),
+            )
+            .await
         }
         Commands::Disconnect => {
             cli::commands::disconnect::run(&cli.session, &output, cli.timeout).await

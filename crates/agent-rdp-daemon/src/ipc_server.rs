@@ -45,6 +45,15 @@ impl IpcServer {
         }
 
         let listener = tokio::net::UnixListener::bind(path)?;
+
+        // Anyone who can connect to this socket can drive the RDP session
+        // (inject input, read the clipboard, take screenshots), so restrict it
+        // to the owner instead of relying on the umask.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
         let address = path.display().to_string();
 
         info!("IPC server listening on {}", address);
