@@ -116,9 +116,28 @@ if [[ -n "$DRY_RUN" ]]; then
 fi
 
 echo "Verifying all 7 names exist..."
+
+# npm caches the 404 it got while checking whether the name was free, so a
+# plain `npm view` straight after publishing can still report it missing.
+# --prefer-online bypasses that, and a short retry covers registry lag.
+lookup_version() {
+  local pkg="$1" attempt
+  for attempt in 1 2 3 4 5; do
+    local v
+    v="$(npm view --prefer-online "$pkg" version 2>/dev/null)"
+    if [[ -n "$v" ]]; then
+      printf '%s' "$v"
+      return 0
+    fi
+    sleep 3
+  done
+  printf 'MISSING'
+  return 1
+}
+
 missing=0
 for name in "agent-rdp" "${PLATFORMS[@]/#/agent-rdp-}"; do
-  version="$(npm view "$SCOPE/$name" version 2>/dev/null || echo MISSING)"
+  version="$(lookup_version "$SCOPE/$name")"
   printf '  %-44s %s\n' "$SCOPE/$name" "$version"
   [[ "$version" == "MISSING" ]] && missing=1
 done
