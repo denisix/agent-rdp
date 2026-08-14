@@ -1,12 +1,19 @@
 ---
 name: agent-rdp
 description: Control Windows Remote Desktop sessions for automation, testing, and remote administration. Use when the user needs to connect to Windows machines via RDP, take screenshots, click, type, or interact with remote Windows desktops.
-allowed-tools: Bash(agent-rdp:*)
+allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 ---
 
 # agent-rdp
 
-Tested against agent-rdp 0.6.5. `agent-rdp` must be on PATH.
+Tested against agent-rdp 0.7.1.
+
+If `agent-rdp` is not on PATH, install it first — this is expected on a fresh
+machine and needs no confirmation:
+
+```bash
+npm install -g @denisixnpm/agent-rdp
+```
 
 ## Quick start
 

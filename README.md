@@ -49,11 +49,14 @@ bun run build:ts   # Build TypeScript
 
 ### Claude Code
 
-Fastest activation — installs the [SKILL.md](skills/agent-rdp/SKILL.md) workflow so Claude knows the commands, flags, and gotchas without you explaining them:
+One command — installs the [SKILL.md](skills/agent-rdp/SKILL.md) workflow so Claude knows the commands, flags, and gotchas without you explaining them:
 
 ```bash
 npx add-skill https://github.com/denisix/agent-rdp
 ```
+
+You don't need to install the CLI separately: the skill installs
+`@denisixnpm/agent-rdp` on first use if it isn't already on PATH.
 
 Or install manually:
 
