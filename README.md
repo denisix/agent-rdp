@@ -45,6 +45,58 @@ bun run build      # Build native binary
 bun run build:ts   # Build TypeScript
 ```
 
+## Using with AI Coding Agents
+
+### Claude Code
+
+Fastest activation — installs the [SKILL.md](skills/agent-rdp/SKILL.md) workflow so Claude knows the commands, flags, and gotchas without you explaining them:
+
+```bash
+npx add-skill https://github.com/denisix/agent-rdp
+```
+
+Or install manually:
+
+```bash
+mkdir -p .claude/skills/agent-rdp
+curl -o .claude/skills/agent-rdp/SKILL.md \
+  https://raw.githubusercontent.com/denisix/agent-rdp/main/skills/agent-rdp/SKILL.md
+```
+
+Then just ask Claude Code, in plain language:
+
+```
+Connect to 192.168.1.100 as Administrator (password: secret), open Notepad,
+type "hello from Claude", and take a screenshot.
+```
+
+Claude will run the underlying `agent-rdp connect`, `automate run`, `keyboard type`, and `screenshot` commands on its own.
+
+### Codex
+
+Codex doesn't have a skill-install mechanism, but it reads `AGENTS.md` for project instructions. Point it at this tool by adding a section to your `AGENTS.md`:
+
+```bash
+cat >> AGENTS.md <<'EOF'
+
+## Remote Windows control
+
+Use the `agent-rdp` CLI (npm i -g @denisix/agent-rdp) to control Windows machines via RDP:
+connect, screenshot, mouse/keyboard input, and UI Automation. See
+https://github.com/denisix/agent-rdp for the full command reference.
+EOF
+```
+
+Then prompt Codex the same way:
+
+```
+codex "Connect to the Windows VM at 192.168.1.100 (user Administrator, password
+secret) using agent-rdp, open the Run dialog, launch calc.exe, and confirm it's
+open with a screenshot."
+```
+
+Codex will call `agent-rdp` as a regular shell command, same as any other CLI tool.
+
 ## Usage
 
 ### Connect to an RDP Server
@@ -319,6 +371,7 @@ agent-rdp --json screenshot --output desktop.png
 | `AGENT_RDP_PASSWORD` | RDP password |
 | `AGENT_RDP_SESSION` | Session name (default: "default") |
 | `AGENT_RDP_STREAM_PORT` | WebSocket streaming port (0 = disabled) |
+| `AGENT_RDP_MODELS_DIR` | Override the OCR models directory (set automatically by the npm wrapper; useful for standalone binary installs) |
 
 ## Node.js API
 

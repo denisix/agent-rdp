@@ -106,6 +106,7 @@ Input sent as `FastPathInputEvent` (mouse via `MousePdu`, keyboard via scancode 
 | `AGENT_RDP_PASSWORD` | RDP password |
 | `AGENT_RDP_SESSION` | Session name (default: "default") |
 | `AGENT_RDP_STREAM_PORT` | WebSocket streaming port (0 = disabled) |
+| `AGENT_RDP_MODELS_DIR` | Override the OCR models directory (set automatically by the npm wrapper; useful for standalone binary installs) |
 
 ## Release Process
 
