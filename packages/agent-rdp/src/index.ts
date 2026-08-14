@@ -58,6 +58,16 @@ export interface RdpSessionOptions {
   timeout?: number;
   /** WebSocket streaming port (0 = disabled). Connect to ws://localhost:<port> for frames. */
   streamPort?: number;
+  /**
+   * Address the streaming server binds to (default: '127.0.0.1'). The stream is
+   * unauthenticated and grants full control of the session, so only widen this
+   * (e.g. '0.0.0.0') on a trusted network.
+   */
+  streamBind?: string;
+  /** Streaming frame rate (default: 10). */
+  streamFps?: number;
+  /** Streaming JPEG quality, 0-100 (default: 80). */
+  streamQuality?: number;
 }
 
 /**
@@ -196,6 +206,9 @@ export class RdpSession {
   private session: string;
   private timeout: number;
   private streamPort: number;
+  private streamBind: string;
+  private streamFps: number;
+  private streamQuality: number;
   private daemon: DaemonManager;
   private client: IpcClient | null = null;
 
@@ -203,6 +216,9 @@ export class RdpSession {
     this.session = options.session ?? 'default';
     this.timeout = options.timeout ?? 30000;
     this.streamPort = options.streamPort ?? 0;
+    this.streamBind = options.streamBind ?? '127.0.0.1';
+    this.streamFps = options.streamFps ?? 10;
+    this.streamQuality = options.streamQuality ?? 80;
     this.daemon = new DaemonManager(this.session, this.streamPort);
 
     this.mouse = new MouseController(this);
@@ -242,10 +258,12 @@ export class RdpSession {
       height: options.height ?? 800,
       drives: options.drives ?? [],
       enable_win_automation: options.enableWinAutomation ?? false,
-      stream_port: 0,
-      stream_fps: 10,
-      stream_quality: 80,
-      serve_viewer: false,
+      stream_port: this.streamPort,
+      stream_bind: this.streamBind,
+      stream_fps: this.streamFps,
+      stream_quality: this.streamQuality,
+      // Serve the HTML viewer whenever streaming is on, matching the CLI.
+      serve_viewer: this.streamPort > 0,
     };
 
     const response = await this._send(request);

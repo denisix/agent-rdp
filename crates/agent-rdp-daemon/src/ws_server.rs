@@ -75,6 +75,7 @@ type ClientId = u64;
 pub struct WsServer {
     port: u16,
     bind: String,
+    fps: u32,
     jpeg_quality: u8,
     serve_viewer: bool,
     /// Active clients (by ID).
@@ -114,6 +115,7 @@ impl WsServer {
         Self {
             port: config.port,
             bind: config.bind,
+            fps: config.fps,
             jpeg_quality: config.jpeg_quality,
             serve_viewer: config.serve_viewer,
             clients: Arc::new(Mutex::new(HashSet::new())),
@@ -188,6 +190,7 @@ impl WsServer {
         Ok(WsServerHandle {
             broadcast_tx: broadcast_tx_clone,
             clients: Arc::clone(&self.clients),
+            fps: self.fps.max(1),
             jpeg_quality: self.jpeg_quality,
         })
     }
@@ -197,10 +200,17 @@ impl WsServer {
 pub struct WsServerHandle {
     broadcast_tx: tokio::sync::broadcast::Sender<String>,
     clients: Arc<Mutex<HashSet<ClientId>>>,
+    fps: u32,
     jpeg_quality: u8,
 }
 
 impl WsServerHandle {
+    /// Frame rate this stream was started with, so the daemon's broadcast
+    /// timer can match the rate requested at connect time.
+    pub fn fps(&self) -> u32 {
+        self.fps
+    }
+
     /// Check if there are any connected clients.
     pub fn has_clients(&self) -> bool {
         !self.clients.lock().is_empty()

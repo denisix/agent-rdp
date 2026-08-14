@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use agent_rdp_protocol::{Request, Response, ResponseData, SessionInfo, ConnectionState, ErrorCode};
 use tokio::sync::{broadcast, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::automation::{new_shared_state, SharedAutomationState};
 use crate::handlers;
@@ -105,9 +105,12 @@ impl Daemon {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        // Frame broadcast interval for WebSocket streaming
-        let frame_interval = Duration::from_millis(1000 / self.stream_fps.max(1) as u64);
-        let mut frame_timer = tokio::time::interval(frame_interval);
+        // Frame broadcast interval for WebSocket streaming. Starts at the
+        // daemon-wide default and is re-tuned below once a stream is running,
+        // since the rate can be chosen per-connection via ConnectRequest.
+        let mut current_fps = self.stream_fps.max(1);
+        let mut frame_timer =
+            tokio::time::interval(Duration::from_millis(1000 / current_fps as u64));
         frame_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -159,6 +162,18 @@ impl Daemon {
                 _ = frame_timer.tick() => {
                     let ws_handle = self.ws_handle.lock().await;
                     if let Some(ref handle) = *ws_handle {
+                        // Adopt the rate the stream was started with, so
+                        // ConnectRequest.stream_fps actually takes effect.
+                        if handle.fps() != current_fps {
+                            current_fps = handle.fps().max(1);
+                            debug!("Stream frame rate set to {} fps", current_fps);
+                            frame_timer = tokio::time::interval(
+                                Duration::from_millis(1000 / current_fps as u64),
+                            );
+                            frame_timer
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        }
+
                         if handle.has_clients() {
                             drop(ws_handle); // Release WS lock before acquiring RDP lock
                             let session = self.rdp_session.lock().await;
