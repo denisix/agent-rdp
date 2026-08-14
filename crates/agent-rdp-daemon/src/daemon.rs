@@ -140,10 +140,23 @@ impl Daemon {
                     }
                 }
 
-                // Handle connection drop from RDP session
+                // Handle connection drop from RDP session.
+                //
+                // Deliberately does NOT exit. The frame processor treats any
+                // read error as terminal, so tearing the daemon down here meant
+                // one transient RDP hiccup destroyed the whole session: every
+                // in-flight command failed with `daemon_not_running`, and the
+                // caller had to respawn a daemon rather than simply reconnect.
+                // Drop the dead session instead and stay up, so commands report
+                // "not connected" and `connect` can re-establish in place.
                 _ = self.disconnect_rx.recv() => {
-                    info!("RDP connection dropped, shutting down daemon");
-                    break;
+                    warn!("RDP connection dropped; session is now disconnected (daemon staying up)");
+
+                    *self.rdp_session.lock().await = None;
+
+                    // The stream belongs to the dead session - stop it too.
+                    *self.ws_handle.lock().await = None;
+                    *self.clipboard_changed_rx.lock().await = None;
                 }
 
                 // Handle shutdown signal from client

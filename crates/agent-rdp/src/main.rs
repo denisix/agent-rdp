@@ -13,9 +13,30 @@ use cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() {
-    // Initialize logging
+    // Initialize logging.
+    //
+    // EnvFilter defaults to ERROR-only when RUST_LOG is unset, which is right
+    // for the CLI (INFO would pollute command output) but useless for the
+    // daemon: it runs detached with its output going to <session>/daemon.log,
+    // and that log is the only record of why a session ended. Default the
+    // daemon to info so an unexpected teardown is explained; RUST_LOG still
+    // overrides either way.
+    let is_daemon = {
+        let args: Vec<String> = std::env::args().collect();
+        args.windows(2)
+            .any(|w| w[0] == "session" && w[1] == "daemon")
+    };
+
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
+    } else if is_daemon {
+        EnvFilter::new("info")
+    } else {
+        EnvFilter::from_default_env()
+    };
+
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .with_target(false)
         .init();
 

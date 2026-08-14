@@ -242,7 +242,7 @@ impl RdpSession {
         // Begin connection (pre-TLS)
         let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
             .await
-            .map_err(|e| RdpError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| RdpError::ConnectionFailed(explain_connect_error(&e.to_string())))?;
 
         // Perform TLS upgrade
         let initial_stream: TcpStream = framed.into_inner_no_leftover();
@@ -1018,4 +1018,33 @@ fn create_key_event(scancode: u8, extended: bool, release: bool) -> FastPathInpu
         flags |= KeyboardFlags::EXTENDED;
     }
     FastPathInputEvent::KeyboardEvent(flags, scancode)
+}
+
+/// Turn IronRDP's negotiation errors into something a user can act on.
+///
+/// The underlying strings describe the protocol outcome but not the fix, and
+/// the most common one ("standard RDP security") is a host misconfiguration
+/// that cannot be worked around client-side: IronRDP refuses that security
+/// layer outright, so no flag will make the connection succeed.
+fn explain_connect_error(raw: &str) -> String {
+    let lower = raw.to_lowercase();
+
+    if lower.contains("standard rdp security") {
+        return format!(
+            "{raw}. The server has both NLA and TLS disabled, leaving only the legacy \
+             Standard RDP Security layer, which is not supported (it uses RC4 with a \
+             well-known key derivation, so credentials sent over it are recoverable). \
+             Enable NLA on the Windows host - set UserAuthentication=1 and \
+             SecurityLayer=2 under HKLM\\System\\CurrentControlSet\\Control\\Terminal \
+             Server\\WinStations\\RDP-Tcp, then restart TermService."
+        );
+    }
+
+    if lower.contains("requires enhanced rdp security with credssp")
+        || lower.contains("hybrid_required")
+    {
+        return format!("{raw}. The server requires NLA/CredSSP; check the username, password and domain.");
+    }
+
+    raw.to_string()
 }
