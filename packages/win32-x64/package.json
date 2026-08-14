@@ -16,7 +16,6 @@
   ],
   "files": [
     "bin",
-    "models",
     "README.md"
   ],
   "preferUnplugged": true

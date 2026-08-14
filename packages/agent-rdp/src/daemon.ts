@@ -5,6 +5,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { IpcClient, getSessionDir, getSocketPath } from './client.js';
 import { RdpError } from './types.js';
@@ -14,6 +15,17 @@ const STARTUP_POLL_INTERVAL_MS = 100;
 
 // Create require function for resolving platform package paths in ESM
 const require = createRequire(import.meta.url);
+
+/**
+ * Locate the OCR models bundled in this package.
+ *
+ * Models are architecture-independent, so they ship here once rather than
+ * being duplicated into every platform package.
+ */
+function findModelsDir(): string {
+  // dist/daemon.js -> package root
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'models');
+}
 
 /**
  * Get the platform package name for the current OS/arch.
@@ -42,6 +54,20 @@ function findBinary(): string {
         'internal_error',
         `Binary not found at ${binaryPath}. Platform package ${platformPackage} may not be installed correctly.`
       );
+    }
+
+    // npm only guarantees the executable bit for files declared in a package's
+    // "bin" field, and dependency install scripts are opt-in as of npm v12, so
+    // the platform package's postinstall chmod may never run. Restore it here.
+    // Non-fatal: read-only stores (pnpm, Nix, container layers) will throw.
+    if (process.platform !== 'win32') {
+      try {
+        if (!(fs.statSync(binaryPath).mode & 0o111)) {
+          fs.chmodSync(binaryPath, 0o755);
+        }
+      } catch {
+        // Fall through - spawning will surface a clearer error if it really can't run.
+      }
     }
 
     return binaryPath;
@@ -124,6 +150,10 @@ export class DaemonManager {
     const child = spawn(binary, args, {
       detached: true,
       stdio: 'ignore',
+      env: {
+        ...process.env,
+        AGENT_RDP_MODELS_DIR: process.env.AGENT_RDP_MODELS_DIR ?? findModelsDir(),
+      },
     });
 
     child.unref();

@@ -64,9 +64,11 @@ if (os !== 'win32') {
 
 console.log(`Copied binary to packages/${packageName}/bin/agent-rdp${ext}`);
 
-// Copy models from root
+// Copy models from root into the main package. The models are
+// architecture-independent, so they ship once there rather than being
+// duplicated into every platform package.
 const modelsSourceDir = join(projectRoot, 'models');
-const modelsDestDir = join(projectRoot, 'packages', packageName, 'models');
+const modelsDestDir = join(projectRoot, 'packages', 'agent-rdp', 'models');
 
 if (existsSync(modelsSourceDir)) {
   if (!existsSync(modelsDestDir)) {
@@ -77,5 +79,5 @@ if (existsSync(modelsSourceDir)) {
   for (const file of modelFiles) {
     copyFileSync(join(modelsSourceDir, file), join(modelsDestDir, file));
   }
-  console.log(`Copied ${modelFiles.length} model files to packages/${packageName}/models/`);
+  console.log(`Copied ${modelFiles.length} model files to packages/agent-rdp/models/`);
 }

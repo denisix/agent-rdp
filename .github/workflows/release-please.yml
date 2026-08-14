@@ -68,13 +68,13 @@ jobs:
           . "$HOME/.cargo/env"
           cargo build --release --target ${{ matrix.target }}
 
-      - name: Copy binary and models to package
+      # Models are architecture-independent and ship once in the main package,
+      # so platform packages carry only the binary.
+      - name: Copy binary to package
         run: |
           mkdir -p packages/${{ matrix.package }}/bin
-          mkdir -p packages/${{ matrix.package }}/models
           cp target/${{ matrix.target }}/release/agent-rdp packages/${{ matrix.package }}/bin/
           chmod +x packages/${{ matrix.package }}/bin/agent-rdp
-          cp models/*.rten packages/${{ matrix.package }}/models/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -131,22 +131,20 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Copy binary and models to package (Unix)
+      # Models are architecture-independent and ship once in the main package,
+      # so platform packages carry only the binary.
+      - name: Copy binary to package (Unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p packages/${{ matrix.package }}/bin
-          mkdir -p packages/${{ matrix.package }}/models
           cp target/${{ matrix.target }}/release/agent-rdp packages/${{ matrix.package }}/bin/
           chmod +x packages/${{ matrix.package }}/bin/agent-rdp
-          cp models/*.rten packages/${{ matrix.package }}/models/
 
-      - name: Copy binary and models to package (Windows)
+      - name: Copy binary to package (Windows)
         if: runner.os == 'Windows'
         run: |
           New-Item -ItemType Directory -Force -Path packages/${{ matrix.package }}/bin
-          New-Item -ItemType Directory -Force -Path packages/${{ matrix.package }}/models
           Copy-Item target/${{ matrix.target }}/release/agent-rdp.exe packages/${{ matrix.package }}/bin/
-          Copy-Item models/*.rten packages/${{ matrix.package }}/models/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -257,4 +255,8 @@ jobs:
       - name: Publish main package
         run: |
           cp README.md packages/agent-rdp/
+          # Models are architecture-independent, so they ship once here rather
+          # than being duplicated into all six platform packages.
+          mkdir -p packages/agent-rdp/models
+          cp models/*.rten packages/agent-rdp/models/
           npm publish --access public --provenance packages/agent-rdp

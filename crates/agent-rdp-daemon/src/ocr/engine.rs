@@ -228,32 +228,46 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     true
 }
 
-/// Find the models directory relative to the executable.
+/// Find the OCR models directory.
 ///
-/// Models are always at `bin/../models` relative to the executable:
-/// - Dev: packages/{platform}/bin/agent-rdp -> packages/{platform}/models/
-/// - npm: node_modules/@agent-rdp/{platform}/bin/agent-rdp -> node_modules/@agent-rdp/{platform}/models/
+/// Searched in order, first match wins:
+/// 1. `$AGENT_RDP_MODELS_DIR` - set by the npm wrapper, which ships the models in
+///    the main `@denisix/agent-rdp` package (they're architecture-independent, so
+///    they aren't duplicated into each platform package).
+/// 2. `bin/../models` relative to the executable - standalone layouts that keep
+///    the models beside the binary.
+/// 3. `bin/../../models` relative to the executable - repo checkout, where
+///    `target/release/agent-rdp` sits two levels below the root `models/` dir.
 pub fn find_models_dir() -> Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(dir) = std::env::var_os("AGENT_RDP_MODELS_DIR") {
+        candidates.push(PathBuf::from(dir));
+    }
+
     let exe_path = std::env::current_exe().context("Failed to get executable path")?;
+    if let Some(bin_dir) = exe_path.parent() {
+        if let Some(root) = bin_dir.parent() {
+            candidates.push(root.join("models"));
+            if let Some(parent) = root.parent() {
+                candidates.push(parent.join("models"));
+            }
+        }
+    }
 
-    // Models are always sibling to bin directory: bin/../models
-    let models_dir = exe_path
-        .parent() // bin/
-        .and_then(|p| p.parent()) // package root
-        .map(|p| p.join("models"))
-        .context("Failed to compute models directory path")?;
-
-    let detection = models_dir.join("text-detection.rten");
-    let recognition = models_dir.join("text-recognition.rten");
-
-    if detection.exists() && recognition.exists() {
-        debug!("Found models directory at {:?}", models_dir);
-        return Ok(models_dir);
+    for models_dir in &candidates {
+        if models_dir.join("text-detection.rten").exists()
+            && models_dir.join("text-recognition.rten").exists()
+        {
+            debug!("Found models directory at {:?}", models_dir);
+            return Ok(models_dir.clone());
+        }
     }
 
     anyhow::bail!(
-        "Could not find OCR models at {:?}. Run 'pnpm build' to copy models.",
-        models_dir
+        "Could not find OCR models (text-detection.rten, text-recognition.rten). \
+         Searched: {:?}. Run 'bun run build' to copy models, or set AGENT_RDP_MODELS_DIR.",
+        candidates
     )
 }
 
@@ -287,5 +301,29 @@ mod tests {
     fn test_glob_match_combined() {
         assert!(glob_match("h*o", "hello"));
         assert!(glob_match("h?ll*", "helloworld"));
+    }
+
+    /// Both env-var cases live in one test: `AGENT_RDP_MODELS_DIR` is
+    /// process-global, so splitting them would race under the parallel runner.
+    #[test]
+    fn test_find_models_dir_env_var() {
+        let complete = tempfile::tempdir().unwrap();
+        std::fs::write(complete.path().join("text-detection.rten"), b"x").unwrap();
+        std::fs::write(complete.path().join("text-recognition.rten"), b"x").unwrap();
+
+        std::env::set_var("AGENT_RDP_MODELS_DIR", complete.path());
+        let found = find_models_dir();
+        std::env::remove_var("AGENT_RDP_MODELS_DIR");
+        assert_eq!(found.unwrap(), complete.path());
+
+        // A directory missing one of the two models must not be accepted; the
+        // search falls through to the exe-relative candidates instead.
+        let partial = tempfile::tempdir().unwrap();
+        std::fs::write(partial.path().join("text-detection.rten"), b"x").unwrap();
+
+        std::env::set_var("AGENT_RDP_MODELS_DIR", partial.path());
+        let found = find_models_dir();
+        std::env::remove_var("AGENT_RDP_MODELS_DIR");
+        assert!(found.map(|p| p != partial.path()).unwrap_or(true));
     }
 }

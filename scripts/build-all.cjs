@@ -23,6 +23,9 @@ const TARGETS = [
   { target: 'aarch64-unknown-linux-gnu', package: 'linux-arm64', useCross: true },
   // Windows
   { target: 'x86_64-pc-windows-gnu', package: 'win32-x64', useCross: true },
+  // CI builds this natively on a windows-11-arm runner; cross has no image for
+  // it, so it's only buildable here from a Windows ARM64 host.
+  { target: 'aarch64-pc-windows-msvc', package: 'win32-arm64', useCross: false, windowsArmOnly: true },
 ];
 
 const PROJECT_ROOT = path.join(__dirname, '..');
@@ -58,6 +61,28 @@ function copyBinary(target, packageName) {
   }
 }
 
+// Copy OCR models into the main package. They're architecture-independent, so
+// they ship once there rather than in every platform package.
+function copyModels() {
+  const src = path.join(PROJECT_ROOT, 'models');
+  const destDir = path.join(PROJECT_ROOT, 'packages', 'agent-rdp', 'models');
+
+  if (!fs.existsSync(src)) {
+    console.error(`Warning: ${src} not found, skipping models`);
+    return;
+  }
+
+  if (!fs.existsSync(destDir)) {
+    fs.mkdirSync(destDir, { recursive: true });
+  }
+
+  const modelFiles = fs.readdirSync(src).filter((f) => f.endsWith('.rten'));
+  for (const file of modelFiles) {
+    fs.copyFileSync(path.join(src, file), path.join(destDir, file));
+  }
+  console.log(`Copied ${modelFiles.length} model files to packages/agent-rdp/models/`);
+}
+
 // Check if cross is available for cross-compilation targets
 function hasCross() {
   try {
@@ -73,10 +98,16 @@ function getAvailableTargets() {
   const platform = process.platform;
   const crossAvailable = hasCross();
 
-  return TARGETS.filter(({ target, useCross }) => {
+  return TARGETS.filter(({ target, useCross, windowsArmOnly }) => {
     // macOS targets only work on macOS
     if (target.includes('apple') && platform !== 'darwin') {
       console.log(`Skipping ${target} (requires macOS)`);
+      return false;
+    }
+
+    // Windows ARM64 has no cross image; it must be built on a Windows ARM host
+    if (windowsArmOnly && !(platform === 'win32' && process.arch === 'arm64')) {
+      console.log(`Skipping ${target} (requires a Windows ARM64 host; CI builds this on windows-11-arm)`);
       return false;
     }
 
@@ -111,6 +142,8 @@ async function main() {
       process.exit(1);
     }
   }
+
+  copyModels();
 
   console.log('\nDone!');
 }

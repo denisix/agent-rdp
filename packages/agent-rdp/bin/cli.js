@@ -8,7 +8,8 @@
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { existsSync } from 'node:fs';
+import { chmodSync, existsSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 
@@ -34,8 +35,27 @@ if (!existsSync(binaryPath)) {
   process.exit(1);
 }
 
+// npm only guarantees the executable bit for files declared in a package's
+// "bin" field, and dependency install scripts are opt-in as of npm v12, so the
+// platform package's postinstall chmod may never run. Restore it here.
+// Non-fatal: read-only stores (pnpm, Nix, container layers) will throw.
+if (process.platform !== 'win32') {
+  try {
+    if (!(statSync(binaryPath).mode & 0o111)) {
+      chmodSync(binaryPath, 0o755);
+    }
+  } catch {
+    // Fall through - spawnSync will surface a clearer error if it really can't run.
+  }
+}
+
+// OCR models ship in this package (they're architecture-independent, so they
+// aren't duplicated into each platform package). Tell the binary where to find them.
+const modelsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'models');
+
 const result = spawnSync(binaryPath, process.argv.slice(2), {
   stdio: 'inherit',
+  env: { ...process.env, AGENT_RDP_MODELS_DIR: process.env.AGENT_RDP_MODELS_DIR ?? modelsDir },
 });
 
 process.exit(result.status ?? 1);
