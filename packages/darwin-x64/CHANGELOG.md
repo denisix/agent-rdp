@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.3](https://github.com/denisix/agent-rdp/compare/darwin-x64-v0.7.2...darwin-x64-v0.7.3) (2026-08-14)
+
+
+### Bug Fixes
+
+* drop redundant postinstall so installs stop warning ([fdadcc7](https://github.com/denisix/agent-rdp/commit/fdadcc7736dca840fbf275910456cdb3ca4d21e9))
+
 ## [0.7.2](https://github.com/denisix/agent-rdp/compare/darwin-x64-v0.7.1...darwin-x64-v0.7.2) (2026-08-14)
 
 

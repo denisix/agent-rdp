@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.3](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.2...agent-rdp-v0.7.3) (2026-08-14)
+
+
+### Bug Fixes
+
+* batch keystrokes, surface indeterminate automation results, read back text ([18cc802](https://github.com/denisix/agent-rdp/commit/18cc802cde422d5df43017f13cd1688371b0a436))
+
 ## [0.7.2](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.1...agent-rdp-v0.7.2) (2026-08-14)
 
 
