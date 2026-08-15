@@ -1056,13 +1056,13 @@ fn explain_connect_error(raw: &str) -> String {
         return format!(
             "{raw}. The server declined TLS and offered only legacy Standard RDP \
              Security, which is not supported (RC4 with a well-known key derivation, \
-             so credentials sent over it are recoverable). Set SecurityLayer=2 (TLS) \
-             under HKLM\\System\\CurrentControlSet\\Control\\Terminal Server\\\
-             WinStations\\RDP-Tcp on the Windows host. Note SecurityLayer=1 \
-             (Negotiate) is also known to fail this way even where TLS is available. \
-             NLA (UserAuthentication=1) is recommended but not required - TLS is what \
-             matters. New connections normally pick the change up immediately; restart \
-             TermService only if they do not."
+             so credentials sent over it are recoverable). This happens when the host \
+             has NLA disabled AND is not set to require TLS. Under \
+             HKLM\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\\
+             RDP-Tcp, either set UserAuthentication=1 (enables NLA, which forces \
+             TLS and adds pre-authentication) or SecurityLayer=2 (forces TLS). Either \
+             one is enough. New connections normally pick the change up immediately; \
+             restart TermService only if they do not."
         );
     }
 

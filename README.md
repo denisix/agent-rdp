@@ -561,38 +561,46 @@ If you need vision-based coordinate detection with Claude, implement your own ha
 ## Requirements
 
 - Rust 1.75 or later
-- Target RDP server must offer **TLS** for RDP (`SecurityLayer=2`) and support TLS 1.2 or later. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1, so legacy targets (e.g. Windows Server 2008 R2) are not supported and fail with a TLS handshake error.
-- NLA (`UserAuthentication=1`) is **recommended but not required** — TLS is what matters.
+- Target RDP server must offer **TLS** for RDP. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1, so the server must support TLS 1.2 or later — legacy targets (e.g. Windows Server 2008 R2) are not supported and fail with a TLS handshake error.
+- NLA (`UserAuthentication=1`) is **recommended but not required** — TLS is what matters. The stock Windows defaults work as shipped.
 
 ### RDP security layer settings
 
-Measured against Windows Server 2022, varying only these two values under
-`HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp`:
+All six combinations measured against Windows Server 2022, varying only these two
+values under `HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp`:
 
 | `SecurityLayer` | `UserAuthentication` | Meaning | Result |
 |---|---|---|---|
+| `1` (Negotiate) | `1` | **Windows default** | **works** |
+| `2` (TLS) | `1` | TLS + NLA (most explicit) | **works** |
 | `2` (TLS) | `0` | TLS, no NLA | **works** |
-| `2` (TLS) | `1` | TLS + NLA (recommended) | **works** |
-| `0` (RDP) | `1` | NLA forces CredSSP/TLS | works, by side effect |
-| `1` (Negotiate) | `0` | server picks | **fails** — server declines TLS |
-| `0` (RDP) | `0` | legacy only | **fails** — unsupported |
+| `0` (RDP) | `1` | NLA forces CredSSP/TLS | **works** |
+| `1` (Negotiate) | `0` | server picks, and declines TLS | fails |
+| `0` (RDP) | `0` | legacy RC4 only | fails |
 
-If `connect` reports *"server only supports Standard RDP Security"*, set:
+The rule: **agent-rdp works wherever the host offers TLS.** With NLA on that is
+always the case, because NLA forces CredSSP/TLS regardless of `SecurityLayer`.
+Both failing rows are NLA-off hosts that refuse TLS outright.
+
+If `connect` reports *"server only supports Standard RDP Security"*, the host is
+in one of those two rows. Either enable NLA (preferred — it also gives you
+pre-authentication) or force TLS:
 
 ```powershell
-Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name SecurityLayer -Value 2
+$k = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+Set-ItemProperty -Path $k -Name UserAuthentication -Value 1   # enable NLA, or:
+Set-ItemProperty -Path $k -Name SecurityLayer      -Value 2   # force TLS
 ```
 
 New connections normally pick this up immediately; restart `TermService` only if
 they don't (a restart drops existing sessions).
 
-Note `SecurityLayer=1` (Negotiate) fails with the same error even on hosts that
-do TLS fine at `SecurityLayer=2` — the server returns `SSL_NOT_ALLOWED_BY_SERVER`
-despite the client advertising `PROTOCOL_SSL`. Use `2` explicitly.
-
-Legacy Standard RDP Security (`SecurityLayer=0` with NLA off) uses RC4 with a
-well-known key derivation, so credentials sent over it are trivially recoverable.
-IronRDP refuses it outright and there is no client-side flag to override that.
+Neither failing case is fixable client-side. With `SecurityLayer=1` and NLA off
+the server returns `SSL_NOT_ALLOWED_BY_SERVER` even though the client advertises
+`PROTOCOL_SSL` — verified by testing a build that requested SSL *only*, which was
+rejected identically. And Standard RDP Security (`SecurityLayer=0`, NLA off) is
+refused by IronRDP itself, which implements no RC4 transport layer; it uses a
+well-known key derivation, so credentials sent over it are recoverable in transit.
 
 ## Credits
 

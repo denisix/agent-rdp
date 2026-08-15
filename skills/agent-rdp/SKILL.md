@@ -215,7 +215,7 @@ agent-rdp view --port 9224                 # opens web viewer
 
 ## Requirements and limitations
 
-- Target must offer TLS for RDP (`SecurityLayer=2`) and support TLS 1.2+. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1 — legacy targets (e.g. Windows Server 2008 R2) are not supported and fail with a TLS handshake error. NLA (`UserAuthentication=1`) is recommended but **not** required; TLS is the requirement. `SecurityLayer=1` (Negotiate) also fails, even on hosts that do TLS fine at `2` — set `2` explicitly.
+- Target must offer TLS for RDP and support TLS 1.2+. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1 — legacy targets (e.g. Windows Server 2008 R2) are not supported and fail with a TLS handshake error. **Stock Windows defaults work as shipped.** The rule is that it works wherever the host offers TLS: with NLA on (`UserAuthentication=1`) that is always true, since NLA forces CredSSP/TLS. Only two configurations fail, both NLA-off hosts that refuse TLS: `SecurityLayer=1` (Negotiate) and `SecurityLayer=0` (legacy RC4). Fix on the host by enabling NLA, or setting `SecurityLayer=2`; neither is fixable client-side.
 - UI Automation cannot see WebView content (Start menu search, Edge/Electron content). Use `automate run` or Win+R to launch programs directly instead of navigating menus.
 - UI Automation cannot see UAC elevation dialogs (secure desktop). Fall back to `locate` (OCR) + `mouse click`; unreliable but may work for simple Yes/No prompts.
 - `locate` (OCR) can misread or miss text — use only when UI Automation can't reach an element, and verify coordinates before clicking anything destructive.
