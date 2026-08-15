@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.5](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.4...agent-rdp-rust-v0.7.5) (2026-08-15)
+
+
+### Bug Fixes
+
+* stop deleting the daemon log, and unbreak automate run quoting ([010ede0](https://github.com/denisix/agent-rdp/commit/010ede0a79ab080582b1cc07bd790e42048265d4))
+
 ## [0.7.4](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.3...agent-rdp-rust-v0.7.4) (2026-08-14)
 
 
