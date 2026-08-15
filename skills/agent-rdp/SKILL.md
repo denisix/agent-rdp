@@ -6,7 +6,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.3.
+Tested against agent-rdp 0.7.5.
 
 If `agent-rdp` is not on PATH, install it first — this is expected on a fresh
 machine and needs no confirmation:
@@ -27,7 +27,12 @@ agent-rdp disconnect
 
 Prefer `automate fill`/`automate click` over raw `keyboard type`/`mouse click` when `--enable-win-automation` is set: lossless and ref-based, no coordinate guessing.
 
-After connecting, wait ~5s before the first input — immediate input can be dropped while the desktop stabilizes: `agent-rdp wait 5000`.
+After connecting, wait a moment before the first input — immediate input can be
+dropped while the desktop stabilizes: `agent-rdp wait 3000`.
+
+`connect --enable-win-automation` already waits for the automation agent (up to
+~25s), so no sleep is needed for it. If the agent fails to start, connect now
+says so explicitly — reconnect to retry rather than polling `automate status`.
 
 ## Reliability rules (learned from real failures)
 
@@ -210,7 +215,7 @@ agent-rdp view --port 9224                 # opens web viewer
 
 ## Requirements and limitations
 
-- Target must have NLA enabled and support TLS 1.2+. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1 — legacy targets (e.g. Windows Server 2008 R2) are not supported and fail with a TLS handshake error.
+- Target must offer TLS for RDP (`SecurityLayer=2`) and support TLS 1.2+. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1 — legacy targets (e.g. Windows Server 2008 R2) are not supported and fail with a TLS handshake error. NLA (`UserAuthentication=1`) is recommended but **not** required; TLS is the requirement. `SecurityLayer=1` (Negotiate) also fails, even on hosts that do TLS fine at `2` — set `2` explicitly.
 - UI Automation cannot see WebView content (Start menu search, Edge/Electron content). Use `automate run` or Win+R to launch programs directly instead of navigating menus.
 - UI Automation cannot see UAC elevation dialogs (secure desktop). Fall back to `locate` (OCR) + `mouse click`; unreliable but may work for simple Yes/No prompts.
 - `locate` (OCR) can misread or miss text — use only when UI Automation can't reach an element, and verify coordinates before clicking anything destructive.

@@ -164,37 +164,78 @@ pub async fn handle(
     }
 
     // Bootstrap automation if enabled (directory was already created before connection)
+    let mut automation_ready = None;
     if enable_automation {
         info!("Bootstrapping Windows UI Automation...");
 
         let session_dir = crate::get_session_dir("");
         let bootstrap = AutomationBootstrap::new(session_dir);
 
-        // Launch the agent via Win+R
-        {
-            let session = rdp_session.lock().await;
-            if let Some(ref rdp) = *session {
-                let auto_state = automation_state.lock().await;
-                if let Err(e) = bootstrap.launch_agent(rdp, &auto_state).await {
-                    warn!("Failed to launch automation agent: {}", e);
+        // Launch, then wait for the handshake - retrying the launch itself if
+        // it doesn't take.
+        //
+        // The launch drives the remote desktop's Run dialog, so it silently
+        // does nothing if the desktop isn't ready to accept input yet (a
+        // freshly connected session, a foreground app still taking focus). The
+        // symptom is a launch that reports success followed by a handshake
+        // timeout. Waiting longer up front would slow every connect, so retry
+        // instead and let the common case stay fast.
+        const LAUNCH_ATTEMPTS: usize = 3;
+        let mut ready = false;
+
+        for attempt in 1..=LAUNCH_ATTEMPTS {
+            let launched = {
+                let session = rdp_session.lock().await;
+                match session.as_ref() {
+                    Some(rdp) => {
+                        let auto_state = automation_state.lock().await;
+                        match bootstrap.launch_agent(rdp, &auto_state).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                warn!("Failed to launch automation agent: {}", e);
+                                false
+                            }
+                        }
+                    }
+                    None => false,
                 }
+            };
+
+            if launched {
+                let mut auto_state = automation_state.lock().await;
+                match bootstrap.wait_for_agent(&mut auto_state, 10).await {
+                    Ok(()) => {
+                        ready = true;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Automation agent handshake failed (attempt {}/{}): {}",
+                            attempt, LAUNCH_ATTEMPTS, e
+                        );
+                    }
+                }
+            }
+
+            if attempt < LAUNCH_ATTEMPTS {
+                info!("Retrying automation agent launch...");
             }
         }
 
-        // Wait for handshake
-        {
-            let mut auto_state = automation_state.lock().await;
-            if let Err(e) = bootstrap.wait_for_agent(&mut auto_state, 10).await {
-                warn!("Automation agent handshake failed: {}", e);
-                // Don't fail - automation just won't be available
-            }
+        if !ready {
+            // RDP itself is fine, so don't fail the connect - but do report it,
+            // otherwise the caller sees a clean "Connected" and only discovers
+            // the problem later as an unexplained "agent not ready".
+            warn!("Automation agent did not come up after {} attempts", LAUNCH_ATTEMPTS);
         }
+        automation_ready = Some(ready);
     }
 
     Response::success(ResponseData::Connected {
         host,
         width,
         height,
+        automation_ready,
     })
 }
 

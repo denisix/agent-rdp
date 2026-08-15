@@ -26,7 +26,16 @@ width: number,
 /**
  * Desktop height.
  */
-height: number, } | { "type": "screenshot", 
+height: number, 
+/**
+ * Whether the UI Automation agent came up, when it was requested.
+ *
+ * `None` if automation wasn't requested. `Some(false)` means RDP is
+ * connected but `automate` commands will not work - previously this
+ * failure was only warned about in the daemon log, so callers saw a
+ * successful connect and then an unexplained "agent not ready".
+ */
+automation_ready?: boolean, } | { "type": "screenshot", 
 /**
  * Image width.
  */

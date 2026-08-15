@@ -179,6 +179,14 @@ impl SessionManager {
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+
+        // Rotate rather than append, so the log can't grow without bound while
+        // still keeping the previous session's output across one reconnect -
+        // which is precisely the case worth reading, since a reconnect is what
+        // you do right after a session dies unexpectedly.
+        if log_path.exists() {
+            let _ = std::fs::rename(&log_path, log_path.with_extension("log.prev"));
+        }
         let open_log = || {
             std::fs::OpenOptions::new()
                 .create(true)

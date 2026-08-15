@@ -66,10 +66,37 @@ pub fn get_session_port(session: &str) -> u16 {
     49152 + (hash % 16384) as u16
 }
 
-/// Clean up a session directory.
+/// Clean up a session's transient state.
+///
+/// Deliberately removes individual entries rather than the whole directory:
+/// `daemon.log` lives here and is the only record of why a session ended. This
+/// runs from `is_daemon_alive()` whenever a dead PID is found, i.e. on the exact
+/// path that then tells the user to go read that log - wiping the directory
+/// destroyed the evidence before it could be read.
 pub fn cleanup_session(session: &str) {
     let dir = get_session_dir(session);
-    let _ = std::fs::remove_dir_all(&dir);
+
+    for entry in ["socket", "pid"] {
+        let _ = std::fs::remove_file(dir.join(entry));
+    }
+
+    // Anything else transient (automation scratch dirs and the like) can go, but
+    // keep the logs.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "daemon.log" || name == "daemon.log.prev" {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
 }
 
 /// Run the daemon server for the given session.

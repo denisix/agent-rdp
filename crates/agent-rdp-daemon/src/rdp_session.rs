@@ -1030,13 +1030,20 @@ fn explain_connect_error(raw: &str) -> String {
     let lower = raw.to_lowercase();
 
     if lower.contains("standard rdp security") {
+        // The server refused TLS and offered only the legacy layer. Don't assert
+        // *why*: this also fires with SecurityLayer=1 (Negotiate) on hosts that
+        // demonstrably do TLS at SecurityLayer=2, so claiming "TLS is disabled"
+        // would be wrong. Point at the setting that is known to work instead.
         return format!(
-            "{raw}. The server has both NLA and TLS disabled, leaving only the legacy \
-             Standard RDP Security layer, which is not supported (it uses RC4 with a \
-             well-known key derivation, so credentials sent over it are recoverable). \
-             Enable NLA on the Windows host - set UserAuthentication=1 and \
-             SecurityLayer=2 under HKLM\\System\\CurrentControlSet\\Control\\Terminal \
-             Server\\WinStations\\RDP-Tcp, then restart TermService."
+            "{raw}. The server declined TLS and offered only legacy Standard RDP \
+             Security, which is not supported (RC4 with a well-known key derivation, \
+             so credentials sent over it are recoverable). Set SecurityLayer=2 (TLS) \
+             under HKLM\\System\\CurrentControlSet\\Control\\Terminal Server\\\
+             WinStations\\RDP-Tcp on the Windows host. Note SecurityLayer=1 \
+             (Negotiate) is also known to fail this way even where TLS is available. \
+             NLA (UserAuthentication=1) is recommended but not required - TLS is what \
+             matters. New connections normally pick the change up immediately; restart \
+             TermService only if they do not."
         );
     }
 

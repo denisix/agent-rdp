@@ -561,22 +561,38 @@ If you need vision-based coordinate detection with Claude, implement your own ha
 ## Requirements
 
 - Rust 1.75 or later
-- Target RDP server with Network Level Authentication (NLA) enabled
-- Target RDP server must support TLS 1.2 or later. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1, so legacy targets (e.g. Windows Server 2008 R2) are not currently supported and will fail with a TLS handshake error.
+- Target RDP server must offer **TLS** for RDP (`SecurityLayer=2`) and support TLS 1.2 or later. agent-rdp uses `rustls`, which does not implement TLS 1.0/1.1, so legacy targets (e.g. Windows Server 2008 R2) are not supported and fail with a TLS handshake error.
+- NLA (`UserAuthentication=1`) is **recommended but not required** — TLS is what matters.
 
-If the server has NLA **and** TLS disabled it offers only Standard RDP Security,
-which IronRDP refuses outright, and `connect` fails with *"server only supports
-Standard RDP Security"*. Enable NLA on the host to fix it:
+### RDP security layer settings
+
+Measured against Windows Server 2022, varying only these two values under
+`HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp`:
+
+| `SecurityLayer` | `UserAuthentication` | Meaning | Result |
+|---|---|---|---|
+| `2` (TLS) | `0` | TLS, no NLA | **works** |
+| `2` (TLS) | `1` | TLS + NLA (recommended) | **works** |
+| `0` (RDP) | `1` | NLA forces CredSSP/TLS | works, by side effect |
+| `1` (Negotiate) | `0` | server picks | **fails** — server declines TLS |
+| `0` (RDP) | `0` | legacy only | **fails** — unsupported |
+
+If `connect` reports *"server only supports Standard RDP Security"*, set:
 
 ```powershell
-Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
 Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name SecurityLayer -Value 2
-Restart-Service TermService -Force
 ```
 
-Standard RDP Security uses RC4 with a well-known key derivation, so credentials
-sent over it are trivially recoverable — this is worth fixing on the host rather
-than working around.
+New connections normally pick this up immediately; restart `TermService` only if
+they don't (a restart drops existing sessions).
+
+Note `SecurityLayer=1` (Negotiate) fails with the same error even on hosts that
+do TLS fine at `SecurityLayer=2` — the server returns `SSL_NOT_ALLOWED_BY_SERVER`
+despite the client advertising `PROTOCOL_SSL`. Use `2` explicitly.
+
+Legacy Standard RDP Security (`SecurityLayer=0` with NLA off) uses RC4 with a
+well-known key derivation, so credentials sent over it are trivially recoverable.
+IronRDP refuses it outright and there is no client-side flag to override that.
 
 ## Credits
 

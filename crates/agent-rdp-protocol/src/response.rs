@@ -74,6 +74,15 @@ pub enum ResponseData {
         width: u16,
         /// Desktop height.
         height: u16,
+        /// Whether the UI Automation agent came up, when it was requested.
+        ///
+        /// `None` if automation wasn't requested. `Some(false)` means RDP is
+        /// connected but `automate` commands will not work - previously this
+        /// failure was only warned about in the daemon log, so callers saw a
+        /// successful connect and then an unexplained "agent not ready".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        automation_ready: Option<bool>,
     },
 
     /// Screenshot data.
@@ -343,6 +352,7 @@ mod tests {
     #[test]
     fn test_success_response() {
         let resp = Response::success(ResponseData::Connected {
+            automation_ready: None,
             host: "192.168.1.100".to_string(),
             width: 1920,
             height: 1080,

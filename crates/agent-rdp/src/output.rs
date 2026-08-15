@@ -46,8 +46,15 @@ impl Output {
             ResponseData::Ok => {
                 println!("OK");
             }
-            ResponseData::Connected { host, width, height } => {
+            ResponseData::Connected { host, width, height, automation_ready } => {
                 println!("Connected to {} ({}x{})", host, width, height);
+                if *automation_ready == Some(false) {
+                    eprintln!(
+                        "Warning: the UI Automation agent did not start, so `automate` \
+                         commands will not work. Reconnect to retry; see the session's \
+                         daemon.log for why."
+                    );
+                }
             }
             ResponseData::Screenshot { width, height, format, .. } => {
                 println!("Screenshot: {}x{} ({})", width, height, format);

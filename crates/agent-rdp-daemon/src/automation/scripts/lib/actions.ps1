@@ -565,9 +565,18 @@ function Invoke-Run {
     $shell = if ($Params.shell) { $Params.shell } else { "powershell.exe" }
     $stream = if ($null -ne $Params.stream) { $Params.stream } else { $false }
 
+    # Hand the script to PowerShell base64-encoded rather than as a quoted
+    # -Command string. Interpolating the command into `-Command "..."` meant any
+    # double quote in it terminated that string early, so
+    # `Test-Path "C:\Program Files\x"` was torn apart before PowerShell saw it,
+    # and even backtick-escaping spaces still failed on literal parentheses like
+    # `(x86)`. -EncodedCommand removes the command-line quoting layer entirely.
+    $script = if ($commandArgs) { "$command $commandArgs" } else { $command }
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $shell
-    $startInfo.Arguments = "-NoProfile -Command `"$command $commandArgs`""
+    $startInfo.Arguments = "-NoProfile -EncodedCommand $encodedCommand"
     $startInfo.WorkingDirectory = $env:USERPROFILE
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $wait -or $stream
