@@ -58,6 +58,16 @@ impl ClipboardMessageProxy for ChannelProxy {
                 warn!("Clipboard backend error: {}", e);
                 return;
             }
+            // File-transfer clipboard (copying files between host and remote)
+            // is not implemented - only text is. Listed explicitly rather than
+            // caught by a wildcard so that new variants keep breaking the build
+            // instead of being silently swallowed here.
+            ClipboardMessage::SendInitiateFileCopy(_)
+            | ClipboardMessage::SendFileContentsRequest(_)
+            | ClipboardMessage::SendFileContentsResponse(_) => {
+                debug!("Ignoring clipboard file-transfer message: not supported");
+                return;
+            }
         };
         let _ = self.tx.send(backend_msg);
     }

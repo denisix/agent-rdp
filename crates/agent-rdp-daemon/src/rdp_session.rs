@@ -162,6 +162,13 @@ impl RdpSession {
             hardware_id: None,
             license_cache: None,
             timezone_info: Default::default(),
+            // Added in ironrdp-connector 0.10. Defaults preserve the previous
+            // behaviour: no alternate shell, no bulk compression, and no
+            // multitransport (we don't implement the UDP transports).
+            alternate_shell: String::new(),
+            work_dir: String::new(),
+            compression_type: None,
+            multitransport_flags: None,
         };
 
         // Establish TCP connection
@@ -289,8 +296,20 @@ impl RdpSession {
             connection_result.desktop_size.height,
         );
 
-        // Create active stage for ongoing communication
-        let active_stage = ActiveStage::new(connection_result);
+        // Create active stage for ongoing communication.
+        // ironrdp-session 0.11 replaced ActiveStage::new(ConnectionResult) with
+        // a builder; the fields still come straight off the connection result.
+        let active_stage = ironrdp::session::ActiveStageBuilder {
+            static_channels: connection_result.static_channels,
+            user_channel_id: connection_result.user_channel_id,
+            io_channel_id: connection_result.io_channel_id,
+            message_channel_id: connection_result.message_channel_id,
+            share_id: connection_result.share_id,
+            compression_type: connection_result.compression_type,
+            enable_server_pointer: connection_result.enable_server_pointer,
+            pointer_software_rendering: connection_result.pointer_software_rendering,
+        }
+        .build();
 
         // Create shared state
         let shared = Arc::new(RwLock::new(SharedState {
