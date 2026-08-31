@@ -11,9 +11,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use agent_rdp_protocol::DriveMapping;
-use ironrdp::connector::{self, ClientConnector, ConnectorResult, Credentials, ServerName};
+use ironrdp::connector::connection_activation::{
+    ConnectionActivationFactory, ConnectionActivationState,
+};
+use ironrdp::connector::{self, ClientConnector, ConnectorResult, Credentials, ServerName, Sequence as _};
 use ironrdp::pdu::gcc::KeyboardType;
-use ironrdp::pdu::input::fast_path::FastPathInputEvent;
+use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::PerformanceFlags;
 use ironrdp::session::image::DecodedImage;
@@ -94,6 +97,11 @@ struct SharedState {
     host: String,
     width: u16,
     height: u16,
+    /// Bumped whenever the server paints into `image`. Lets the streaming
+    /// tick skip re-encoding a framebuffer that has not changed - without
+    /// this, a completely static desktop is copied and JPEG-encoded at the
+    /// full frame rate forever.
+    frame_generation: u64,
     /// Drives that were mapped at connect time.
     drives: Vec<DriveMapping>,
     /// Clipboard state for CLIPRDR.
@@ -289,12 +297,31 @@ impl RdpSession {
 
         info!("RDP connection established to {}", config.host);
 
-        // Create decoded image for storing desktop state
-        let image = DecodedImage::new(
-            ironrdp_graphics::image_processing::PixelFormat::RgbA32,
+        // The size the server granted, which is not necessarily the one we
+        // requested. Bound before the builder below partially moves out of
+        // `connection_result`.
+        let (desktop_width, desktop_height) = (
             connection_result.desktop_size.width,
             connection_result.desktop_size.height,
         );
+
+        if (desktop_width, desktop_height) != (config.width, config.height) {
+            info!(
+                "Server granted {}x{} desktop (requested {}x{})",
+                desktop_width, desktop_height, config.width, config.height
+            );
+        }
+
+        // Create decoded image for storing desktop state
+        let image = DecodedImage::new(
+            ironrdp_graphics::image_processing::PixelFormat::RgbA32,
+            desktop_width,
+            desktop_height,
+        );
+
+        // Kept for the Deactivation-Reactivation Sequence, which needs to build
+        // a fresh activation sequence long after the connector is gone.
+        let activation_factory = connection_result.activation_factory.clone();
 
         // Create active stage for ongoing communication.
         // ironrdp-session 0.11 replaced ActiveStage::new(ConnectionResult) with
@@ -311,12 +338,21 @@ impl RdpSession {
         }
         .build();
 
-        // Create shared state
+        // Create shared state.
+        //
+        // The size recorded here is the one the *server* granted, not the one
+        // we asked for - servers routinely snap the resolution (rounding, or
+        // forcing the console session's size). Screenshots and OCR already work
+        // off `image`, so taking the requested size here would make
+        // `width()`/`height()` disagree with the actual framebuffer and put the
+        // reported desktop size, the viewer viewport and scroll's default
+        // centre point in the wrong place.
         let shared = Arc::new(RwLock::new(SharedState {
             image,
             host: config.host.clone(),
-            width: config.width,
-            height: config.height,
+            width: desktop_width,
+            height: desktop_height,
+            frame_generation: 0,
             drives: config.drives.clone(),
             clipboard: clipboard_state,
         }));
@@ -335,6 +371,7 @@ impl RdpSession {
                 disconnect_notify,
                 clipboard_backend_rx,
                 dvc_command_rx,
+                activation_factory,
             )
             .await;
         });
@@ -464,6 +501,26 @@ impl RdpSession {
         (width, height, data)
     }
 
+    /// Copy only a sub-rectangle of the desktop.
+    ///
+    /// A `--region` request for one table row needs tens of KB; copying the
+    /// whole multi-MB framebuffer under the read lock just to crop it again
+    /// blocks the frame decoder for no reason. The region must already be
+    /// clamped to the framebuffer (`Region::clamp_to`); an out-of-bounds
+    /// region returns `None` rather than panicking on a bad row slice.
+    pub fn get_region_data(&self, region: agent_rdp_protocol::Region) -> Option<Vec<u8>> {
+        let state = self.shared.read();
+        let full_width = state.image.width() as u32;
+        let full_height = state.image.height() as u32;
+        copy_rgba_region(state.image.data(), full_width, full_height, region)
+    }
+
+    /// Generation counter of the framebuffer contents; see
+    /// `SharedState::frame_generation`.
+    pub fn frame_generation(&self) -> u64 {
+        self.shared.read().frame_generation
+    }
+
     /// Send input events to the remote desktop.
     pub async fn send_input(&self, events: Vec<FastPathInputEvent>) -> Result<(), RdpError> {
         debug!("Sending {} input events to frame processor", events.len());
@@ -510,17 +567,20 @@ impl RdpSession {
     /// `delay_ms` inserts a pause between batches for remote apps that drop
     /// input when it arrives too fast; it defaults to none.
     pub async fn send_text(&self, text: &str, delay_ms: Option<u64>) -> Result<(), RdpError> {
-        use ironrdp::pdu::input::fast_path::KeyboardFlags;
         use std::time::Duration;
 
-        // Two events (press + release) per character. FastPath encodes the
-        // event count in a single byte, so stay well under 255 per PDU.
-        const CHARS_PER_BATCH: usize = 64;
+        // Two events (press + release) per UTF-16 code unit. FastPath encodes
+        // the event count in a single byte, so stay well under 255 per PDU.
+        const UNITS_PER_BATCH: usize = 64;
 
-        let chars: Vec<char> = text.chars().collect();
+        // The RDP Unicode keyboard event carries UTF-16 code units, so a
+        // character outside the BMP (emoji, rare CJK) must be sent as its
+        // surrogate pair. The previous `ch as u16` silently truncated those to
+        // an unrelated BMP character - the agent saw success and wrong text.
+        let units: Vec<u16> = text.encode_utf16().collect();
         let mut first = true;
 
-        for chunk in chars.chunks(CHARS_PER_BATCH) {
+        for chunk in units.chunks(UNITS_PER_BATCH) {
             if !first {
                 if let Some(ms) = delay_ms {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -528,20 +588,7 @@ impl RdpSession {
             }
             first = false;
 
-            let mut events = Vec::with_capacity(chunk.len() * 2);
-            for &ch in chunk {
-                let code = ch as u16;
-                events.push(FastPathInputEvent::UnicodeKeyboardEvent(
-                    KeyboardFlags::empty(),
-                    code,
-                ));
-                events.push(FastPathInputEvent::UnicodeKeyboardEvent(
-                    KeyboardFlags::RELEASE,
-                    code,
-                ));
-            }
-
-            self.send_input(events).await?;
+            self.send_input(unicode_key_events(chunk)).await?;
         }
 
         Ok(())
@@ -600,6 +647,7 @@ async fn run_frame_processor(
     disconnect_notify: Option<DisconnectNotify>,
     mut clipboard_backend_rx: mpsc::UnboundedReceiver<clipboard::BackendMessage>,
     mut dvc_command_rx: Option<DvcCommandReceiver>,
+    activation_factory: ConnectionActivationFactory,
 ) {
     info!("Frame processor started");
     let mut graceful_shutdown = false;
@@ -743,12 +791,14 @@ async fn run_frame_processor(
                 match result {
                     Ok((action, payload)) => {
                         // Process frame and collect responses
-                        let (frames_to_send, should_terminate) = {
+                        let (frames_to_send, should_terminate, should_reactivate) = {
                             let mut state = shared.write();
                             match active_stage.process(&mut state.image, action, &payload) {
                                 Ok(outputs) => {
                                     let mut frames = Vec::new();
                                     let mut terminate = false;
+                                    let mut reactivate = false;
+                                    let mut dirty = false;
                                     for output in outputs {
                                         match output {
                                             ActiveStageOutput::ResponseFrame(frame) => {
@@ -758,14 +808,34 @@ async fn run_frame_processor(
                                                 warn!("Session terminated: {:?}", reason);
                                                 terminate = true;
                                             }
+                                            ActiveStageOutput::DeactivateAll => {
+                                                // The server is renegotiating, typically because
+                                                // the desktop resolution changed. Ignoring this
+                                                // leaves the framebuffer at the old size while the
+                                                // server sends updates for the new one, so
+                                                // screenshots and every coordinate derived from
+                                                // them silently stop matching the real screen.
+                                                reactivate = true;
+                                            }
+                                            ActiveStageOutput::GraphicsUpdate(_) => {
+                                                // The server painted into `state.image`. Marking
+                                                // this lets the WebSocket broadcast tick skip
+                                                // re-encoding a framebuffer that has not actually
+                                                // changed, instead of doing it unconditionally at
+                                                // the full stream frame rate forever.
+                                                dirty = true;
+                                            }
                                             _ => {}
                                         }
                                     }
-                                    (frames, terminate)
+                                    if dirty {
+                                        state.frame_generation = state.frame_generation.wrapping_add(1);
+                                    }
+                                    (frames, terminate, reactivate)
                                 }
                                 Err(e) => {
                                     error!("Failed to process frame: {}", e);
-                                    (Vec::new(), false)
+                                    (Vec::new(), false, false)
                                 }
                             }
                         };
@@ -773,6 +843,14 @@ async fn run_frame_processor(
                         for frame in frames_to_send {
                             if let Err(e) = framed.write_all(&frame).await {
                                 error!("Failed to send response frame: {}", e);
+                            }
+                        }
+                        if should_reactivate {
+                            if let Err(e) =
+                                reactivate(&mut framed, &mut active_stage, &shared, &activation_factory).await
+                            {
+                                error!("Deactivation-Reactivation Sequence failed: {}", e);
+                                break;
                             }
                         }
                         if should_terminate {
@@ -871,6 +949,79 @@ async fn run_frame_processor(
     }
 }
 
+/// Run the [Deactivation-Reactivation Sequence] after a Server Deactivate All PDU.
+///
+/// The server sends this when it renegotiates the session - most often because
+/// the desktop resolution changed. Until the sequence is driven to completion
+/// and the framebuffer reallocated, the decoded image keeps the old dimensions
+/// while the server streams updates for the new ones, which quietly invalidates
+/// every coordinate taken from a screenshot.
+///
+/// [Deactivation-Reactivation Sequence]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
+async fn reactivate(
+    framed: &mut TokioFramed<tokio_rustls::client::TlsStream<TcpStream>>,
+    active_stage: &mut ActiveStage,
+    shared: &Arc<RwLock<SharedState>>,
+    activation_factory: &ConnectionActivationFactory,
+) -> Result<(), RdpError> {
+    info!("Server sent Deactivate All; running reactivation sequence");
+
+    let mut activation = activation_factory.create();
+    let mut buf = ironrdp::core::WriteBuf::new();
+
+    while !activation.state().is_terminal() {
+        ironrdp_tokio::single_sequence_step(framed, &mut activation, &mut buf)
+            .await
+            .map_err(|e| RdpError::ProtocolError(e.to_string()))?;
+    }
+
+    let ConnectionActivationState::Finalized {
+        desktop_size,
+        share_id,
+        enable_server_pointer,
+        ..
+    } = activation.connection_activation_state()
+    else {
+        return Err(RdpError::ProtocolError(
+            "reactivation sequence ended in a non-finalized state".to_string(),
+        ));
+    };
+
+    // The x224 processor picks up the new share id. The fast-path processor
+    // holds one too, but rebuilding it needs a BulkCompressor and the PDU ->
+    // bulk compression-type mapping is private to ironrdp-session, so it keeps
+    // the share id from the original activation. That only affects frame-marker
+    // responses, and servers reuse the share id across reactivation in
+    // practice; the framebuffer size below is what actually matters here.
+    active_stage.set_share_id(share_id);
+    active_stage.set_enable_server_pointer(enable_server_pointer);
+
+    let (old_width, old_height) = {
+        let mut state = shared.write();
+        let old = (state.width, state.height);
+
+        // Reallocate rather than resize: the old contents describe a screen
+        // layout that no longer exists, and keeping them would leave stale
+        // pixels wherever the server has not yet sent an update.
+        state.image = DecodedImage::new(
+            ironrdp_graphics::image_processing::PixelFormat::RgbA32,
+            desktop_size.width,
+            desktop_size.height,
+        );
+        state.width = desktop_size.width;
+        state.height = desktop_size.height;
+
+        old
+    };
+
+    info!(
+        "Reactivated: desktop {}x{} (was {}x{})",
+        desktop_size.width, desktop_size.height, old_width, old_height
+    );
+
+    Ok(())
+}
+
 /// Custom certificate verifier that accepts all certificates.
 /// This is necessary because RDP servers typically use self-signed certificates.
 #[derive(Debug)]
@@ -947,13 +1098,19 @@ struct KeyInfo {
 }
 
 /// Parse a key combination like "ctrl+c" into key info for sending.
+///
+/// Delegates to `crate::keymap`, the single scancode table shared with the
+/// CLI keyboard handler and the WebSocket input path. This function used to
+/// carry its own smaller, divergent copy - fine for the fixed sequences
+/// automation bootstrap sends (`super+r`, `ctrl+v`, `return`) today, but a key
+/// fixed in one table silently stayed broken in the others.
 fn parse_key_combination(keys: &str) -> Result<Vec<KeyInfo>, String> {
     let parts: Vec<String> = keys.split('+').map(|s| s.trim().to_lowercase()).collect();
 
     let mut key_infos = Vec::new();
 
     for key in &parts {
-        let (scancode, extended) = key_to_scancode(key)
+        let (scancode, extended) = crate::keymap::key_to_scancode(key)
             .ok_or_else(|| format!("Unknown key: {}", key))?;
         key_infos.push(KeyInfo { scancode, extended });
     }
@@ -961,74 +1118,8 @@ fn parse_key_combination(keys: &str) -> Result<Vec<KeyInfo>, String> {
     Ok(key_infos)
 }
 
-/// Convert a key name to a scancode and extended flag.
-fn key_to_scancode(key: &str) -> Option<(u8, bool)> {
-    use std::collections::HashMap;
-
-    let key_lower = key.to_lowercase();
-    let key_map: HashMap<&str, (u8, bool)> = [
-        // Modifier keys
-        ("ctrl", (0x1D, false)),
-        ("control", (0x1D, false)),
-        ("alt", (0x38, false)),
-        ("shift", (0x2A, false)),
-        ("win", (0x5B, true)),
-        ("windows", (0x5B, true)),
-        ("super", (0x5B, true)),
-
-        // Function keys
-        ("esc", (0x01, false)),
-        ("escape", (0x01, false)),
-        ("tab", (0x0F, false)),
-        ("enter", (0x1C, false)),
-        ("return", (0x1C, false)),
-        ("backspace", (0x0E, false)),
-        ("space", (0x39, false)),
-
-        // Arrow keys
-        ("up", (0x48, true)),
-        ("down", (0x50, true)),
-        ("left", (0x4B, true)),
-        ("right", (0x4D, true)),
-
-        // Letter keys
-        ("a", (0x1E, false)),
-        ("b", (0x30, false)),
-        ("c", (0x2E, false)),
-        ("d", (0x20, false)),
-        ("e", (0x12, false)),
-        ("f", (0x21, false)),
-        ("g", (0x22, false)),
-        ("h", (0x23, false)),
-        ("i", (0x17, false)),
-        ("j", (0x24, false)),
-        ("k", (0x25, false)),
-        ("l", (0x26, false)),
-        ("m", (0x32, false)),
-        ("n", (0x31, false)),
-        ("o", (0x18, false)),
-        ("p", (0x19, false)),
-        ("q", (0x10, false)),
-        ("r", (0x13, false)),
-        ("s", (0x1F, false)),
-        ("t", (0x14, false)),
-        ("u", (0x16, false)),
-        ("v", (0x2F, false)),
-        ("w", (0x11, false)),
-        ("x", (0x2D, false)),
-        ("y", (0x15, false)),
-        ("z", (0x2C, false)),
-    ]
-    .into_iter()
-    .collect();
-
-    key_map.get(key_lower.as_str()).copied()
-}
-
 /// Create a keyboard event with proper flags.
 fn create_key_event(scancode: u8, extended: bool, release: bool) -> FastPathInputEvent {
-    use ironrdp::pdu::input::fast_path::KeyboardFlags;
-
     let mut flags = KeyboardFlags::empty();
     if release {
         flags |= KeyboardFlags::RELEASE;
@@ -1037,6 +1128,47 @@ fn create_key_event(scancode: u8, extended: bool, release: bool) -> FastPathInpu
         flags |= KeyboardFlags::EXTENDED;
     }
     FastPathInputEvent::KeyboardEvent(flags, scancode)
+}
+
+/// Copy only the rows/columns of `region` out of a full RGBA `data` buffer.
+///
+/// Pure function so it is testable without a live `RdpSession`, and so its
+/// output can be checked byte-for-byte against
+/// `handlers::imaging::crop_to_region` (crop-then-encode vs. copy-then-encode
+/// must agree, or `screenshot --region` and `locate --region` would disagree
+/// on what pixels a coordinate refers to).
+///
+/// `region` must already be within `full_width x full_height`; an
+/// out-of-bounds region returns `None` rather than panicking on a bad slice.
+fn copy_rgba_region(
+    data: &[u8],
+    full_width: u32,
+    full_height: u32,
+    region: agent_rdp_protocol::Region,
+) -> Option<Vec<u8>> {
+    let (full_width, full_height) = (full_width as usize, full_height as usize);
+    let (x, y) = (region.x as usize, region.y as usize);
+    let (w, h) = (region.width as usize, region.height as usize);
+    if w == 0 || h == 0 || x + w > full_width || y + h > full_height {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(w * h * 4);
+    for row in y..y + h {
+        let start = (row * full_width + x) * 4;
+        out.extend_from_slice(&data[start..start + w * 4]);
+    }
+    Some(out)
+}
+
+/// Build press+release fast-path events for a batch of UTF-16 code units.
+fn unicode_key_events(units: &[u16]) -> Vec<FastPathInputEvent> {
+    let mut events = Vec::with_capacity(units.len() * 2);
+    for &code in units {
+        events.push(FastPathInputEvent::UnicodeKeyboardEvent(KeyboardFlags::empty(), code));
+        events.push(FastPathInputEvent::UnicodeKeyboardEvent(KeyboardFlags::RELEASE, code));
+    }
+    events
 }
 
 /// Turn IronRDP's negotiation errors into something a user can act on.
@@ -1073,4 +1205,128 @@ fn explain_connect_error(raw: &str) -> String {
     }
 
     raw.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn codes(events: &[FastPathInputEvent]) -> Vec<u16> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                FastPathInputEvent::UnicodeKeyboardEvent(flags, code)
+                    if !flags.contains(KeyboardFlags::RELEASE) =>
+                {
+                    Some(*code)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_unicode_key_events_bmp_char_is_untruncated() {
+        // A BMP character round-trips as itself.
+        let units: Vec<u16> = "A".encode_utf16().collect();
+        assert_eq!(units, vec![0x0041]);
+        let events = unicode_key_events(&units);
+        assert_eq!(events.len(), 2); // press + release
+        assert_eq!(codes(&events), vec![0x0041]);
+    }
+
+    #[test]
+    fn test_unicode_key_events_surrogate_pair_is_not_truncated() {
+        // U+1F642 (slightly smiling face) is above the BMP and must be sent
+        // as its two surrogate halves, not truncated to a BMP code point.
+        // `ch as u16` truncation would have produced 0xF642 - a private-use
+        // codepoint with no relation to the emoji.
+        let units: Vec<u16> = "🙂".encode_utf16().collect();
+        assert_eq!(units.len(), 2, "U+1F642 must encode as a surrogate pair");
+        assert_eq!(units, vec![0xD83D, 0xDE42]);
+
+        let events = unicode_key_events(&units);
+        assert_eq!(events.len(), 4); // two code units x press+release
+        assert_eq!(codes(&events), vec![0xD83D, 0xDE42]);
+
+        // The old bug's output must not appear anywhere in the stream.
+        assert!(!codes(&events).contains(&0xF642));
+    }
+
+    #[test]
+    fn test_unicode_key_events_press_before_release_per_unit() {
+        let units: Vec<u16> = "Z".encode_utf16().collect();
+        let events = unicode_key_events(&units);
+        match &events[..] {
+            [FastPathInputEvent::UnicodeKeyboardEvent(f0, c0), FastPathInputEvent::UnicodeKeyboardEvent(f1, c1)] => {
+                assert!(!f0.contains(KeyboardFlags::RELEASE));
+                assert!(f1.contains(KeyboardFlags::RELEASE));
+                assert_eq!((c0, c1), (&0x005A, &0x005A));
+            }
+            other => panic!("unexpected event shape: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unicode_key_events_empty_input() {
+        assert!(unicode_key_events(&[]).is_empty());
+    }
+
+    fn coordinate_rgba(width: u32, height: u32) -> image::RgbaImage {
+        image::RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, (x / 256) as u8, 255])
+        })
+    }
+
+    #[test]
+    fn test_copy_rgba_region_matches_crop_to_region() {
+        // The region-only copy path (used by screenshot/locate) and the
+        // crop-then-encode path (used by handlers::imaging) must produce
+        // byte-identical pixels for the same region, or the two commands
+        // would disagree on what a coordinate refers to.
+        let source = coordinate_rgba(1280, 800);
+        let region = agent_rdp_protocol::Region { x: 100, y: 380, width: 400, height: 30 };
+
+        let copied = copy_rgba_region(source.as_raw(), 1280, 800, region).unwrap();
+        let (cropped, used) = crate::handlers::imaging::crop_to_region(&source, region).unwrap();
+
+        assert_eq!(used, region);
+        assert_eq!(copied, cropped.into_raw());
+    }
+
+    #[test]
+    fn test_copy_rgba_region_matches_crop_to_region_at_the_corner() {
+        // Same check at the framebuffer's bottom-right, where an off-by-one
+        // in either implementation would show up as a size mismatch.
+        let source = coordinate_rgba(640, 480);
+        let region = agent_rdp_protocol::Region { x: 639, y: 479, width: 1, height: 1 };
+
+        let copied = copy_rgba_region(source.as_raw(), 640, 480, region).unwrap();
+        let (cropped, _) = crate::handlers::imaging::crop_to_region(&source, region).unwrap();
+
+        assert_eq!(copied, cropped.into_raw());
+    }
+
+    #[test]
+    fn test_copy_rgba_region_rejects_out_of_bounds() {
+        let source = coordinate_rgba(100, 100);
+        assert_eq!(
+            copy_rgba_region(source.as_raw(), 100, 100, agent_rdp_protocol::Region { x: 100, y: 0, width: 1, height: 1 }),
+            None
+        );
+        assert_eq!(
+            copy_rgba_region(source.as_raw(), 100, 100, agent_rdp_protocol::Region { x: 0, y: 0, width: 0, height: 10 }),
+            None
+        );
+    }
+
+    #[test]
+    fn test_unicode_key_events_mixed_bmp_and_surrogate_text() {
+        // Cyrillic (BMP) followed by an emoji (surrogate pair): every unit
+        // must survive, in order, none silently dropped or corrupted.
+        let units: Vec<u16> = "Привет🙂".encode_utf16().collect();
+        let events = unicode_key_events(&units);
+        assert_eq!(events.len(), units.len() * 2);
+        assert_eq!(codes(&events), units);
+    }
 }

@@ -125,6 +125,16 @@ pub async fn handle(
 
     info!("Connected to {} ({}x{})", host, width, height);
 
+    // Load the OCR models now rather than on the first `locate` call. Model
+    // loading is the slow part (disk I/O plus building the rten graphs), so
+    // paying for it here means the first `locate` an agent issues is as fast
+    // as every later one. Fire-and-forget: a failure just leaves the lazy
+    // path in `handlers::locate` to retry and report it when `locate` is
+    // actually used.
+    tokio::spawn(async {
+        crate::handlers::locate::get_or_init_ocr_service().await;
+    });
+
     // Start WebSocket streaming server if requested
     if stream_port > 0 {
         let mut ws = ws_handle.lock().await;

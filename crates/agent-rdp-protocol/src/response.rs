@@ -95,6 +95,17 @@ pub enum ResponseData {
         format: String,
         /// Base64-encoded image data.
         base64: String,
+        /// X offset of the image within the full desktop (region captures only).
+        ///
+        /// Add this to an x coordinate read off the image to get a coordinate
+        /// that can be clicked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        offset_x: Option<u32>,
+        /// Y offset of the image within the full desktop (region captures only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        offset_y: Option<u32>,
     },
 
     /// Clipboard text content.
@@ -379,6 +390,8 @@ mod tests {
             height: 1080,
             format: "png".to_string(),
             base64: "iVBORw0KGgo...".to_string(),
+            offset_x: None,
+            offset_y: None,
         });
 
         let json = serde_json::to_string(&resp).unwrap();

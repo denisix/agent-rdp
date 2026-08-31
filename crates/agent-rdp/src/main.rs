@@ -41,9 +41,21 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+    let json = cli.json;
 
     if let Err(e) = run(cli).await {
-        error!("{}", e);
+        // Errors that reach here are the ones no command formatted itself -
+        // a timed-out request, a dropped socket, "daemon failed to start".
+        // Printing them via `error!` put a non-JSON tracing line on stderr
+        // even under `--json`, so a JSON-consuming caller got unparseable
+        // output on exactly the paths most likely to need a *specific*
+        // failure reason (a caller retrying on `timeout` vs. giving up on
+        // `connection_failed`, for instance).
+        if json {
+            output::Output::new(true).print_error("cli_error", &e.to_string());
+        } else {
+            error!("{}", e);
+        }
         std::process::exit(1);
     }
 }
@@ -107,7 +119,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             cli::commands::session::run(&cli.session, args, &output, timeout).await
         }
         Commands::Wait { ms } => {
-            cli::commands::wait::run(ms).await
+            cli::commands::wait::run(ms, &output).await
         }
         Commands::View(args) => {
             cli::commands::view::run(args, &output).await

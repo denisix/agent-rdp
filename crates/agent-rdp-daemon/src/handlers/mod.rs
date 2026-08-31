@@ -4,6 +4,7 @@ pub mod automate;
 pub mod clipboard;
 pub mod connect;
 pub mod drive;
+pub mod imaging;
 pub mod keyboard;
 pub mod locate;
 pub mod mouse;

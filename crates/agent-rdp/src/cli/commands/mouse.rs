@@ -14,15 +14,13 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let manager = SessionManager::new(session.to_string());
 
-    if !manager.is_daemon_alive() {
-        output.print_error(
-            "daemon_not_running",
-            &crate::session_manager::daemon_not_running_message(session),
-        );
-        std::process::exit(1);
-    }
-
-    let mut client = manager.ensure_daemon().await?;
+    let mut client = match manager.connect_existing().await {
+        Ok(client) => client,
+        Err(message) => {
+            output.print_error("daemon_not_running", &message);
+            std::process::exit(1);
+        }
+    };
 
     let mouse_request = match args.action {
         MouseAction::Click { x, y } => MouseRequest::Click { x, y },

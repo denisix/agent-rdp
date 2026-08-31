@@ -128,9 +128,9 @@ impl SessionManager {
         if self.is_daemon_alive() {
             debug!("Daemon already running, connecting...");
             match self.connect_to_daemon().await {
-                Ok(client) => {
+                Ok(mut client) => {
                     // Verify daemon is responsive with a ping
-                    if self.verify_daemon_health(&client).await {
+                    if Self::verify_daemon_health(&mut client).await {
                         return Ok(client);
                     }
                     warn!("Daemon not responsive, cleaning up and restarting...");
@@ -152,17 +152,37 @@ impl SessionManager {
         self.wait_for_daemon().await
     }
 
-    /// Verify daemon is responsive by sending a ping.
-    async fn verify_daemon_health(&self, _client: &IpcClient) -> bool {
-        // Create a temporary mutable client for the ping
-        let socket_path = self.socket_path();
-        match IpcClient::connect(&socket_path).await {
-            Ok(mut ping_client) => {
-                match ping_client.send(&Request::Ping, 5000).await {
-                    Ok(response) => response.success,
-                    Err(_) => false,
-                }
-            }
+    /// Connect to a daemon that must already exist - never spawn one.
+    ///
+    /// Every command except `connect` goes through here. The previous flow
+    /// (an `is_daemon_alive` check followed by `ensure_daemon`) had a gap: a
+    /// daemon dying between the two silently spawned a fresh, connectionless
+    /// daemon, and the command then failed with a misleading `NotConnected`
+    /// instead of the daemon_not_running message that points at daemon.log.
+    pub async fn connect_existing(&self) -> Result<IpcClient, String> {
+        if !self.is_daemon_alive() {
+            return Err(daemon_not_running_message(&self.session));
+        }
+
+        let mut client = self
+            .connect_to_daemon()
+            .await
+            .map_err(|_| daemon_not_running_message(&self.session))?;
+
+        if !Self::verify_daemon_health(&mut client).await {
+            return Err(daemon_not_running_message(&self.session));
+        }
+
+        Ok(client)
+    }
+
+    /// Verify daemon is responsive by sending a ping over the connection that
+    /// will actually be used - not a throwaway second connection, which both
+    /// doubled the per-command connect cost and proved nothing about the
+    /// client being handed back.
+    async fn verify_daemon_health(client: &mut IpcClient) -> bool {
+        match client.send(&Request::Ping, 5000).await {
+            Ok(response) => response.success,
             Err(_) => false,
         }
     }

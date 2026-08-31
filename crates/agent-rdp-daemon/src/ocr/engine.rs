@@ -2,6 +2,7 @@
 
 use agent_rdp_protocol::OcrMatch;
 use anyhow::{Context, Result};
+use image::RgbImage;
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams, TextItem};
 use rten::Model;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,10 @@ impl OcrService {
     ///
     /// # Returns
     /// A tuple of (matching lines, total line count)
+    ///
+    /// Decodes `image_data` first; callers that already hold a decoded
+    /// `RgbImage` (the daemon's own screenshot handlers do) should call
+    /// [`Self::find_text_rgb`] instead and skip the encode/decode round trip.
     pub fn find_text(
         &self,
         image_data: &[u8],
@@ -54,7 +59,25 @@ impl OcrService {
         pattern: bool,
         ignore_case: bool,
     ) -> Result<(Vec<OcrMatch>, u32)> {
-        let (all_lines, total_lines) = self.get_all_lines(image_data)?;
+        let img = image::load_from_memory(image_data)
+            .context("Failed to decode image")?
+            .into_rgb8();
+        self.find_text_rgb(&img, query, pattern, ignore_case)
+    }
+
+    /// Same as [`Self::find_text`], operating on an already-decoded RGB image.
+    ///
+    /// The daemon holds the framebuffer as RGBA already; PNG-encoding it just
+    /// for this function to `load_from_memory` it back was a pure-overhead
+    /// encode+decode round trip on every `locate` call.
+    pub fn find_text_rgb(
+        &self,
+        img: &RgbImage,
+        query: &str,
+        pattern: bool,
+        ignore_case: bool,
+    ) -> Result<(Vec<OcrMatch>, u32)> {
+        let (all_lines, total_lines) = self.get_all_lines_rgb(img)?;
 
         // Prepare query for comparison
         let query_cmp = if ignore_case {
@@ -99,11 +122,15 @@ impl OcrService {
     /// # Returns
     /// A tuple of (all lines with positions, total line count)
     pub fn get_all_lines(&self, image_data: &[u8]) -> Result<(Vec<OcrMatch>, u32)> {
-        // Load image
         let img = image::load_from_memory(image_data)
             .context("Failed to decode image")?
             .into_rgb8();
+        self.get_all_lines_rgb(&img)
+    }
 
+    /// Same as [`Self::get_all_lines`], operating on an already-decoded RGB
+    /// image; see [`Self::find_text_rgb`] for why this exists.
+    pub fn get_all_lines_rgb(&self, img: &RgbImage) -> Result<(Vec<OcrMatch>, u32)> {
         let (width, height) = (img.width(), img.height());
         trace!("Image loaded: {}x{}", width, height);
 

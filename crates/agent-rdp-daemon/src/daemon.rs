@@ -13,6 +13,21 @@ use crate::ipc_server::IpcServer;
 use crate::rdp_session::RdpSession;
 use crate::ws_server::WsServerHandle;
 
+/// Highest allowed streaming frame rate.
+///
+/// The cap matters beyond taste: the frame period is computed as
+/// `1000 / fps` milliseconds, and fps above 1000 would yield a zero period,
+/// which `tokio::time::interval` panics on.
+pub const MAX_STREAM_FPS: u32 = 60;
+
+/// Largest accepted IPC request line, in bytes.
+///
+/// `read_line` is otherwise unbounded, and on Windows the IPC endpoint is
+/// loopback TCP that any local process can reach - an endless line must not
+/// be able to grow the daemon's memory without limit. 64MB comfortably covers
+/// the largest legitimate payload (a full-desktop PNG as base64 in JSON).
+pub const MAX_IPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Shared WebSocket server state that can be started/stopped dynamically.
 pub type SharedWsHandle = Arc<Mutex<Option<WsServerHandle>>>;
 
@@ -108,10 +123,27 @@ impl Daemon {
         // Frame broadcast interval for WebSocket streaming. Starts at the
         // daemon-wide default and is re-tuned below once a stream is running,
         // since the rate can be chosen per-connection via ConnectRequest.
-        let mut current_fps = self.stream_fps.max(1);
+        // Clamp, don't just floor: fps >= 1001 makes the millisecond division
+        // yield a zero period, and `tokio::time::interval` panics on that -
+        // reachable straight from AGENT_RDP_STREAM_FPS. 60 is already beyond
+        // what a JPEG-over-WebSocket stream can deliver.
+        let mut current_fps = self.stream_fps.clamp(1, MAX_STREAM_FPS);
         let mut frame_timer =
             tokio::time::interval(Duration::from_millis(1000 / current_fps as u64));
         frame_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Generation last sent to viewers. Skips re-copying and re-encoding
+        // the framebuffer when nothing painted since the last tick, which
+        // otherwise happens unconditionally at the full stream frame rate
+        // even for a completely idle desktop.
+        //
+        // Known limitation: the generation counter resets to 0 on every
+        // reconnect (it lives on the `RdpSession`, not the daemon), so in the
+        // rare case where a fresh session's counter is still 0 when the next
+        // tick fires, that tick is skipped. This self-corrects on the next
+        // paint - reactivating the desktop itself counts as one - so the
+        // worst case is one stale frame, not a stuck stream.
+        let mut last_broadcast_generation: Option<u64> = None;
 
         loop {
             tokio::select! {
@@ -177,8 +209,8 @@ impl Daemon {
                     if let Some(ref handle) = *ws_handle {
                         // Adopt the rate the stream was started with, so
                         // ConnectRequest.stream_fps actually takes effect.
-                        if handle.fps() != current_fps {
-                            current_fps = handle.fps().max(1);
+                        if handle.fps().clamp(1, MAX_STREAM_FPS) != current_fps {
+                            current_fps = handle.fps().clamp(1, MAX_STREAM_FPS);
                             debug!("Stream frame rate set to {} fps", current_fps);
                             frame_timer = tokio::time::interval(
                                 Duration::from_millis(1000 / current_fps as u64),
@@ -191,11 +223,15 @@ impl Daemon {
                             drop(ws_handle); // Release WS lock before acquiring RDP lock
                             let session = self.rdp_session.lock().await;
                             if let Some(ref rdp) = *session {
-                                let (width, height, data) = rdp.get_image_data();
-                                drop(session); // Release lock before broadcasting
-                                let ws_handle = self.ws_handle.lock().await;
-                                if let Some(ref handle) = *ws_handle {
-                                    handle.broadcast_frame(width, height, &data);
+                                let generation = rdp.frame_generation();
+                                if last_broadcast_generation != Some(generation) {
+                                    let (width, height, data) = rdp.get_image_data();
+                                    drop(session); // Release lock before broadcasting
+                                    let ws_handle = self.ws_handle.lock().await;
+                                    if let Some(ref handle) = *ws_handle {
+                                        handle.broadcast_frame(width, height, &data);
+                                    }
+                                    last_broadcast_generation = Some(generation);
                                 }
                             }
                         }
@@ -281,8 +317,9 @@ async fn handle_client(
             Ok(req) => req,
             Err(e) => {
                 let resp = Response::error(ErrorCode::InvalidRequest, format!("Invalid request: {}", e));
-                let json = serde_json::to_string(&resp)? + "\n";
-                writer.write_all(json.as_bytes()).await?;
+                let mut json = serde_json::to_vec(&resp)?;
+                json.push(b'\n');
+                writer.write_all(&json).await?;
                 writer.flush().await?;
                 continue;
             }
@@ -301,8 +338,12 @@ async fn handle_client(
             &clipboard_changed_rx,
         ).await;
 
-        let json = serde_json::to_string(&response)? + "\n";
-        writer.write_all(json.as_bytes()).await?;
+        // `to_vec` + push instead of `to_string + "\n"`: appending to a String
+        // that just reached exactly its capacity re-allocates and copies the
+        // whole multi-MB screenshot payload one extra time.
+        let mut json = serde_json::to_vec(&response)?;
+        json.push(b'\n');
+        writer.write_all(&json).await?;
         writer.flush().await?;
 
         // Trigger daemon shutdown if this was a shutdown request

@@ -385,27 +385,29 @@ where
         }
     }
 
-    // Send initial frame
-    {
+    // Send initial frame. Copy the pixels out and release the session lock
+    // before encoding - a new viewer connecting used to block every other
+    // request on the daemon for the length of a JPEG encode.
+    let initial_frame = {
         let session = rdp_session.lock().await;
-        if let Some(ref rdp) = *session {
-            let (width, height, data) = rdp.get_image_data();
-            if let Ok(jpeg_data) = encode_jpeg(width, height, &data, jpeg_quality) {
-                let base64_data = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &jpeg_data,
-                );
-                let msg = FrameMessage {
-                    msg_type: "frame",
-                    data: base64_data,
-                    metadata: FrameMetadata {
-                        device_width: width,
-                        device_height: height,
-                    },
-                };
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let _ = ws_sink.send(Message::Text(json.into())).await;
-                }
+        session.as_ref().map(|rdp| rdp.get_image_data())
+    };
+    if let Some((width, height, data)) = initial_frame {
+        if let Ok(jpeg_data) = encode_jpeg(width, height, &data, jpeg_quality) {
+            let base64_data = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &jpeg_data,
+            );
+            let msg = FrameMessage {
+                msg_type: "frame",
+                data: base64_data,
+                metadata: FrameMetadata {
+                    device_width: width,
+                    device_height: height,
+                },
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                let _ = ws_sink.send(Message::Text(json.into())).await;
             }
         }
     }
@@ -537,21 +539,29 @@ async fn handle_client_message<S>(
 
 /// Encode RGBA image data to JPEG.
 fn encode_jpeg(width: u16, height: u16, rgba_data: &[u8], quality: u8) -> anyhow::Result<Vec<u8>> {
-    use image::{ImageBuffer, Rgba};
+    // Pack RGBA to RGB (JPEG has no alpha) straight from the borrowed slice.
+    // The previous version first copied the whole framebuffer with `to_vec()`
+    // just to build an owned ImageBuffer - a second ~4MB memcpy per frame at
+    // stream fps.
+    let expected = width as usize * height as usize * 4;
+    if rgba_data.len() != expected {
+        anyhow::bail!(
+            "Frame buffer size {} does not match {}x{} RGBA",
+            rgba_data.len(),
+            width,
+            height
+        );
+    }
 
-    // Create image buffer from RGBA data
-    let img: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(
-        width as u32,
-        height as u32,
-        rgba_data.to_vec(),
-    )
-    .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
-
-    // Convert to RGB (JPEG doesn't support alpha)
-    let rgb_img = image::DynamicImage::ImageRgba8(img).into_rgb8();
+    let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+    for px in rgba_data.chunks_exact(4) {
+        rgb.extend_from_slice(&px[..3]);
+    }
+    let rgb_img = image::RgbImage::from_raw(width as u32, height as u32, rgb)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
 
     // Encode to JPEG
-    let mut jpeg_data = Vec::new();
+    let mut jpeg_data = Vec::with_capacity(64 * 1024);
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_data, quality);
     rgb_img.write_with_encoder(encoder)?;
 

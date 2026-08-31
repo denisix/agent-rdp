@@ -153,6 +153,46 @@ impl Default for ConnectRequest {
     }
 }
 
+/// A rectangular sub-area of the desktop, in framebuffer pixels.
+///
+/// Used to restrict a screenshot or an OCR pass to part of the screen. The
+/// origin is always the top-left of the full desktop, and any coordinate the
+/// daemon reports back for a region request is translated back into that same
+/// full-desktop space - callers never have to add the offset themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct Region {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Region {
+    /// Intersect the region with a `width` x `height` framebuffer.
+    ///
+    /// Returns `None` when the region lies entirely outside the framebuffer,
+    /// which callers should treat as an error rather than silently widening to
+    /// the full screen.
+    pub fn clamp_to(&self, width: u32, height: u32) -> Option<Region> {
+        let x = self.x.min(width);
+        let y = self.y.min(height);
+        let right = self.x.saturating_add(self.width).min(width);
+        let bottom = self.y.saturating_add(self.height).min(height);
+
+        if right <= x || bottom <= y {
+            return None;
+        }
+
+        Some(Region {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        })
+    }
+}
+
 /// Screenshot request parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
@@ -160,6 +200,11 @@ pub struct ScreenshotRequest {
     /// Image format.
     #[serde(default)]
     pub format: ImageFormat,
+
+    /// Capture only this part of the desktop (default: the whole desktop).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub region: Option<Region>,
 }
 
 /// Supported image formats.
@@ -241,6 +286,14 @@ pub enum KeyboardRequest {
 
     /// Release a held key.
     KeyUp { key: String },
+
+    /// Set the remote clipboard to `text`, then send Ctrl+V.
+    ///
+    /// One atomic command rather than `clipboard set` + `keyboard press`, so
+    /// focus cannot move between the two. This is the reliable path for long
+    /// or non-Latin text: it cannot lose individual keystrokes and is immune
+    /// to autocomplete popups eating input mid-string.
+    Paste { text: String },
 }
 
 /// Scroll operation request.
@@ -322,6 +375,24 @@ pub struct LocateRequest {
     /// Return all text on screen (ignores text/pattern/ignore_case).
     #[serde(default)]
     pub all: bool,
+
+    /// Restrict OCR to this part of the desktop (default: the whole desktop).
+    ///
+    /// Match coordinates are still reported in full-desktop space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub region: Option<Region>,
+
+    /// Keep re-running OCR until the text appears or this many milliseconds
+    /// pass (default: single pass).
+    ///
+    /// Lets a caller block server-side on "the dialog is now visible" instead
+    /// of polling screenshot/locate in a loop from the outside. On timeout the
+    /// response is a `timeout` error rather than an empty success, so a
+    /// wait-then-click sequence cannot fall through to clicking nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub wait_ms: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -331,6 +402,105 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_region_clamp_inside_framebuffer() {
+        let r = Region { x: 100, y: 380, width: 400, height: 30 };
+        assert_eq!(r.clamp_to(1280, 800), Some(r));
+    }
+
+    #[test]
+    fn test_region_clamp_trims_overhang() {
+        let r = Region { x: 1200, y: 780, width: 400, height: 300 };
+        assert_eq!(
+            r.clamp_to(1280, 800),
+            Some(Region { x: 1200, y: 780, width: 80, height: 20 })
+        );
+    }
+
+    #[test]
+    fn test_region_clamp_rejects_offscreen() {
+        // Fully past the right edge, and a zero-width region: both are errors
+        // rather than a silent fall back to the full desktop.
+        assert_eq!(Region { x: 1280, y: 0, width: 100, height: 100 }.clamp_to(1280, 800), None);
+        assert_eq!(Region { x: 10, y: 10, width: 0, height: 50 }.clamp_to(1280, 800), None);
+    }
+
+    #[test]
+    fn test_region_clamp_does_not_overflow() {
+        let r = Region { x: 10, y: 10, width: u32::MAX, height: u32::MAX };
+        assert_eq!(
+            r.clamp_to(1280, 800),
+            Some(Region { x: 10, y: 10, width: 1270, height: 790 })
+        );
+
+        // Origin at the maximum too: saturating_add must not wrap round to a
+        // small value and produce a bogus in-bounds region.
+        let r = Region { x: u32::MAX, y: u32::MAX, width: u32::MAX, height: u32::MAX };
+        assert_eq!(r.clamp_to(1280, 800), None);
+    }
+
+    #[test]
+    fn test_region_clamp_exactly_the_framebuffer() {
+        let r = Region { x: 0, y: 0, width: 1280, height: 800 };
+        assert_eq!(r.clamp_to(1280, 800), Some(r));
+    }
+
+    #[test]
+    fn test_region_clamp_last_pixel_is_in_bounds() {
+        // The bottom-right pixel is a classic off-by-one; it must survive.
+        let r = Region { x: 1279, y: 799, width: 1, height: 1 };
+        assert_eq!(r.clamp_to(1280, 800), Some(r));
+    }
+
+    #[test]
+    fn test_region_clamp_trims_one_axis_at_a_time() {
+        // Overhanging only horizontally leaves the vertical extent untouched,
+        // and vice versa - a clamp that trimmed both would go unnoticed if
+        // only the symmetric case were tested.
+        assert_eq!(
+            Region { x: 1000, y: 100, width: 500, height: 50 }.clamp_to(1280, 800),
+            Some(Region { x: 1000, y: 100, width: 280, height: 50 })
+        );
+        assert_eq!(
+            Region { x: 100, y: 700, width: 50, height: 500 }.clamp_to(1280, 800),
+            Some(Region { x: 100, y: 700, width: 50, height: 100 })
+        );
+    }
+
+    #[test]
+    fn test_region_clamp_rejects_below_bottom_edge() {
+        // The x axis is fully in bounds here, so only a y-axis check can
+        // reject it.
+        assert_eq!(Region { x: 0, y: 800, width: 100, height: 100 }.clamp_to(1280, 800), None);
+        assert_eq!(Region { x: 0, y: 5000, width: 100, height: 100 }.clamp_to(1280, 800), None);
+    }
+
+    #[test]
+    fn test_region_clamp_against_empty_framebuffer() {
+        // Before the first frame arrives the framebuffer can be 0x0; every
+        // region is then out of bounds rather than a panic or an empty crop.
+        assert_eq!(Region { x: 0, y: 0, width: 10, height: 10 }.clamp_to(0, 0), None);
+    }
+
+    #[test]
+    fn test_region_clamp_is_idempotent() {
+        // Clamping an already-clamped region must not shrink it further.
+        let once = Region { x: 1200, y: 780, width: 400, height: 300 }
+            .clamp_to(1280, 800)
+            .unwrap();
+        assert_eq!(once.clamp_to(1280, 800), Some(once));
+    }
+
+    #[test]
+    fn test_screenshot_region_is_optional() {
+        // Old clients omit `region` entirely; it must still deserialize.
+        let req: ScreenshotRequest = serde_json::from_str(r#"{"format":"png"}"#).unwrap();
+        assert!(req.region.is_none());
+
+        let req: LocateRequest = serde_json::from_str(r#"{"text":"OK"}"#).unwrap();
+        assert!(req.region.is_none());
+    }
 
     #[test]
     fn test_request_serialization() {

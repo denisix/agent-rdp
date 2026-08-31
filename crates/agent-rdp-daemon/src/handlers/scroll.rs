@@ -9,6 +9,10 @@ use tokio::sync::Mutex;
 
 use crate::rdp_session::RdpSession;
 
+/// Upper bound on scroll notches per request - each notch is one input event,
+/// so an unbounded `amount` is an allocation of the same size.
+const MAX_SCROLL_AMOUNT: u32 = 100;
+
 /// Handle a scroll request.
 pub async fn handle(
     rdp_session: &Arc<Mutex<Option<RdpSession>>>,
@@ -26,6 +30,12 @@ pub async fn handle(
     // Use specified position or default to center of screen
     let x = params.x.unwrap_or(rdp.width() / 2);
     let y = params.y.unwrap_or(rdp.height() / 2);
+
+    // Each notch is one input event; an unbounded amount would let a single
+    // request allocate a multi-gigabyte event Vec. 100 notches is already far
+    // past any legitimate scroll.
+    let amount = params.amount.clamp(1, MAX_SCROLL_AMOUNT);
+    let params = agent_rdp_protocol::ScrollRequest { amount, ..params };
 
     let events = match params.direction {
         ScrollDirection::Up | ScrollDirection::Down => {

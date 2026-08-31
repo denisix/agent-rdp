@@ -1,6 +1,6 @@
 //! CLI command definitions using clap.
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 
 pub mod commands;
 
@@ -149,6 +149,10 @@ pub struct ScreenshotArgs {
     /// Image format
     #[arg(long, default_value = "png")]
     pub format: String,
+
+    /// Capture only part of the screen (X,Y,WIDTH,HEIGHT in screen pixels)
+    #[arg(long, value_name = "X,Y,W,H", value_parser = crate::cli::commands::parse_region)]
+    pub region: Option<agent_rdp_protocol::Region>,
 }
 
 /// Mouse command arguments.
@@ -230,6 +234,28 @@ pub enum KeyboardAction {
         /// Key combination or single key
         keys: String,
     },
+
+    /// Press and hold a key without releasing it (for shift-click, hold-and-drag, ...)
+    Down {
+        /// Key name
+        key: String,
+    },
+
+    /// Release a key previously held with `down`
+    Up {
+        /// Key name
+        key: String,
+    },
+
+    /// Set the clipboard to `text` and paste it with Ctrl+V, as one command
+    ///
+    /// More reliable than `type` for long or non-Latin text: it cannot lose
+    /// individual keystrokes, and setting the clipboard then pasting in one
+    /// daemon-side command means focus cannot move in between.
+    Paste {
+        /// Text to paste
+        text: String,
+    },
 }
 
 /// Scroll command arguments.
@@ -243,8 +269,8 @@ pub struct ScrollArgs {
 pub enum ScrollDirection {
     /// Scroll up
     Up {
-        /// Amount to scroll
-        #[arg(default_value = "3")]
+        /// Amount to scroll (clamped to 1-100 notches)
+        #[arg(default_value = "3", value_parser = clap::value_parser!(u32).range(1..=100))]
         amount: u32,
         /// Position to scroll at (x y)
         #[arg(long = "at", num_args = 2, value_names = ["X", "Y"])]
@@ -253,8 +279,8 @@ pub enum ScrollDirection {
 
     /// Scroll down
     Down {
-        /// Amount to scroll
-        #[arg(default_value = "3")]
+        /// Amount to scroll (clamped to 1-100 notches)
+        #[arg(default_value = "3", value_parser = clap::value_parser!(u32).range(1..=100))]
         amount: u32,
         /// Position to scroll at (x y)
         #[arg(long = "at", num_args = 2, value_names = ["X", "Y"])]
@@ -263,8 +289,8 @@ pub enum ScrollDirection {
 
     /// Scroll left
     Left {
-        /// Amount to scroll
-        #[arg(default_value = "3")]
+        /// Amount to scroll (clamped to 1-100 notches)
+        #[arg(default_value = "3", value_parser = clap::value_parser!(u32).range(1..=100))]
         amount: u32,
         /// Position to scroll at (x y)
         #[arg(long = "at", num_args = 2, value_names = ["X", "Y"])]
@@ -273,8 +299,8 @@ pub enum ScrollDirection {
 
     /// Scroll right
     Right {
-        /// Amount to scroll
-        #[arg(default_value = "3")]
+        /// Amount to scroll (clamped to 1-100 notches)
+        #[arg(default_value = "3", value_parser = clap::value_parser!(u32).range(1..=100))]
         amount: u32,
         /// Position to scroll at (x y)
         #[arg(long = "at", num_args = 2, value_names = ["X", "Y"])]
@@ -364,6 +390,12 @@ pub enum AutomateAction {
         #[arg(short = 'f', long)]
         focused: bool,
     },
+
+    /// Show the element that currently has keyboard focus
+    ///
+    /// Shorthand for `snapshot --focused --compact --depth 1`. Use it to confirm
+    /// which field a Tab or Enter actually landed in before typing into it.
+    Focused,
 
     /// Get element properties
     Get {
@@ -528,7 +560,16 @@ pub enum AutomateAction {
 }
 
 /// Locate command arguments (OCR-based text location).
+///
+/// The click flags form one mutually exclusive group, which `--index` requires:
+/// an `--index` with nothing to click is a silent no-op otherwise, and silently
+/// ignoring a targeting argument is exactly the failure mode this command
+/// exists to prevent.
 #[derive(Parser)]
+#[command(group = ArgGroup::new("click_action")
+    .args(["click", "double_click", "right_click"])
+    .multiple(false)
+    .conflicts_with("all"))]
 pub struct LocateArgs {
     /// Text to search for on screen (searches within full lines)
     #[arg(required_unless_present = "all")]
@@ -545,4 +586,34 @@ pub struct LocateArgs {
     /// Return all text lines on screen (ignores search text)
     #[arg(long, short = 'a')]
     pub all: bool,
+
+    /// Search only part of the screen (X,Y,WIDTH,HEIGHT in screen pixels).
+    /// Results are still reported in full-screen coordinates.
+    #[arg(long, value_name = "X,Y,W,H", value_parser = crate::cli::commands::parse_region)]
+    pub region: Option<agent_rdp_protocol::Region>,
+
+    /// Keep retrying until the text appears, up to this many milliseconds
+    ///
+    /// Blocks server-side instead of polling `locate` in a loop from the
+    /// outside. Has no target text to wait for with `--all`, so the two
+    /// conflict. Composes with `--click`: wait, then click what appeared.
+    #[arg(long, value_name = "MS", conflicts_with = "all")]
+    pub wait: Option<u64>,
+
+    /// Click the match instead of just printing its position
+    #[arg(long)]
+    pub click: bool,
+
+    /// Double-click the match
+    #[arg(long)]
+    pub double_click: bool,
+
+    /// Right-click the match
+    #[arg(long)]
+    pub right_click: bool,
+
+    /// Which match to click when several are found (0-based).
+    /// Without it, clicking requires an unambiguous single match.
+    #[arg(long, value_name = "N", requires = "click_action")]
+    pub index: Option<usize>,
 }

@@ -73,15 +73,13 @@ async fn list_sessions(output: &Output) -> anyhow::Result<()> {
 async fn session_info(session: &str, output: &Output, timeout_ms: u64) -> anyhow::Result<()> {
     let manager = SessionManager::new(session.to_string());
 
-    if !manager.is_daemon_alive() {
-        output.print_error(
-            "daemon_not_running",
-            &crate::session_manager::daemon_not_running_message(session),
-        );
-        std::process::exit(1);
-    }
-
-    let mut client = manager.ensure_daemon().await?;
+    let mut client = match manager.connect_existing().await {
+        Ok(client) => client,
+        Err(message) => {
+            output.print_error("daemon_not_running", &message);
+            std::process::exit(1);
+        }
+    };
     let response = client.send(&Request::SessionInfo, timeout_ms).await?;
     output.print_response(&response);
 

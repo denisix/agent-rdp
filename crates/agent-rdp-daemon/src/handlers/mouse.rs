@@ -7,7 +7,7 @@ use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::input::mouse::{MousePdu, PointerFlags};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
-use tracing::debug;
+use tracing::info;
 
 use crate::rdp_session::RdpSession;
 
@@ -19,7 +19,7 @@ pub async fn handle(
     // For Click and Drag, we release the lock during sleep() to allow streaming
     match action {
         MouseRequest::Click { x, y } => {
-            debug!("Mouse click at ({}, {})", x, y);
+            info!("Mouse click at ({}, {})", x, y);
             // Send down event
             let down_event =
                 vec![create_mouse_event(x, y, PointerFlags::LEFT_BUTTON | PointerFlags::DOWN)];
@@ -68,6 +68,7 @@ pub async fn handle(
             to_x,
             to_y,
         } => {
+            info!("Mouse drag ({}, {}) -> ({}, {})", from_x, from_y, to_x, to_y);
             // Press at start position
             let start_events = vec![
                 create_mouse_event(from_x, from_y, PointerFlags::MOVE),
@@ -130,12 +131,13 @@ pub async fn handle(
 
     let result = match action {
         MouseRequest::Move { x, y } => {
-            debug!("Mouse move to ({}, {})", x, y);
+            info!("Mouse move to ({}, {})", x, y);
             let events = vec![create_mouse_event(x, y, PointerFlags::MOVE)];
             rdp.send_input(events).await
         }
 
         MouseRequest::RightClick { x, y } => {
+            info!("Mouse right-click at ({}, {})", x, y);
             let events = vec![
                 create_mouse_event(x, y, PointerFlags::RIGHT_BUTTON | PointerFlags::DOWN),
                 create_mouse_event(x, y, PointerFlags::RIGHT_BUTTON),
@@ -144,6 +146,7 @@ pub async fn handle(
         }
 
         MouseRequest::DoubleClick { x, y } => {
+            info!("Mouse double-click at ({}, {})", x, y);
             let events = vec![
                 create_mouse_event(x, y, PointerFlags::LEFT_BUTTON | PointerFlags::DOWN),
                 create_mouse_event(x, y, PointerFlags::LEFT_BUTTON),
@@ -154,6 +157,7 @@ pub async fn handle(
         }
 
         MouseRequest::MiddleClick { x, y } => {
+            info!("Mouse middle-click at ({}, {})", x, y);
             let events = vec![
                 create_mouse_event(
                     x,
@@ -166,12 +170,14 @@ pub async fn handle(
         }
 
         MouseRequest::ButtonDown { button } => {
+            info!("Mouse button down: {:?}", button);
             let flags = button_to_flags(button) | PointerFlags::DOWN;
             let events = vec![create_mouse_event(0, 0, flags | PointerFlags::MOVE)];
             rdp.send_input(events).await
         }
 
         MouseRequest::ButtonUp { button } => {
+            info!("Mouse button up: {:?}", button);
             let flags = button_to_flags(button);
             let events = vec![create_mouse_event(0, 0, flags | PointerFlags::MOVE)];
             rdp.send_input(events).await
