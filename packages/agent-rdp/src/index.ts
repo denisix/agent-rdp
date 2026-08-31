@@ -451,8 +451,10 @@ export class RdpSession {
       exact: options.exact ?? false,
       ignore_case: !(options.caseSensitive ?? false),
       all: options.all ?? false,
+      near_distance: options.nearDistance ?? 150,
       ...(options.region ? { region: options.region } : {}),
       ...(options.waitMs !== undefined ? { wait_ms: options.waitMs } : {}),
+      ...(options.near !== undefined ? { near: options.near } : {}),
     });
 
     const data = response.data as { matches: OcrMatch[] };
@@ -528,6 +530,8 @@ export class RdpSession {
       min_gap: options.minGap ?? 10,
       double_click: options.doubleClick ?? false,
       right_click: options.rightClick ?? false,
+      max_divergence: options.maxDivergence ?? 40,
+      ...(options.confirm ? { confirm_x: options.confirm.x, confirm_y: options.confirm.y } : {}),
     });
 
     const data = response.data as unknown as { type: 'click_at_result' } & ClickAtResult;
@@ -537,6 +541,7 @@ export class RdpSession {
       y: data.y,
       matched_text: data.matched_text,
       nearby: data.nearby ?? [],
+      divergence: data.divergence,
     };
   }
 

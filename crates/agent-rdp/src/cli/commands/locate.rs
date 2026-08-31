@@ -72,6 +72,21 @@ fn click_point(m: &OcrMatch) -> Result<(u16, u16), String> {
     Ok((to_u16(m.center_x, "x")?, to_u16(m.center_y, "y")?))
 }
 
+/// Build the "no matches" message, with an extra hint when `--near` was set:
+/// zero matches there could mean the anchor itself wasn't found, not that
+/// the query text is absent, and those need different fixes.
+fn no_match_message(search_text: &str, total_lines: u32, near: &Option<String>) -> String {
+    let base = format!("No lines containing '{}' found ({} lines detected)", search_text, total_lines);
+    match near {
+        Some(anchor) => format!(
+            "{}. This could also mean the --near anchor '{}' itself wasn't found - try \
+             `locate '{}'` (without --near) to check.",
+            base, anchor, anchor
+        ),
+        None => base,
+    }
+}
+
 pub async fn run(
     session: &str,
     args: LocateArgs,
@@ -100,6 +115,8 @@ pub async fn run(
         all: args.all,
         region: args.region,
         wait_ms: args.wait,
+        near: args.near.clone(),
+        near_distance: args.near_distance,
     });
 
     // The daemon polls for up to `--wait` milliseconds before answering, so
@@ -121,13 +138,7 @@ pub async fn run(
         // never has to be read off a screenshot and typed back in.
         if let Some(kind) = click_kind {
             if result.matches.is_empty() {
-                output.print_error(
-                    "no_match",
-                    &format!(
-                        "No text matching '{}' found ({} lines detected)",
-                        search_text, result.total_words
-                    ),
-                );
+                output.print_error("no_match", &no_match_message(&search_text, result.total_words, &args.near));
                 std::process::exit(1);
             }
 
@@ -194,7 +205,7 @@ pub async fn run(
         } else {
             // Search mode
             if result.matches.is_empty() {
-                println!("No lines containing '{}' found ({} lines detected)", search_text, result.total_words);
+                println!("{}", no_match_message(&search_text, result.total_words, &args.near));
             } else {
                 println!("Found {} line(s) containing '{}' ({} lines detected):",
                     result.matches.len(), search_text, result.total_words);
@@ -236,6 +247,11 @@ pub async fn run_click_at(
 
     let (window_width, window_height) = args.window.unwrap_or((400, 160));
 
+    let (confirm_x, confirm_y) = match args.confirm {
+        Some((x, y)) => (Some(x), Some(y)),
+        None => (None, None),
+    };
+
     let request = Request::ClickAt(ClickAtRequest {
         x: args.x,
         y: args.y,
@@ -244,6 +260,9 @@ pub async fn run_click_at(
         min_gap: args.min_gap.unwrap_or(10),
         double_click: args.double_click,
         right_click: args.right_click,
+        confirm_x,
+        confirm_y,
+        max_divergence: args.max_divergence.unwrap_or(40),
     });
 
     let response = client.send(&request, timeout_ms).await?;
@@ -268,6 +287,19 @@ pub async fn run_click_at(
                     result.x, result.y
                 ),
             }
+        } else if let Some(divergence) = result.divergence {
+            output.print_error(
+                "measurements_diverge",
+                &format!(
+                    "confirm point diverges {}px from ({}, {}), past --max-divergence {}px - \
+                     the two measurements don't agree closely enough to trust either",
+                    divergence,
+                    result.x,
+                    result.y,
+                    args.max_divergence.unwrap_or(40)
+                ),
+            );
+            std::process::exit(1);
         } else {
             // Refused: mirror the ambiguous-match formatting `locate --click`
             // uses, so the two commands read the same way when they decline.
@@ -414,6 +446,8 @@ mod tests {
             double_click,
             right_click,
             index: None,
+            near: None,
+            near_distance: 150,
         };
 
         assert_eq!(ClickKind::from_args(&base(false, false, false)), None);

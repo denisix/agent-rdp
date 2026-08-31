@@ -21,4 +21,10 @@ matched_text?: string,
  * Populated (with `clicked: false`) when the click was refused as
  * ambiguous.
  */
-nearby: Array<OcrMatch>, };
+nearby: Array<OcrMatch>, 
+/**
+ * Chebyshev distance between `(x, y)` and the confirm point, when a
+ * confirm point was supplied. Populated (with `clicked: false`) when
+ * the two measurements diverged past `max_divergence`.
+ */
+divergence?: number, };

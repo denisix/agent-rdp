@@ -179,6 +179,19 @@ agent-rdp screenshot --region 100,380,600,30 --output row.png
 
 > Note: the CLI no longer has `screenshot --base64`. For agent pipelines, write a file and encode it yourself, or use the Node.js API's `rdp.screenshot({ path })`, which writes to disk and returns `{ path, width, height }` without materializing base64 — prefer this over the default `rdp.screenshot()` (which returns `{ base64, width, height }`) when the caller doesn't need the raw bytes, since echoing a base64 image into an LLM context is expensive.
 
+Every screenshot also reports `frame_age_ms` (`--json`) / a printed warning
+(human mode, when large): milliseconds since the RDP server last sent any
+data. An idle-but-alive desktop can legitimately sit at a large age — RDP
+servers send nothing when nothing changes — but combined with `agent-rdp
+session info`'s `last_frame_age_ms`, a value that never resets on an
+otherwise-idle session is the signal to check the connection rather than
+trust the frame. The daemon also enables TCP keepalive on the RDP socket, so
+a genuinely dead connection (cable pull, black-holed network path) is now
+detected and disconnected within seconds instead of the OS's own multi-minute
+retransmission timeout — previously `screenshot` could keep returning a
+stale, byte-identical frame under a fresh filename for the entire time the
+transport was silently dead.
+
 ### Getting Coordinates Right
 
 **Never estimate a coordinate by looking at a screenshot.** Screenshot pixels,
@@ -267,12 +280,14 @@ agent-rdp keyboard up shift
 Position defaults to the **screen center**, not whatever pane you're working
 in — pass `--at` to target a specific window or control.
 
+Amount is a positional argument, not `--amount`:
+
 ```bash
-agent-rdp scroll up --amount 3
-agent-rdp scroll down --amount 5
+agent-rdp scroll up 3
+agent-rdp scroll down 5
 agent-rdp scroll left
 agent-rdp scroll right
-agent-rdp scroll down --amount 5 --at 600 400
+agent-rdp scroll down 5 --at 600 400
 ```
 
 ### Locate (OCR)
@@ -311,6 +326,12 @@ agent-rdp locate --all --region 100,380,600,30
 # Block until text appears (e.g. a dialog finishing its animation), instead
 # of polling `locate` in a loop from the outside. Composes with --click.
 agent-rdp locate "OK" --wait 10000 --click
+
+# Constrain matches to those near a distinctive anchor label - useful when
+# the same text repeats on screen (a column header in every row, a label
+# that also appears in a tooltip). Anchor is matched by substring; if it
+# isn't found at all, this returns zero matches rather than an error.
+agent-rdp locate "Отменить" --near "Заказ №001" --click
 ```
 
 Returns text lines with coordinates for clicking:
@@ -343,6 +364,14 @@ agent-rdp click-at 665 209 --window 400x160 --min-gap 20
 # Variants
 agent-rdp click-at 665 209 --double-click
 agent-rdp click-at 665 209 --right-click
+
+# Cross-check: a second independent measurement for the same target (e.g. a
+# vision model queried twice). Clicks the midpoint if the two agree within
+# --max-divergence (default 40px); refuses if they don't. Formalizes the
+# "click the intersection of two measurements" technique that catches a
+# single call's misreads.
+agent-rdp click-at 665 209 --confirm 670,212
+agent-rdp click-at 665 209 --confirm 670,212 --max-divergence 20
 ```
 
 The check uses OCR *detection* only (bounding boxes, script-agnostic), not
@@ -429,7 +458,22 @@ agent-rdp automate run "$PSVersionTable" --wait --shell pwsh.exe    # Run throug
 # Stream output from a long-running command instead of waiting for it to exit
 agent-rdp automate run "ping -t 127.0.0.1" --stream   # Returns immediately with a pid
 agent-rdp automate run-poll <pid>                      # Repeat to drain output incrementally; reports exit once the process ends
+
+# Diagnostics: agent uptime, last DVC round-trip time, consecutive failures
+agent-rdp automate status
+
+# Relaunch the agent without a full RDP reconnect - use when the agent died
+# mid-session or never came up after connect, but the RDP session is fine.
+# Requires --enable-win-automation to have been passed at connect time.
+agent-rdp automate restart
 ```
+
+An `automation indeterminate` error means the DVC reply was lost, not that
+the action necessarily failed or succeeded - check state before retrying, or
+a retried click/fill can apply twice. For read-only commands (`snapshot`,
+`get`, `status`, `wait-for`, `window list`) the error text now says so
+explicitly ("This command is read-only - retrying is safe"), since those can
+always be retried safely.
 
 **Selector Types:**
 - `@e5` or `@5` - Reference number from snapshot (e prefix recommended)

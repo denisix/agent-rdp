@@ -53,6 +53,24 @@ pub fn parse_window(s: &str) -> Result<(u32, u32), String> {
     Ok((width, height))
 }
 
+/// Parse a `--confirm X,Y` argument: a second independently measured point
+/// for the same target, used by `click-at`'s cross-check.
+pub fn parse_point(s: &str) -> Result<(u16, u16), String> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    if parts.len() != 2 {
+        return Err(format!("expected X,Y (2 comma-separated values), got '{}'", s));
+    }
+
+    let x: u16 = parts[0]
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid coordinate", parts[0]))?;
+    let y: u16 = parts[1]
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid coordinate", parts[1]))?;
+
+    Ok((x, y))
+}
+
 pub mod automate;
 pub mod clipboard;
 pub mod connect;
@@ -173,5 +191,21 @@ mod tests {
         assert!(parse_window("400x0").is_err());
         assert!(parse_window("wxh").is_err());
         assert!(parse_window("").is_err());
+    }
+
+    #[test]
+    fn test_parse_point_valid() {
+        assert_eq!(parse_point("665,209"), Ok((665, 209)));
+        assert_eq!(parse_point(" 665 , 209 "), Ok((665, 209)));
+        assert_eq!(parse_point("0,0"), Ok((0, 0)));
+    }
+
+    #[test]
+    fn test_parse_point_rejects_bad_input() {
+        assert!(parse_point("665").is_err());
+        assert!(parse_point("665,209,1").is_err());
+        assert!(parse_point("665x209").is_err());
+        assert!(parse_point("-1,209").is_err());
+        assert!(parse_point("").is_err());
     }
 }

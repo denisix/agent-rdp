@@ -50,4 +50,22 @@ region?: Region,
  * response is a `timeout` error rather than an empty success, so a
  * wait-then-click sequence cannot fall through to clicking nothing.
  */
-wait_ms?: number, };
+wait_ms?: number, 
+/**
+ * Constrain matches to those within `near_distance` px of a line
+ * containing this anchor text (substring match).
+ *
+ * The same text often appears in more than one place on screen (a
+ * column header repeated in several rows, a label that also appears in
+ * a tooltip); anchoring to a nearby, more distinctive label disambiguates
+ * without needing `--exact` to already know the one true full string.
+ * The anchor itself is matched by substring, same as the default `text`
+ * mode - if it isn't found at all, the result is zero matches (not an
+ * error), since there is nothing to anchor to.
+ */
+near?: string, 
+/**
+ * Maximum distance in pixels from the anchor's bounding box, used only
+ * when `near` is set.
+ */
+near_distance: number, };

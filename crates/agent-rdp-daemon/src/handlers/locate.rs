@@ -155,28 +155,66 @@ async fn run_one_pass(
     let pattern = params.pattern;
     let ignore_case = params.ignore_case;
     let exact = params.exact;
+    let near = params.near.clone();
 
     // OCR is CPU-bound and can run to multiple seconds on a full desktop;
     // keep it off the async worker so other requests keep being served.
+    // The anchor search (when `near` is set) runs in the same blocking task
+    // against the same decoded image, instead of a second screenshot+OCR
+    // round trip.
     let result = tokio::task::spawn_blocking(move || {
-        if all {
+        let primary = if all {
             ocr.get_all_lines_rgb(&rgb_image)
         } else {
             ocr.find_text_rgb(&rgb_image, &text, pattern, ignore_case, exact)
-        }
+        };
+        let anchor = near
+            .map(|anchor_text| ocr.find_text_rgb(&rgb_image, &anchor_text, false, ignore_case, false));
+        (primary, anchor)
     })
     .await
     .map_err(|e| Response::error(ErrorCode::InternalError, format!("OCR task failed: {}", e)))?;
 
-    match result {
-        Ok((mut matches, total_lines)) => {
-            if let Some(region) = applied_region {
-                offset_matches(&mut matches, region);
-            }
-            Ok((matches, total_lines))
-        }
-        Err(e) => Err(Response::error(ErrorCode::InternalError, format!("OCR failed: {}", e))),
+    let (primary, anchor) = result;
+
+    let (mut matches, total_lines) = match primary {
+        Ok((matches, total_lines)) => (matches, total_lines),
+        Err(e) => return Err(Response::error(ErrorCode::InternalError, format!("OCR failed: {}", e))),
+    };
+    if let Some(region) = applied_region {
+        offset_matches(&mut matches, region);
     }
+
+    if let Some(anchor_result) = anchor {
+        let mut anchors = match anchor_result {
+            Ok((anchors, _)) => anchors,
+            Err(e) => {
+                return Err(Response::error(
+                    ErrorCode::InternalError,
+                    format!("OCR failed while locating --near anchor: {}", e),
+                ))
+            }
+        };
+        if let Some(region) = applied_region {
+            offset_matches(&mut anchors, region);
+        }
+        matches = filter_near(matches, &anchors, params.near_distance as i32);
+    }
+
+    Ok((matches, total_lines))
+}
+
+/// Keep only the matches within `near_distance` px of at least one anchor
+/// box. Pure so it's testable without OCR or a screenshot.
+fn filter_near(matches: Vec<OcrMatch>, anchors: &[OcrMatch], near_distance: i32) -> Vec<OcrMatch> {
+    matches
+        .into_iter()
+        .filter(|m| {
+            anchors
+                .iter()
+                .any(|anchor| rect_distance(anchor, m.center_x, m.center_y) <= near_distance)
+        })
+        .collect()
 }
 
 /// Handle a locate request.
@@ -185,8 +223,17 @@ pub async fn handle(
     params: LocateRequest,
 ) -> Response {
     info!(
-        "Locate request: text='{}', pattern={}, exact={}, ignore_case={}, all={}, region={:?}, wait_ms={:?}",
-        params.text, params.pattern, params.exact, params.ignore_case, params.all, params.region, params.wait_ms
+        "Locate request: text='{}', pattern={}, exact={}, ignore_case={}, all={}, region={:?}, \
+         wait_ms={:?}, near={:?}, near_distance={}",
+        params.text,
+        params.pattern,
+        params.exact,
+        params.ignore_case,
+        params.all,
+        params.region,
+        params.wait_ms,
+        params.near,
+        params.near_distance
     );
 
     let ocr = match get_or_init_ocr_service().await {
@@ -251,6 +298,20 @@ fn rect_distance(m: &OcrMatch, x: i32, y: i32) -> i32 {
     dx.max(dy)
 }
 
+/// Chebyshev distance between two points, used for the `click-at` confirm
+/// cross-check - the same distance metric as `rect_distance`, just between
+/// two points instead of a point and a box.
+fn point_distance(x1: u16, y1: u16, x2: u16, y2: u16) -> u32 {
+    let dx = (x1 as i32 - x2 as i32).unsigned_abs();
+    let dy = (y1 as i32 - y2 as i32).unsigned_abs();
+    dx.max(dy)
+}
+
+/// Midpoint of two points, rounding down.
+fn midpoint(x1: u16, y1: u16, x2: u16, y2: u16) -> (u16, u16) {
+    (((x1 as u32 + x2 as u32) / 2) as u16, ((y1 as u32 + y2 as u32) / 2) as u16)
+}
+
 /// Result of checking whether `(x, y)` is safe to click.
 struct ClickAtCheck {
     /// Recognized text of the sole nearby region, when there was exactly one.
@@ -292,8 +353,15 @@ pub async fn handle_click_at(
     params: ClickAtRequest,
 ) -> Response {
     info!(
-        "ClickAt request: ({}, {}), window={}x{}, min_gap={}",
-        params.x, params.y, params.window_width, params.window_height, params.min_gap
+        "ClickAt request: ({}, {}), window={}x{}, min_gap={}, confirm=({:?}, {:?}), max_divergence={}",
+        params.x,
+        params.y,
+        params.window_width,
+        params.window_height,
+        params.min_gap,
+        params.confirm_x,
+        params.confirm_y,
+        params.max_divergence
     );
 
     let ocr = match get_or_init_ocr_service().await {
@@ -306,7 +374,36 @@ pub async fn handle_click_at(
         }
     };
 
-    let (px, py) = (params.x as i32, params.y as i32);
+    // Cross-check: two independently measured points for the same target
+    // (e.g. two separate vision-model calls) should roughly agree. Formalizes
+    // the "click the intersection of two measurements" workaround that
+    // proved reliable when OCR recognition and single vision calls both
+    // struggled. Divergence is checked before anything else - no point
+    // running OCR detection for a click that's already going to be refused.
+    let (target_x, target_y) = match (params.confirm_x, params.confirm_y) {
+        (Some(cx), Some(cy)) => {
+            let divergence = point_distance(params.x, params.y, cx, cy);
+            if divergence > params.max_divergence {
+                info!(
+                    "ClickAt confirm mismatch: ({}, {}) vs ({}, {}), divergence {}px > max {}px",
+                    params.x, params.y, cx, cy, divergence, params.max_divergence
+                );
+                return Response::success(ResponseData::ClickAtResult(ClickAtResult {
+                    clicked: false,
+                    x: params.x,
+                    y: params.y,
+                    matched_text: None,
+                    nearby: Vec::new(),
+                    divergence: Some(divergence),
+                }));
+            }
+            // Measurements agree - click their midpoint rather than either
+            // point alone, which cancels out noise from a single measurement.
+            midpoint(params.x, params.y, cx, cy)
+        }
+        _ => (params.x, params.y),
+    };
+    let (px, py) = (target_x as i32, target_y as i32);
 
     let rgb_image = {
         let session = rdp_session.lock().await;
@@ -321,13 +418,16 @@ pub async fn handle_click_at(
 
         // The point itself must be on the desktop - the detection window can
         // still overlap the desktop even when the point isn't, so the
-        // clamp_to check below would not catch this on its own.
-        if params.x as u32 >= full_width || params.y as u32 >= full_height {
+        // clamp_to check below would not catch this on its own. Checked
+        // against the target (midpoint, if confirmed) - a confirm point
+        // could in principle pull the midpoint off-desktop even if the
+        // primary point alone wouldn't be.
+        if target_x as u32 >= full_width || target_y as u32 >= full_height {
             return Response::error(
                 ErrorCode::InvalidRequest,
                 format!(
                     "Point ({}, {}) lies outside the {}x{} desktop",
-                    params.x, params.y, full_width, full_height
+                    target_x, target_y, full_width, full_height
                 ),
             );
         }
@@ -338,8 +438,8 @@ pub async fn handle_click_at(
         // is inherently about labels near this point, not ones elsewhere on
         // screen.
         let region = Region {
-            x: (params.x as u32).saturating_sub(params.window_width / 2),
-            y: (params.y as u32).saturating_sub(params.window_height / 2),
+            x: (target_x as u32).saturating_sub(params.window_width / 2),
+            y: (target_y as u32).saturating_sub(params.window_height / 2),
             width: params.window_width,
             height: params.window_height,
         };
@@ -348,7 +448,7 @@ pub async fn handle_click_at(
                 ErrorCode::InvalidRequest,
                 format!(
                     "Point ({}, {}) lies outside the {}x{} desktop",
-                    params.x, params.y, full_width, full_height
+                    target_x, target_y, full_width, full_height
                 ),
             );
         };
@@ -393,23 +493,24 @@ pub async fn handle_click_at(
     if !check.nearby.is_empty() {
         info!(
             "ClickAt ({}, {}) refused: {} regions within {}px",
-            params.x, params.y, check.nearby.len(), params.min_gap
+            target_x, target_y, check.nearby.len(), params.min_gap
         );
         return Response::success(ResponseData::ClickAtResult(ClickAtResult {
             clicked: false,
-            x: params.x,
-            y: params.y,
+            x: target_x,
+            y: target_y,
             matched_text: None,
             nearby: check.nearby,
+            divergence: None,
         }));
     }
 
     let mouse_action = if params.double_click {
-        agent_rdp_protocol::MouseRequest::DoubleClick { x: params.x, y: params.y }
+        agent_rdp_protocol::MouseRequest::DoubleClick { x: target_x, y: target_y }
     } else if params.right_click {
-        agent_rdp_protocol::MouseRequest::RightClick { x: params.x, y: params.y }
+        agent_rdp_protocol::MouseRequest::RightClick { x: target_x, y: target_y }
     } else {
-        agent_rdp_protocol::MouseRequest::Click { x: params.x, y: params.y }
+        agent_rdp_protocol::MouseRequest::Click { x: target_x, y: target_y }
     };
 
     let click_response = crate::handlers::mouse::handle(rdp_session, mouse_action).await;
@@ -417,13 +518,14 @@ pub async fn handle_click_at(
         return click_response;
     }
 
-    info!("ClickAt clicked ({}, {})", params.x, params.y);
+    info!("ClickAt clicked ({}, {})", target_x, target_y);
     Response::success(ResponseData::ClickAtResult(ClickAtResult {
         clicked: true,
-        x: params.x,
-        y: params.y,
+        x: target_x,
+        y: target_y,
         matched_text: check.matched_text,
         nearby: Vec::new(),
+        divergence: None,
     }))
 }
 
@@ -628,5 +730,75 @@ mod tests {
         // 50px gap between point (705) and the neighbor at 760.
         assert!(check_click_safety(&boxes, 705, 209, 10).nearby.is_empty());
         assert_eq!(check_click_safety(&boxes, 705, 209, 60).nearby.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_near_keeps_only_matches_close_to_an_anchor() {
+        // "Отменить" appears twice on screen; only the one next to the
+        // "Заказ №001" anchor (right edge at x=100, y-range [200,216])
+        // should survive.
+        let near_anchor = m(130, 200, 0, 0); // gap = 30
+        let far_from_anchor = m(130, 600, 0, 0); // same x-gap, wrong row
+        let anchor = m(0, 200, 100, 16);
+
+        let kept = filter_near(vec![near_anchor.clone(), far_from_anchor], &[anchor], 50);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].y, near_anchor.y);
+    }
+
+    #[test]
+    fn test_filter_near_with_no_anchor_matches_drops_everything() {
+        let candidate = m(120, 200, 80, 16);
+        let anchor = m(900, 900, 10, 10);
+        assert!(filter_near(vec![candidate], &[anchor], 50).is_empty());
+    }
+
+    #[test]
+    fn test_filter_near_union_of_multiple_anchor_occurrences() {
+        // The anchor text itself appears twice (e.g. a repeated column
+        // header) - a candidate near either occurrence should be kept.
+        let near_second_anchor = m(130, 600, 0, 0); // gap = 30 from anchor_2
+        let anchor_1 = m(0, 0, 100, 16);
+        let anchor_2 = m(0, 600, 100, 16);
+
+        let kept = filter_near(vec![near_second_anchor], &[anchor_1, anchor_2], 50);
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn test_filter_near_respects_distance_boundary() {
+        let anchor = m(0, 0, 50, 16); // right edge at x=50, y-range [0,16]
+        // Zero-size points so the distance is exactly `center_x - 50`.
+        let just_inside = m(60, 0, 0, 0); // gap = 10, <= 10: kept
+        let just_outside = m(61, 0, 0, 0); // gap = 11, > 10: dropped
+
+        assert_eq!(filter_near(vec![just_inside], &[anchor.clone()], 10).len(), 1);
+        assert!(filter_near(vec![just_outside], &[anchor], 10).is_empty());
+    }
+
+    #[test]
+    fn test_point_distance_agreeing_measurements() {
+        assert_eq!(point_distance(665, 209, 670, 212), 5);
+        assert_eq!(point_distance(100, 100, 100, 100), 0);
+    }
+
+    #[test]
+    fn test_point_distance_diverging_measurements() {
+        // Two vision calls that landed on different buttons entirely.
+        assert_eq!(point_distance(600, 200, 900, 200), 300);
+    }
+
+    #[test]
+    fn test_point_distance_is_symmetric_and_chebyshev() {
+        // Larger of the two axis deltas, not Euclidean.
+        assert_eq!(point_distance(0, 0, 3, 4), 4);
+        assert_eq!(point_distance(3, 4, 0, 0), 4);
+    }
+
+    #[test]
+    fn test_midpoint_rounds_down() {
+        assert_eq!(midpoint(0, 0, 10, 10), (5, 5));
+        assert_eq!(midpoint(0, 0, 1, 1), (0, 0));
+        assert_eq!(midpoint(665, 209, 671, 213), (668, 211));
     }
 }

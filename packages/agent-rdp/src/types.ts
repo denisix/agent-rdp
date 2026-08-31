@@ -234,6 +234,16 @@ export interface LocateOptions {
    * clicking at all, so an ambiguous match throws rather than guessing.
    */
   index?: number;
+  /**
+   * Constrain matches to those within `nearDistance` px of a line containing
+   * this anchor text (substring match). Useful when the same text appears in
+   * several places (a repeated column header, a label and its tooltip) -
+   * anchor to a nearby, more distinctive label instead. If the anchor itself
+   * isn't found, the result is zero matches, not an error.
+   */
+  near?: string;
+  /** Max distance in pixels from the `near` anchor (default: 150). */
+  nearDistance?: number;
 }
 
 /** Result of `locate()` when `click` is set. */
@@ -260,6 +270,19 @@ export interface ClickAtOptions {
   doubleClick?: boolean;
   /** Right-click instead of left click. */
   rightClick?: boolean;
+  /**
+   * A second, independently measured point for the same target (e.g. a
+   * vision model queried twice). If the two points agree within
+   * `maxDivergence`, their midpoint is clicked instead of the first point
+   * alone; if they diverge, the click is refused rather than picking one
+   * arbitrarily.
+   */
+  confirm?: Point;
+  /**
+   * Max pixel distance between the point and `confirm` before it's treated
+   * as diverging measurements rather than noise (default: 40).
+   */
+  maxDivergence?: number;
 }
 
 // --- Automation convenience types (aliases for backwards compatibility) ---

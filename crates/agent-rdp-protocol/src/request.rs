@@ -43,6 +43,14 @@ pub enum Request {
     /// more than one detected text region.
     ClickAt(ClickAtRequest),
 
+    /// Relaunch the UI Automation agent without a full RDP reconnect.
+    ///
+    /// Requires automation to have been initialized at `connect` (i.e.
+    /// `--enable-win-automation` was passed, even if the agent later died or
+    /// never came up) - the drive it relies on is only mapped at connect
+    /// time and cannot be added afterward.
+    AutomationRestart,
+
     /// Get session info.
     SessionInfo,
 
@@ -410,10 +418,33 @@ pub struct LocateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub wait_ms: Option<u64>,
+
+    /// Constrain matches to those within `near_distance` px of a line
+    /// containing this anchor text (substring match).
+    ///
+    /// The same text often appears in more than one place on screen (a
+    /// column header repeated in several rows, a label that also appears in
+    /// a tooltip); anchoring to a nearby, more distinctive label disambiguates
+    /// without needing `--exact` to already know the one true full string.
+    /// The anchor itself is matched by substring, same as the default `text`
+    /// mode - if it isn't found at all, the result is zero matches (not an
+    /// error), since there is nothing to anchor to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub near: Option<String>,
+
+    /// Maximum distance in pixels from the anchor's bounding box, used only
+    /// when `near` is set.
+    #[serde(default = "default_near_distance")]
+    pub near_distance: u32,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_near_distance() -> u32 {
+    150
 }
 
 /// Click a caller-supplied point, refusing if it's ambiguously close to more
@@ -450,6 +481,27 @@ pub struct ClickAtRequest {
 
     #[serde(default)]
     pub right_click: bool,
+
+    /// A second, independently measured point for the same target - e.g. a
+    /// vision model queried twice, or two different vision calls. Formalizes
+    /// the "two independent measurements, click the intersection" workflow:
+    /// when both points roughly agree, their midpoint is used as the click
+    /// target instead of the first point alone, which cancels out
+    /// measurement noise from either single call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub confirm_x: Option<u16>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub confirm_y: Option<u16>,
+
+    /// Maximum allowed distance in pixels between `(x, y)` and
+    /// `(confirm_x, confirm_y)` before the click is refused as diverging
+    /// measurements rather than noise (default: 40). Ignored unless both
+    /// confirm coordinates are set.
+    #[serde(default = "default_click_at_max_divergence")]
+    pub max_divergence: u32,
 }
 
 fn default_click_at_window_w() -> u32 {
@@ -462,6 +514,10 @@ fn default_click_at_window_h() -> u32 {
 
 fn default_click_at_min_gap() -> u32 {
     10
+}
+
+fn default_click_at_max_divergence() -> u32 {
+    40
 }
 
 #[cfg(test)]

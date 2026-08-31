@@ -6,7 +6,8 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.5.
+Tested against agent-rdp 0.8.0+ (transport keepalive, `automate restart`,
+`locate --near`, `click-at --confirm`).
 
 If `agent-rdp` is not on PATH, install it first — this is expected on a fresh
 machine and needs no confirmation:
@@ -39,20 +40,53 @@ says so explicitly — reconnect to retry rather than polling `automate status`.
 **A DVC timeout does NOT mean the action failed.** `automation indeterminate`
 means the request reached the agent but the reply was lost — it may well have
 been applied. Never blindly retry: check state first, or you double-apply
-(text typed twice, a button clicked twice).
+(text typed twice, a button clicked twice). Exception: read-only commands
+(`snapshot`, `get`, `status`, `wait-for`, `window list`) now say so in the
+error text itself ("This command is read-only - retrying is safe") — those
+are always safe to retry.
 
 ```bash
 agent-rdp automate get "@e2"        # read back before retrying
 ```
 
 **"Channel unresponsive" is usually transient.** It recovers on its own. Re-probe
-with `automate status` before reconnecting; a needless reconnect re-issues all
-refs and, combined with a retry, is what corrupts state.
+with `automate status` before reconnecting — it now reports agent uptime,
+last DVC round-trip time, and consecutive-failure count, so you can judge
+"degraded but working" from "actually dead" instead of guessing. A needless
+reconnect re-issues all refs and, combined with a retry, is what corrupts
+state.
+
+**Agent died or never came up? Try `automate restart` before reconnecting.**
+It relaunches the PowerShell agent without touching the RDP session or
+invalidating refs - a full `disconnect`+`connect` should be the last resort,
+not the first response to `automate status` failing:
+
+```bash
+agent-rdp automate restart
+```
 
 **Verify with `automate get`, not OCR.** `get` now returns `Value:` for text
 controls including multiline editors. OCR (`locate`) misreads confidently —
 it read "Hello World!" as "Hel1o Worldi", so `locate "Hello"` found nothing.
 Use OCR only when UI Automation cannot see the element.
+
+**A screenshot is a cached frame, not a live poll.** The daemon returns the
+last frame the server painted, tagged with `frame_age_ms` (how long since the
+server last sent anything). A dead RDP transport is now detected within
+seconds via TCP keepalive rather than sitting silent for tens of minutes, but
+a large `frame_age_ms` on its own can still just mean "the desktop is
+genuinely idle" — check `agent-rdp session info`'s `last_frame_age_ms` too;
+if it keeps climbing indefinitely rather than resetting on real UI changes,
+distrust the frame and reconnect. Every CLI command also has a hard watchdog
+now (defaults to its own timeout plus a grace window) so a stuck command
+exits with `watchdog_timeout` instead of hanging indefinitely.
+
+**Enter in a 1C list can mean "Create", not "Open".** With no row explicitly
+selected, pressing Enter in a 1C list view often opens a new-document form
+instead of the current row. Before Enter, explicitly select the row
+(`locate --click` on it, or click its coordinates), and after, check the
+opened form's title/header for "(создание)"/"(create)" before proceeding -
+this is 1C's own behavior, not something agent-rdp can prevent.
 
 **Wildcards search the whole desktop, including the taskbar.** `~*Notepad*`
 matches the taskbar button before the window. Get the exact title first:
@@ -157,24 +191,44 @@ agent-rdp locate "Cancel" --click          # click the match directly - no coord
 agent-rdp locate "OK" --wait 10000 --click # block until it appears, then click it
 agent-rdp locate --all --region 100,380,600,30  # verify one row; coords stay full-screen
 
+# Constrain to matches near a distinctive anchor label - the same text often
+# repeats (a column header in every row, a label that also appears in a
+# tooltip). Anchor not found at all -> zero matches, not an error.
+agent-rdp locate "Отменить" --near "Заказ №001" --click
+
 # Safe click of an externally-computed point (vision-model bbox, manual crop):
 # refuses if another detected label is within --min-gap px of the target.
 # Detection-only, so it works even where OCR can't READ the text (AR-003-style
 # Cyrillic custom renderers) and UIA is blind.
 agent-rdp click-at 665 209
 agent-rdp click-at 665 209 --min-gap 20 --double-click
+
+# Cross-check two independent measurements of the same target (e.g. two
+# vision calls): clicks the midpoint if they agree within --max-divergence
+# (default 40px), refuses otherwise. This is the "click the intersection"
+# technique that catches a single call's misreads/hallucinated coordinates.
+agent-rdp click-at 665 209 --confirm 670,212
 ```
 
 Substring matching means a query that is a prefix of a longer button label
 matches both ("Провести" matches "Провести и закрыть" too). `--click` refuses
 to guess between multiple matches, so the worst case is an error, not a wrong
-click - but prefer `--exact` so the ambiguity never arises.
+click - but prefer `--exact` (or `--near` when several genuinely distinct
+matches share a name) so the ambiguity never arises.
 
 Never estimate a coordinate by reading a screenshot image - always `--click`,
 or read the printed coordinate straight from `locate`/`automate get` output.
 If the coordinate must come from a vision model (OCR/UIA both fail), click it
 through `click-at` rather than raw `mouse click` - it adds the ambiguity check
-you'd otherwise have to do by hand.
+you'd otherwise have to do by hand, and `--confirm` adds the two-measurement
+cross-check on top of that.
+
+**When OCR recognition mangles the text itself** (e.g. Cyrillic read as
+"OTM?H?T? ?????????"), don't give up on OCR entirely - `locate --all` still
+returns every detected line's *position*, even when the recognized text is
+garbage. Dump it, filter for the digits/Latin substrings that usually survive
+intact (order numbers, codes), and use their positions to reason about the
+layout geometrically instead of by text content.
 
 ## UI Automation (`--enable-win-automation`)
 
@@ -201,7 +255,8 @@ agent-rdp automate window list
 agent-rdp automate window focus "~*Notepad*"
 agent-rdp automate window maximize|minimize|restore|close
 agent-rdp automate wait-for <selector> --timeout 5000 --state visible
-agent-rdp automate status
+agent-rdp automate status                    # includes uptime, last RTT, consecutive-failure count
+agent-rdp automate restart                   # relaunch the agent without a full RDP reconnect
 ```
 
 Run commands/apps (preferred way to open apps):

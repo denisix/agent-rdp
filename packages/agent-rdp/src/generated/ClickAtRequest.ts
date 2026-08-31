@@ -25,4 +25,20 @@ window_height: number,
  * detected region's boundary, below which the click is refused as
  * ambiguous (default: 10).
  */
-min_gap: number, double_click: boolean, right_click: boolean, };
+min_gap: number, double_click: boolean, right_click: boolean, 
+/**
+ * A second, independently measured point for the same target - e.g. a
+ * vision model queried twice, or two different vision calls. Formalizes
+ * the "two independent measurements, click the intersection" workflow:
+ * when both points roughly agree, their midpoint is used as the click
+ * target instead of the first point alone, which cancels out
+ * measurement noise from either single call.
+ */
+confirm_x?: number, confirm_y?: number, 
+/**
+ * Maximum allowed distance in pixels between `(x, y)` and
+ * `(confirm_x, confirm_y)` before the click is refused as diverging
+ * measurements rather than noise (default: 40). Ignored unless both
+ * confirm coordinates are set.
+ */
+max_divergence: number, };
