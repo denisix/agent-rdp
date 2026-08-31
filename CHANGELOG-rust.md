@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.6](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.5...agent-rdp-rust-v0.7.6) (2026-08-31)
+
+
+### Features
+
+* add SDK parity for locate click/wait, automation.focused, and keyboard paste/down/up ([369ac2a](https://github.com/denisix/agent-rdp/commit/369ac2a83ef184335b459a35a33da69a56175a9c))
+* click OCR matches directly, block on text with locate --wait, and paste for reliable text entry ([4c54730](https://github.com/denisix/agent-rdp/commit/4c547307f6f539e15ce740e2574b8dde8b8144e2))
+
 ## [0.7.5](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.4...agent-rdp-rust-v0.7.5) (2026-08-15)
 
 

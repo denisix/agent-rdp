@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.6](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.5...agent-rdp-v0.7.6) (2026-08-31)
+
+
+### Features
+
+* add SDK parity for locate click/wait, automation.focused, and keyboard paste/down/up ([369ac2a](https://github.com/denisix/agent-rdp/commit/369ac2a83ef184335b459a35a33da69a56175a9c))
+
 ## [0.7.5](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.4...agent-rdp-v0.7.5) (2026-08-15)
 
 
