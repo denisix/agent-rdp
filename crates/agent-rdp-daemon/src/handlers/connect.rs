@@ -53,19 +53,45 @@ pub async fn handle(
     // IMPORTANT: Create the automation directory BEFORE registering the drive,
     // otherwise Windows will get "invalid address" errors trying to access it
     let mut drives = params.drives.clone();
+    // Tracks whether `initialize()` actually succeeded, independent of
+    // `enable_automation` - the launch loop further down must not run
+    // against a drive/DVC state that was never created. Without this gate it
+    // used to burn 3 blind Win+R/paste/Enter attempts on the remote desktop
+    // referencing a `\\TSCLIENT\<drive>` path that was never mapped, then
+    // fail with the same generic "automation not enabled" message a session
+    // that never requested automation at all would get.
+    let mut automation_init_error: Option<String> = None;
     if enable_automation {
         let session_dir = crate::get_session_dir("");
         let bootstrap = AutomationBootstrap::new(session_dir);
 
-        // Initialize automation directory structure first
-        {
+        // Initialize automation directory structure first. Retry once on
+        // failure - a `cleanup()` from the previous session's `remove_dir_all`
+        // (bootstrap.rs) not having fully settled is exactly the kind of
+        // transient local-fs condition a short retry absorbs, instead of
+        // forcing the caller through an entire extra reconnect to recover.
+        let mut init_result = {
             let mut auto_state = automation_state.lock().await;
-            if let Err(e) = bootstrap.initialize(&mut auto_state).await {
-                warn!("Failed to initialize automation directory: {}", e);
-                // Don't add the drive if we can't create the directory
-            } else {
-                // Only add drive if directory was created successfully
+            bootstrap.initialize(&mut auto_state).await
+        };
+        if let Err(ref e) = init_result {
+            warn!("Failed to initialize automation directory (attempt 1/2): {}", e);
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            init_result = {
+                let mut auto_state = automation_state.lock().await;
+                bootstrap.initialize(&mut auto_state).await
+            };
+        }
+
+        match init_result {
+            Ok(()) => {
+                // Only add the drive if the directory was actually created.
+                let auto_state = automation_state.lock().await;
                 drives.push(bootstrap.get_drive_mapping(&auto_state));
+            }
+            Err(e) => {
+                warn!("Failed to initialize automation directory (attempt 2/2): {}", e);
+                automation_init_error = Some(format!("Failed to initialize automation: {}", e));
             }
         }
     }
@@ -175,70 +201,85 @@ pub async fn handle(
 
     // Bootstrap automation if enabled (directory was already created before connection)
     let mut automation_ready = None;
+    let mut automation_error = automation_init_error;
     if enable_automation {
-        info!("Bootstrapping Windows UI Automation...");
+        if automation_error.is_some() {
+            // `initialize()` never produced a `dvc_ipc`, so there is nothing
+            // for `launch_agent`/`wait_for_agent` to do but fail - launching
+            // anyway would still open the remote Run dialog and paste a
+            // command referencing a drive that was never mapped, three times,
+            // for no benefit. Report the real reason immediately instead.
+            automation_ready = Some(false);
+        } else {
+            info!("Bootstrapping Windows UI Automation...");
 
-        let session_dir = crate::get_session_dir("");
-        let bootstrap = AutomationBootstrap::new(session_dir);
+            let session_dir = crate::get_session_dir("");
+            let bootstrap = AutomationBootstrap::new(session_dir);
 
-        // Launch, then wait for the handshake - retrying the launch itself if
-        // it doesn't take.
-        //
-        // The launch drives the remote desktop's Run dialog, so it silently
-        // does nothing if the desktop isn't ready to accept input yet (a
-        // freshly connected session, a foreground app still taking focus). The
-        // symptom is a launch that reports success followed by a handshake
-        // timeout. Waiting longer up front would slow every connect, so retry
-        // instead and let the common case stay fast.
-        const LAUNCH_ATTEMPTS: usize = 3;
-        let mut ready = false;
+            // Launch, then wait for the handshake - retrying the launch itself
+            // if it doesn't take.
+            //
+            // The launch drives the remote desktop's Run dialog, so it silently
+            // does nothing if the desktop isn't ready to accept input yet (a
+            // freshly connected session, a foreground app still taking focus).
+            // The symptom is a launch that reports success followed by a
+            // handshake timeout. Waiting longer up front would slow every
+            // connect, so retry instead and let the common case stay fast.
+            const LAUNCH_ATTEMPTS: usize = 3;
+            let mut ready = false;
+            let mut last_reason = String::new();
 
-        for attempt in 1..=LAUNCH_ATTEMPTS {
-            let launched = {
-                let session = rdp_session.lock().await;
-                match session.as_ref() {
-                    Some(rdp) => {
-                        let auto_state = automation_state.lock().await;
-                        match bootstrap.launch_agent(rdp, &auto_state).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                warn!("Failed to launch automation agent: {}", e);
-                                false
+            for attempt in 1..=LAUNCH_ATTEMPTS {
+                let launched = {
+                    let session = rdp_session.lock().await;
+                    match session.as_ref() {
+                        Some(rdp) => {
+                            let auto_state = automation_state.lock().await;
+                            match bootstrap.launch_agent(rdp, &auto_state).await {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    warn!("Failed to launch automation agent: {}", e);
+                                    last_reason = format!("Failed to launch automation agent: {}", e);
+                                    false
+                                }
                             }
                         }
+                        None => false,
                     }
-                    None => false,
-                }
-            };
+                };
 
-            if launched {
-                let mut auto_state = automation_state.lock().await;
-                match bootstrap.wait_for_agent(&mut auto_state, 10).await {
-                    Ok(()) => {
-                        ready = true;
-                        break;
+                if launched {
+                    let mut auto_state = automation_state.lock().await;
+                    match bootstrap.wait_for_agent(&mut auto_state, 10).await {
+                        Ok(()) => {
+                            ready = true;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Automation agent handshake failed (attempt {}/{}): {}",
+                                attempt, LAUNCH_ATTEMPTS, e
+                            );
+                            last_reason = format!("Automation agent handshake failed: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            "Automation agent handshake failed (attempt {}/{}): {}",
-                            attempt, LAUNCH_ATTEMPTS, e
-                        );
-                    }
+                }
+
+                if attempt < LAUNCH_ATTEMPTS {
+                    info!("Retrying automation agent launch...");
                 }
             }
 
-            if attempt < LAUNCH_ATTEMPTS {
-                info!("Retrying automation agent launch...");
+            if !ready {
+                // RDP itself is fine, so don't fail the connect - but do report
+                // it, otherwise the caller sees a clean "Connected" and only
+                // discovers the problem later as an unexplained "agent not
+                // ready".
+                warn!("Automation agent did not come up after {} attempts", LAUNCH_ATTEMPTS);
+                automation_error = Some(last_reason);
             }
+            automation_ready = Some(ready);
         }
-
-        if !ready {
-            // RDP itself is fine, so don't fail the connect - but do report it,
-            // otherwise the caller sees a clean "Connected" and only discovers
-            // the problem later as an unexplained "agent not ready".
-            warn!("Automation agent did not come up after {} attempts", LAUNCH_ATTEMPTS);
-        }
-        automation_ready = Some(ready);
     }
 
     Response::success(ResponseData::Connected {
@@ -246,6 +287,7 @@ pub async fn handle(
         width,
         height,
         automation_ready,
+        automation_error,
     })
 }
 

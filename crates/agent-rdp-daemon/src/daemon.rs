@@ -7,7 +7,7 @@ use agent_rdp_protocol::{Request, Response, ResponseData, SessionInfo, Connectio
 use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, error, info, warn};
 
-use crate::automation::{new_shared_state, SharedAutomationState};
+use crate::automation::{new_shared_state, AutomationBootstrap, SharedAutomationState};
 use crate::handlers;
 use crate::ipc_server::IpcServer;
 use crate::rdp_session::RdpSession;
@@ -189,6 +189,21 @@ impl Daemon {
                     // The stream belongs to the dead session - stop it too.
                     *self.ws_handle.lock().await = None;
                     *self.clipboard_changed_rx.lock().await = None;
+
+                    // Automation belongs to the dead session too. Without this,
+                    // a mid-session transport drop left `enabled=true` and
+                    // `dvc_ipc=Some(<dead ipc>)` stale - `automate` calls would
+                    // hang or fail against a channel that no longer has a
+                    // remote end, and the state only got cleared by the next
+                    // `connect`'s own pre-cleanup, not by the drop itself.
+                    // `cleanup()` is a no-op when automation was never
+                    // enabled, so this is safe to call unconditionally.
+                    {
+                        let mut auto_state = self.automation_state.lock().await;
+                        let session_dir = crate::get_session_dir("");
+                        let bootstrap = AutomationBootstrap::new(session_dir);
+                        let _ = bootstrap.cleanup(&mut auto_state).await;
+                    }
                 }
 
                 // Handle shutdown signal from client
@@ -438,6 +453,10 @@ async fn process_request(
 
         Request::Locate(params) => {
             handlers::locate::handle(rdp_session, params).await
+        }
+
+        Request::ClickAt(params) => {
+            handlers::locate::handle_click_at(rdp_session, params).await
         }
     }
 }

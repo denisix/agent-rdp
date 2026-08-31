@@ -83,6 +83,14 @@ pub enum ResponseData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         automation_ready: Option<bool>,
+        /// Why the automation agent failed to come up, when `automation_ready`
+        /// is `Some(false)`. Distinguishes "the automation directory
+        /// couldn't be created" from "the agent launched but the handshake
+        /// timed out" - both used to collapse into the same generic
+        /// "automation not enabled" message on the next `automate` call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        automation_error: Option<String>,
     },
 
     /// Screenshot data.
@@ -158,6 +166,9 @@ pub enum ResponseData {
 
     /// OCR locate result.
     LocateResult(LocateResult),
+
+    /// Result of a `ClickAt` request.
+    ClickAtResult(ClickAtResult),
 }
 
 /// Session information.
@@ -240,6 +251,28 @@ pub struct LocateResult {
     pub matches: Vec<OcrMatch>,
     /// Total words detected on screen.
     pub total_words: u32,
+}
+
+/// Result of a `ClickAt` request.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct ClickAtResult {
+    /// Whether the click was actually sent.
+    pub clicked: bool,
+    pub x: u16,
+    pub y: u16,
+    /// Text OCR recognized in the region containing the point, if any.
+    /// Best-effort - may be inaccurate or absent for scripts OCR recognition
+    /// struggles with; the safety check itself only relies on detection
+    /// (bounding boxes), not on this being correct.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub matched_text: Option<String>,
+    /// Other detected regions within the configured gap of the point.
+    /// Populated (with `clicked: false`) when the click was refused as
+    /// ambiguous.
+    #[serde(default)]
+    pub nearby: Vec<OcrMatch>,
 }
 
 /// A text region found by OCR.
@@ -364,6 +397,7 @@ mod tests {
     fn test_success_response() {
         let resp = Response::success(ResponseData::Connected {
             automation_ready: None,
+            automation_error: None,
             host: "192.168.1.100".to_string(),
             width: 1920,
             height: 1080,

@@ -21,6 +21,32 @@ impl Output {
     /// Print a response.
     pub fn print_response(&self, response: &Response) {
         if self.json {
+            // `Connected { automation_ready: Some(false), .. }` still has
+            // `success: true` (RDP itself connected - only automation
+            // failed), so a JSON caller checking only `success` or skimming
+            // `data` for a familiar field sees a clean success. Splice in an
+            // explicit `warning` key so the failure can't be missed without
+            // specifically knowing to check `automation_ready`.
+            if let Some(agent_rdp_protocol::ResponseData::Connected {
+                automation_ready: Some(false),
+                automation_error,
+                ..
+            }) = &response.data
+            {
+                let mut value = serde_json::to_value(response).unwrap();
+                let warning = match automation_error {
+                    Some(reason) => format!(
+                        "The UI Automation agent did not start: {}. Reconnect to retry.",
+                        reason
+                    ),
+                    None => "The UI Automation agent did not start. Reconnect to retry.".to_string(),
+                };
+                if let Some(data) = value.get_mut("data") {
+                    data["warning"] = serde_json::Value::String(warning);
+                }
+                println!("{}", value);
+                return;
+            }
             println!("{}", serde_json::to_string(response).unwrap());
         } else if response.success {
             if let Some(ref data) = response.data {
@@ -46,14 +72,21 @@ impl Output {
             ResponseData::Ok => {
                 println!("OK");
             }
-            ResponseData::Connected { host, width, height, automation_ready } => {
+            ResponseData::Connected { host, width, height, automation_ready, automation_error } => {
                 println!("Connected to {} ({}x{})", host, width, height);
                 if *automation_ready == Some(false) {
-                    eprintln!(
-                        "Warning: the UI Automation agent did not start, so `automate` \
-                         commands will not work. Reconnect to retry; see the session's \
-                         daemon.log for why."
-                    );
+                    match automation_error {
+                        Some(reason) => eprintln!(
+                            "Warning: the UI Automation agent did not start: {}. Reconnect to \
+                             retry; see the session's daemon.log for details.",
+                            reason
+                        ),
+                        None => eprintln!(
+                            "Warning: the UI Automation agent did not start, so `automate` \
+                             commands will not work. Reconnect to retry; see the session's \
+                             daemon.log for why."
+                        ),
+                    }
                 }
             }
             ResponseData::Screenshot { width, height, format, .. } => {
@@ -194,6 +227,20 @@ impl Output {
                         println!("  '{}' at ({}, {}) size {}x{} - center: ({}, {})",
                             m.text, m.x, m.y, m.width, m.height, m.center_x, m.center_y);
                     }
+                }
+            }
+            ResponseData::ClickAtResult(result) => {
+                // The click-at command renders this itself with more context;
+                // this arm only fires for callers reaching it another way.
+                if result.clicked {
+                    println!("Clicked at ({}, {})", result.x, result.y);
+                } else {
+                    println!(
+                        "Click refused: {} text regions near ({}, {})",
+                        result.nearby.len(),
+                        result.x,
+                        result.y
+                    );
                 }
             }
             ResponseData::ClickResult(result) => {
