@@ -75,7 +75,8 @@ network (a round-trip incl. a full screenshot is ~85ms). So:
 - **Make fewer tool calls.** Batch independent commands into one shell
   invocation with `;` — five commands in one call costs one round-trip, not five.
 - **Block server-side.** `automate wait-for <sel> --timeout 15000` returns the
-  moment the condition holds. Never poll `screenshot` in a loop.
+  moment the condition holds; `locate "text" --wait 15000` does the same via
+  OCR when UIA can't see the element. Never poll `screenshot` in a loop.
 - **Reuse refs.** They stay stable while the window is unchanged; re-snapshot
   only after the UI actually changes. They are NOT stable across reconnects.
 - **Use the Node API for long sequences** — it pays process startup once.
@@ -84,9 +85,11 @@ network (a round-trip incl. a full screenshot is ~85ms). So:
 - `automate run --wait` beats `run` + repeated `run-poll` unless the command is
   genuinely long-running.
 
-`keyboard type` is batched and fast (dozens of characters in one round-trip),
-so it no longer needs a clipboard workaround. If a remote app drops fast input,
-pace it with `--delay 20` rather than falling back to clipboard.
+`keyboard type` is batched and fast (dozens of characters in one round-trip).
+If a remote app drops fast input, pace it with `--delay 20`. For long or
+non-Latin text, prefer `keyboard paste "text"` instead: it sets the clipboard
+and pastes as one daemon-side command, so it cannot lose individual
+keystrokes and there is no focus-moving gap between two separate calls.
 
 ## Core workflow
 
@@ -112,7 +115,8 @@ agent-rdp --session work screenshot
 
 # Screenshot
 agent-rdp screenshot -o desktop.png        # PNG, default ./screenshot.png
-agent-rdp screenshot --format jpeg         # JPEG fails if the frame has alpha; prefer PNG
+agent-rdp screenshot --format jpeg         # smaller; PNG is lossless if exact pixels matter
+agent-rdp screenshot --region 100,380,600,30 -o row.png  # crop; reports the offset back
 
 # Mouse
 agent-rdp mouse click 500 300
@@ -124,16 +128,19 @@ agent-rdp mouse drag 100 100 500 500
 # Keyboard
 agent-rdp keyboard type "Hello World"      # Unicode-safe, batched into one round-trip
 agent-rdp keyboard type "text" --delay 20  # pace it only if the remote app drops fast input
+agent-rdp keyboard paste "Привет, мир!"    # clipboard + Ctrl+V as one command; most reliable for long/non-Latin text
 agent-rdp keyboard press "ctrl+c"          # use "press", not "key"
 agent-rdp keyboard press "win+r"
 agent-rdp keyboard press enter
+agent-rdp keyboard down shift              # hold, do something else, then release
+agent-rdp keyboard up shift
 
-# Scroll (amount is positional, not --amount)
+# Scroll (amount is positional, not --amount). Default point is the SCREEN
+# CENTER, not whatever pane you're working in - use --at to target one.
 agent-rdp scroll up 3
 agent-rdp scroll down 5 --at 600 400
 
 # Clipboard (first use can block during remote channel init; wrap in a timeout)
-# Note: no longer needed as a fast path for bulk text - `keyboard type` is batched
 agent-rdp clipboard set "text"
 agent-rdp clipboard get
 
@@ -145,9 +152,13 @@ agent-rdp drive list                       # remote path: \\tsclient\Share
 agent-rdp locate "Cancel"                  # substring match, returns coords
 agent-rdp locate "Save*" --pattern         # glob match
 agent-rdp locate --all                     # all text on screen
+agent-rdp locate "Cancel" --click          # click the match directly - no coordinate hand-off
+agent-rdp locate "OK" --wait 10000 --click # block until it appears, then click it
+agent-rdp locate --all --region 100,380,600,30  # verify one row; coords stay full-screen
 ```
 
-`locate` output: `'Cancel' at (650, 420) size 45x14 - center: (672, 427)` → click with `agent-rdp mouse click 672 427`.
+Never estimate a coordinate by reading a screenshot image - always `--click`,
+or read the printed coordinate straight from `locate`/`automate get` output.
 
 ## UI Automation (`--enable-win-automation`)
 
@@ -166,6 +177,7 @@ agent-rdp automate collapse "@e3"
 agent-rdp automate context-menu "@e5"
 agent-rdp automate focus <selector>
 agent-rdp automate get <selector>            # includes Value: for text/multiline edits
+agent-rdp automate focused                   # what has keyboard focus right now - verify a Tab landed correctly
 agent-rdp automate fill <selector> "text"
 agent-rdp automate clear <selector>
 agent-rdp automate scroll <selector> --direction down --amount 3

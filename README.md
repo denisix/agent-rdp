@@ -170,9 +170,50 @@ agent-rdp screenshot --output desktop.png
 
 # JSON metadata (path/width/height — image is always written to disk)
 agent-rdp --json screenshot --output desktop.png
+
+# Capture just part of the screen (X,Y,WIDTH,HEIGHT in screen pixels).
+# The result reports the offset, so a coordinate read off the crop can be
+# turned back into a clickable one.
+agent-rdp screenshot --region 100,380,600,30 --output row.png
 ```
 
 > Note: the CLI no longer has `screenshot --base64`. For agent pipelines, write a file and encode it yourself, or use the Node.js API's `rdp.screenshot({ path })`, which writes to disk and returns `{ path, width, height }` without materializing base64 — prefer this over the default `rdp.screenshot()` (which returns `{ base64, width, height }`) when the caller doesn't need the raw bytes, since echoing a base64 image into an LLM context is expensive.
+
+### Getting Coordinates Right
+
+**Never estimate a coordinate by looking at a screenshot.** Screenshot pixels,
+OCR boxes and click coordinates are all the same space, so a coordinate that
+comes out of the tool is exact — but one guessed from an image is not. Images
+get downscaled on their way into a vision model, and a click that is 30px off
+lands on the wrong row, the wrong cell, or a search box.
+
+Ask for the target by name and let the tool find it:
+
+```bash
+# Click text, without a coordinate ever passing through your hands
+agent-rdp locate "Добавить" --click
+
+# Several matches? Choosing is explicit - it will not guess for you
+agent-rdp locate "Добавить" --click --index 1
+
+# Click a button by accessibility selector (preferred when UIA can see it)
+agent-rdp automate click "#SaveButton"
+```
+
+To verify a value in place, read the region rather than cropping an image
+yourself — coordinates still come back in full-screen space:
+
+```bash
+# Check one table row
+agent-rdp locate --all --region 100,380,600,30
+agent-rdp screenshot --region 100,380,600,30 -o row.png
+
+# Confirm which field the keyboard is actually in before typing
+agent-rdp automate focused
+```
+
+`agent-rdp mouse click X Y` remains available for coordinates you got from
+`locate`, `automate get`, or a deliberate calculation.
 
 ### Mouse Operations
 
@@ -199,6 +240,12 @@ agent-rdp mouse drag 100 100 500 500
 # Type text (supports Unicode)
 agent-rdp keyboard type "Hello, World!"
 
+# Paste instead of type for long or non-Latin text: clipboard + Ctrl+V as one
+# command. More reliable than `type` - it cannot lose individual keystrokes,
+# and there's no gap between setting the clipboard and pasting for focus to
+# move in.
+agent-rdp keyboard paste "Привет, мир! A very long string types can drop pieces of."
+
 # Press key combinations
 agent-rdp keyboard press "ctrl+c"
 agent-rdp keyboard press "alt+tab"
@@ -208,15 +255,24 @@ agent-rdp keyboard press "ctrl+shift+esc"
 agent-rdp keyboard press enter
 agent-rdp keyboard press escape
 agent-rdp keyboard press f5
+
+# Hold a key across other commands (shift-click, hold-and-drag, ...)
+agent-rdp keyboard down shift
+agent-rdp mouse click 200 300
+agent-rdp keyboard up shift
 ```
 
 ### Scroll
+
+Position defaults to the **screen center**, not whatever pane you're working
+in — pass `--at` to target a specific window or control.
 
 ```bash
 agent-rdp scroll up --amount 3
 agent-rdp scroll down --amount 5
 agent-rdp scroll left
 agent-rdp scroll right
+agent-rdp scroll down --amount 5 --at 600 400
 ```
 
 ### Locate (OCR)
@@ -235,6 +291,20 @@ agent-rdp locate --all
 
 # JSON output
 agent-rdp locate "OK" --json
+
+# Click the match directly (see "Getting Coordinates Right" above)
+agent-rdp locate "Cancel" --click
+agent-rdp locate "Cancel" --double-click
+agent-rdp locate "Cancel" --right-click
+
+# Search only part of the screen. Results stay in full-screen coordinates,
+# so --region composes with --click. A tight region also reads small text
+# more reliably than a full-screen pass.
+agent-rdp locate --all --region 100,380,600,30
+
+# Block until text appears (e.g. a dialog finishing its animation), instead
+# of polling `locate` in a loop from the outside. Composes with --click.
+agent-rdp locate "OK" --wait 10000 --click
 ```
 
 Returns text lines with coordinates for clicking:
@@ -242,8 +312,12 @@ Returns text lines with coordinates for clicking:
 Found 1 line(s) containing 'Cancel':
   'Cancel Button' at (650, 420) size 80x14 - center: (690, 427)
 
-To click the first match: agent-rdp mouse click 690 427
+To click it: agent-rdp locate 'Cancel' --click
 ```
+
+Clicking is deliberately strict: no match, or several matches without
+`--index`, is an error rather than a guess. Prefer narrowing with `--region`
+over picking an index.
 
 ### Clipboard
 
@@ -293,6 +367,12 @@ agent-rdp automate snapshot -c              # Compact (remove empty structural e
 agent-rdp automate snapshot -d 3            # Limit depth to 3 levels
 agent-rdp automate snapshot -s "~*Notepad*" # Scope to a window/element
 agent-rdp automate snapshot -i -c -d 5      # Combine options
+
+# Which control has keyboard focus right now?
+# Use this after Tab/Enter to confirm where your keystrokes will go, instead
+# of typing into a cell you assume is focused.
+agent-rdp automate focused
+# edit 'Количество' = "5,000" at (110, 391) 80x18 [focusable]
 
 # Pattern-based element operations (refs use @eN format)
 agent-rdp automate click "#SaveButton"     # Click button
@@ -456,8 +536,11 @@ await rdp.mouse.drag({ from: { x: 100, y: 100 }, to: { x: 500, y: 500 } });
 
 // Keyboard
 await rdp.keyboard.type({ text: 'Hello World' });
+await rdp.keyboard.paste('Привет, мир!');     // Reliable for long/non-Latin text
 await rdp.keyboard.press({ keys: 'ctrl+c' });
 await rdp.keyboard.press({ keys: 'enter' });  // Single keys use press()
+await rdp.keyboard.down('shift');             // Hold across other commands
+await rdp.keyboard.up('shift');
 
 // Scroll
 await rdp.scroll.up();                    // Default amount: 3
@@ -477,8 +560,15 @@ if (matches.length > 0) {
 // Get all text on screen
 const allText = await rdp.locate({ all: true });
 
+// Click a match directly - the coordinate never leaves the process
+await rdp.locate({ text: 'Cancel', click: 'left' });
+
+// Block until text appears, instead of polling in a loop
+await rdp.locate({ text: 'OK', waitMs: 10000, click: 'left' });
+
 // Automation (requires --enable-win-automation at connect)
 const snapshot = await rdp.automation.snapshot({ interactive: true });
+const focused = await rdp.automation.focused();  // What has keyboard focus right now
 await rdp.automation.click('@e5');           // Click button by ref
 await rdp.automation.click('@e5', { doubleClick: true }); // Double-click
 await rdp.automation.select('@e10');         // Select item
