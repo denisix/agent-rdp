@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.7](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.6...agent-rdp-v0.7.7) (2026-08-31)
+
+
+### Features
+
+* add locate --exact and a click-at safety-net command ([f8962a0](https://github.com/denisix/agent-rdp/commit/f8962a04624cf7edbb4754584ded4e4174ab9d28))
+
 ## [0.7.6](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.5...agent-rdp-v0.7.6) (2026-08-31)
 
 
