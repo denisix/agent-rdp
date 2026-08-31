@@ -43,6 +43,11 @@ pub struct DvcIpc {
     timeout: Duration,
     /// Count of consecutive failures (for detecting dead channel).
     consecutive_failures: Arc<std::sync::atomic::AtomicU32>,
+    /// Round-trip time of the most recent successful request, in
+    /// milliseconds. `u64::MAX` means "no successful request yet" - lets
+    /// `automate status` distinguish a fresh session from a genuinely fast
+    /// (0ms) round trip.
+    last_rtt_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DvcIpc {
@@ -52,6 +57,7 @@ impl DvcIpc {
             state,
             timeout: Duration::from_secs(10),
             consecutive_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            last_rtt_ms: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         }
     }
 
@@ -64,6 +70,15 @@ impl DvcIpc {
     pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Round-trip time of the most recent successful request, if any request
+    /// has succeeded yet.
+    pub fn last_rtt_ms(&self) -> Option<u64> {
+        match self.last_rtt_ms.load(std::sync::atomic::Ordering::Relaxed) {
+            u64::MAX => None,
+            ms => Some(ms),
+        }
     }
 
     /// Reset the failure counter.
@@ -95,6 +110,12 @@ impl DvcIpc {
     pub fn agent_pid(&self) -> Option<u32> {
         let state = self.state.lock();
         state.handshake.as_ref().map(|h| h.agent_pid)
+    }
+
+    /// Seconds since the current agent's handshake was received.
+    pub fn agent_uptime_secs(&self) -> Option<u64> {
+        let state = self.state.lock();
+        state.handshake_at.map(|at| at.elapsed().as_secs())
     }
 
     /// Get the agent capabilities from the handshake.
@@ -160,11 +181,16 @@ impl DvcIpc {
         };
 
         debug!("Sent DVC request on channel {}", channel_id);
+        let sent_at = std::time::Instant::now();
 
         // Wait for response with timeout
         let response = match timeout(self.timeout, rx).await {
             Ok(Ok(response)) => {
                 self.reset_failures();
+                self.last_rtt_ms.store(
+                    sent_at.elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 response
             }
             Ok(Err(_)) => {

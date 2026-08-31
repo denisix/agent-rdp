@@ -375,6 +375,26 @@ pub struct AutomationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub version: Option<String>,
+    /// Seconds since the current agent's DVC handshake completed. Distinct
+    /// from `agent_running`: an agent can be "running" per the PS-reported
+    /// fields yet the daemon-side DVC channel could have gone stale without
+    /// a full status round-trip being able to tell - uptime combined with
+    /// `last_rtt_ms` is what actually answers "is this still responsive".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub uptime_secs: Option<u64>,
+    /// Round-trip time of the most recent successful DVC request, in
+    /// milliseconds. `None` if no request has succeeded yet this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub last_rtt_ms: Option<u64>,
+    /// Count of consecutive requests that got no reply. Non-zero without the
+    /// channel being reported dead means it is degraded, not yet unresponsive
+    /// - a signal for deciding whether reconnecting is warranted (refs
+    /// invalidate on reconnect, so this should inform that decision rather
+    /// than triggering an automatic one).
+    #[serde(default)]
+    pub consecutive_failures: u32,
 }
 
 /// Command run result.

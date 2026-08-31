@@ -19,4 +19,25 @@ capabilities: Array<string>,
 /**
  * Agent version.
  */
-version?: string, };
+version?: string, 
+/**
+ * Seconds since the current agent's DVC handshake completed. Distinct
+ * from `agent_running`: an agent can be "running" per the PS-reported
+ * fields yet the daemon-side DVC channel could have gone stale without
+ * a full status round-trip being able to tell - uptime combined with
+ * `last_rtt_ms` is what actually answers "is this still responsive".
+ */
+uptime_secs?: number, 
+/**
+ * Round-trip time of the most recent successful DVC request, in
+ * milliseconds. `None` if no request has succeeded yet this session.
+ */
+last_rtt_ms?: number, 
+/**
+ * Count of consecutive requests that got no reply. Non-zero without the
+ * channel being reported dead means it is degraded, not yet unresponsive
+ * - a signal for deciding whether reconnecting is warranted (refs
+ * invalidate on reconnect, so this should inform that decision rather
+ * than triggering an automatic one).
+ */
+consecutive_failures: number, };

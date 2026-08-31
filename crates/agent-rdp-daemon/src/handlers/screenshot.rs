@@ -19,7 +19,7 @@ pub async fn handle(
     // everything past this point (encode, base64) used to run with the lock
     // still held, blocking every mouse/keyboard/frame-decode operation on the
     // daemon for the length of a PNG deflate.
-    let (img_width, img_height, data, offset_x, offset_y) = {
+    let (img_width, img_height, data, offset_x, offset_y, frame_age_ms) = {
         let session = rdp_session.lock().await;
         let rdp = match session.as_ref() {
             Some(rdp) => rdp,
@@ -28,7 +28,9 @@ pub async fn handle(
             }
         };
 
-        match params.region {
+        let frame_age_ms = rdp.last_frame_age().as_millis() as u64;
+
+        let (w, h, data, off_x, off_y) = match params.region {
             None => {
                 // The background frame processor keeps this up-to-date.
                 let (w, h, data) = rdp.get_image_data();
@@ -57,7 +59,8 @@ pub async fn handle(
                 };
                 (clamped.width, clamped.height, data, Some(clamped.x), Some(clamped.y))
             }
-        }
+        };
+        (w, h, data, off_x, off_y, frame_age_ms)
     };
 
     let rgba_image = match image::RgbaImage::from_raw(img_width, img_height, data) {
@@ -106,5 +109,6 @@ pub async fn handle(
         base64: base64_data,
         offset_x,
         offset_y,
+        frame_age_ms,
     })
 }

@@ -71,7 +71,16 @@ offset_x?: number,
 /**
  * Y offset of the image within the full desktop (region captures only).
  */
-offset_y?: number, } | { "type": "clipboard", 
+offset_y?: number, 
+/**
+ * Milliseconds since the last PDU was successfully read from the
+ * RDP server. A stuck-but-undetected connection previously kept
+ * returning the same cached frame forever with no way to tell -
+ * a large, growing value here (especially combined with an
+ * unchanged image) is the signal that the transport may be dead
+ * rather than the desktop just being idle.
+ */
+frame_age_ms: number, } | { "type": "clipboard", 
 /**
  * Text content.
  */

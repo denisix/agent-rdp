@@ -388,15 +388,16 @@ async fn process_request(
 
         Request::SessionInfo => {
             let session = rdp_session.lock().await;
-            let (state, host, width, height) = if let Some(ref rdp) = *session {
+            let (state, host, width, height, last_frame_age_ms) = if let Some(ref rdp) = *session {
                 (
                     ConnectionState::Connected,
                     Some(rdp.host().to_string()),
                     Some(rdp.width()),
                     Some(rdp.height()),
+                    Some(rdp.last_frame_age().as_millis() as u64),
                 )
             } else {
-                (ConnectionState::Disconnected, None, None, None)
+                (ConnectionState::Disconnected, None, None, None, None)
             };
 
             Response::success(ResponseData::SessionInfo(SessionInfo {
@@ -407,6 +408,7 @@ async fn process_request(
                 height,
                 pid: std::process::id(),
                 uptime_secs: start_time.elapsed().as_secs(),
+                last_frame_age_ms,
             }))
         }
 
@@ -457,6 +459,10 @@ async fn process_request(
 
         Request::ClickAt(params) => {
             handlers::locate::handle_click_at(rdp_session, params).await
+        }
+
+        Request::AutomationRestart => {
+            handlers::automate::handle_restart(rdp_session, automation_state).await
         }
     }
 }

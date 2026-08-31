@@ -226,8 +226,8 @@ fn lookup(key: &str) -> Option<(u8, bool)> {
         "right" | "arrowright" => (0x4D, true),
 
         // Other navigation (extended)
-        "insert" => (0x52, true),
-        "delete" => (0x53, true),
+        "insert" | "ins" => (0x52, true),
+        "delete" | "del" => (0x53, true),
         "home" => (0x47, true),
         "end" => (0x4F, true),
         "pageup" | "pgup" => (0x49, true),
@@ -376,6 +376,13 @@ mod tests {
     fn test_seq_passes_plain_keys_through() {
         assert_eq!(key_to_scancode_seq("enter"), Some(vec![(0x1C, false)]));
         assert_eq!(key_to_scancode_seq("nosuchkey"), None);
+    }
+
+    #[test]
+    fn test_ins_del_aliases_match_their_full_names() {
+        assert_eq!(key_to_scancode("ins"), key_to_scancode("insert"));
+        assert_eq!(key_to_scancode("del"), key_to_scancode("delete"));
+        assert_eq!(key_to_scancode("Ins"), key_to_scancode("insert"));
     }
 
     #[test]

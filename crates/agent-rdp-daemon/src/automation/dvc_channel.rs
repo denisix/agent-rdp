@@ -85,6 +85,9 @@ pub struct DvcSharedState {
     pub pending: HashMap<String, oneshot::Sender<DvcResponse>>,
     /// Handshake received from PowerShell.
     pub handshake: Option<DvcHandshake>,
+    /// When `handshake` was set - the basis for the agent uptime reported by
+    /// `automate status`.
+    pub handshake_at: Option<std::time::Instant>,
     /// Channel ID (set when opened).
     pub channel_id: Option<u32>,
     /// Sender to send DVC data through the RDP session.
@@ -96,6 +99,7 @@ impl Default for DvcSharedState {
         Self {
             pending: HashMap::new(),
             handshake: None,
+            handshake_at: None,
             channel_id: None,
             command_tx: None,
         }
@@ -218,6 +222,7 @@ impl DvcProcessor for AutomationDvc {
                 {
                     let mut state = self.state.lock();
                     state.handshake = Some(handshake.clone());
+                    state.handshake_at = Some(std::time::Instant::now());
                 }
 
                 if let Some(ref tx) = self.handshake_tx {
@@ -273,6 +278,7 @@ impl DvcProcessor for AutomationDvc {
         let mut state = self.state.lock();
         state.channel_id = None;
         state.handshake = None;
+        state.handshake_at = None;
 
         // Notify all pending requests that the channel closed
         for (id, sender) in state.pending.drain() {

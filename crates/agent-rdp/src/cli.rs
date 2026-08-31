@@ -567,6 +567,15 @@ pub enum AutomateAction {
 
     /// Get automation agent status
     Status,
+
+    /// Relaunch the UI Automation agent without a full RDP reconnect
+    ///
+    /// Use this when the agent died mid-session or never came up after
+    /// connect, but the RDP session itself is still fine - a full
+    /// disconnect+connect works too but invalidates every element ref for no
+    /// reason. Requires connect to have been run with
+    /// --enable-win-automation this session.
+    Restart,
 }
 
 /// Locate command arguments (OCR-based text location).
@@ -635,6 +644,17 @@ pub struct LocateArgs {
     /// Without it, clicking requires an unambiguous single match.
     #[arg(long, value_name = "N", requires = "click_action")]
     pub index: Option<usize>,
+
+    /// Only consider matches within --near-distance px of a line containing
+    /// this anchor text (substring match). Useful when the same text appears
+    /// in several places (a repeated column header, a label and its tooltip)
+    /// - anchor to a nearby, more distinctive label instead.
+    #[arg(long, value_name = "TEXT")]
+    pub near: Option<String>,
+
+    /// Max distance in pixels from the --near anchor (default: 150)
+    #[arg(long, value_name = "PX", requires = "near", default_value = "150")]
+    pub near_distance: u32,
 }
 
 /// Click-at command arguments (geometric click-safety check).
@@ -662,4 +682,17 @@ pub struct ClickAtArgs {
     /// Right-click instead of left click
     #[arg(long)]
     pub right_click: bool,
+
+    /// A second, independently measured point for the same target (X,Y) -
+    /// e.g. a vision model queried twice. If the two points roughly agree
+    /// (within --max-divergence), their midpoint is clicked instead of the
+    /// first point alone; if they diverge, the click is refused rather than
+    /// picking one arbitrarily.
+    #[arg(long, value_name = "X,Y", value_parser = crate::cli::commands::parse_point)]
+    pub confirm: Option<(u16, u16)>,
+
+    /// Max pixel distance between the point and --confirm before it's
+    /// treated as diverging measurements rather than noise (default: 40)
+    #[arg(long, value_name = "PX", requires = "confirm")]
+    pub max_divergence: Option<u32>,
 }

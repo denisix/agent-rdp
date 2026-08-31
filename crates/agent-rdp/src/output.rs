@@ -106,6 +106,9 @@ impl Output {
                 }
                 println!("PID: {}", info.pid);
                 println!("Uptime: {}s", info.uptime_secs);
+                if let Some(age_ms) = info.last_frame_age_ms {
+                    println!("Last frame from server: {}s ago", age_ms / 1000);
+                }
             }
             ResponseData::DriveList { drives } => {
                 if drives.is_empty() {
@@ -180,6 +183,20 @@ impl Output {
                 }
                 if !status.capabilities.is_empty() {
                     println!("Capabilities: {}", status.capabilities.join(", "));
+                }
+                if let Some(uptime) = status.uptime_secs {
+                    println!("Agent uptime: {}s", uptime);
+                }
+                match status.last_rtt_ms {
+                    Some(rtt) => println!("Last request RTT: {}ms", rtt),
+                    None => println!("Last request RTT: none yet"),
+                }
+                if status.consecutive_failures > 0 {
+                    println!(
+                        "Consecutive failures: {} (channel degraded, not necessarily dead - \
+                         reconnecting invalidates all refs, so prefer probing status again first)",
+                        status.consecutive_failures
+                    );
                 }
             }
             ResponseData::RunResult(result) => {

@@ -32,4 +32,9 @@ pid: number,
 /**
  * Time since daemon started (seconds).
  */
-uptime_secs: number, };
+uptime_secs: number, 
+/**
+ * Milliseconds since the last PDU was successfully read from the RDP
+ * server (only present while connected). See `Screenshot::frame_age_ms`.
+ */
+last_frame_age_ms?: number, };

@@ -41,6 +41,9 @@ webpki-roots = { workspace = true }
 image = { workspace = true }
 base64 = { workspace = true }
 
+# TCP keepalive
+socket2 = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 

@@ -114,6 +114,14 @@ pub enum ResponseData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         offset_y: Option<u32>,
+        /// Milliseconds since the last PDU was successfully read from the
+        /// RDP server. A stuck-but-undetected connection previously kept
+        /// returning the same cached frame forever with no way to tell -
+        /// a large, growing value here (especially combined with an
+        /// unchanged image) is the signal that the transport may be dead
+        /// rather than the desktop just being idle.
+        #[ts(type = "number")]
+        frame_age_ms: u64,
     },
 
     /// Clipboard text content.
@@ -202,6 +210,12 @@ pub struct SessionInfo {
     /// Time since daemon started (seconds).
     #[ts(type = "number")]
     pub uptime_secs: u64,
+
+    /// Milliseconds since the last PDU was successfully read from the RDP
+    /// server (only present while connected). See `Screenshot::frame_age_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub last_frame_age_ms: Option<u64>,
 }
 
 /// Connection state.
@@ -273,6 +287,12 @@ pub struct ClickAtResult {
     /// ambiguous.
     #[serde(default)]
     pub nearby: Vec<OcrMatch>,
+    /// Chebyshev distance between `(x, y)` and the confirm point, when a
+    /// confirm point was supplied. Populated (with `clicked: false`) when
+    /// the two measurements diverged past `max_divergence`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub divergence: Option<u32>,
 }
 
 /// A text region found by OCR.
@@ -426,6 +446,7 @@ mod tests {
             base64: "iVBORw0KGgo...".to_string(),
             offset_x: None,
             offset_y: None,
+            frame_age_ms: 0,
         });
 
         let json = serde_json::to_string(&resp).unwrap();

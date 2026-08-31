@@ -102,6 +102,14 @@ struct SharedState {
     /// this, a completely static desktop is copied and JPEG-encoded at the
     /// full frame rate forever.
     frame_generation: u64,
+    /// When the last PDU was successfully read from the server. Distinct
+    /// from `frame_generation`, which only counts *content* changes - an
+    /// idle-but-alive desktop and a dead connection look identical by that
+    /// counter alone. This is the only signal a handler can consult
+    /// synchronously to tell "genuinely alive, just quiet" apart from "the
+    /// transport died and nothing has noticed yet" (detection otherwise only
+    /// happens reactively, when `read_pdu()` itself errors).
+    last_frame_at: std::time::Instant,
     /// Drives that were mapped at connect time.
     drives: Vec<DriveMapping>,
     /// Clipboard state for CLIPRDR.
@@ -122,6 +130,19 @@ pub struct RdpSession {
 pub type DisconnectNotify = mpsc::Sender<()>;
 
 impl RdpSession {
+    /// Enable OS-level TCP keepalive on the RDP socket so a black-holed
+    /// connection (no RST/FIN from the peer) is detected in seconds instead
+    /// of the OS's default multi-minute retransmission timeout.
+    fn apply_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+        let sock_ref = socket2::SockRef::from(stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(10))
+            .with_interval(std::time::Duration::from_secs(5));
+        #[cfg(not(any(target_os = "windows", target_os = "openbsd")))]
+        let keepalive = keepalive.with_retries(4);
+        sock_ref.set_tcp_keepalive(&keepalive)
+    }
+
     /// Establish a new RDP connection.
     ///
     /// If `disconnect_notify` is provided, it will be signaled when the connection drops.
@@ -184,6 +205,16 @@ impl RdpSession {
         let tcp_stream = TcpStream::connect(&addr).await?;
         let client_addr: SocketAddr = tcp_stream.local_addr()?;
         debug!("TCP connection established from {:?}", client_addr);
+
+        // Without this, a peer that goes dark without sending TCP RST/FIN
+        // (cable pull, firewalled path, paused VM) is invisible to us until
+        // the OS's own retransmission timeout gives up - commonly 15-30
+        // minutes. During that whole window `read_pdu()` just blocks and
+        // every `screenshot` keeps "succeeding" with a stale cached frame.
+        // A short keepalive turns that into a detected disconnect in ~20-30s.
+        if let Err(e) = Self::apply_tcp_keepalive(&tcp_stream) {
+            warn!("Failed to configure TCP keepalive (continuing without it): {}", e);
+        }
 
         // Create framed transport for initial connection
         let mut framed: TokioFramed<TcpStream> = TokioFramed::new(tcp_stream);
@@ -353,6 +384,7 @@ impl RdpSession {
             width: desktop_width,
             height: desktop_height,
             frame_generation: 0,
+            last_frame_at: std::time::Instant::now(),
             drives: config.drives.clone(),
             clipboard: clipboard_state,
         }));
@@ -519,6 +551,16 @@ impl RdpSession {
     /// `SharedState::frame_generation`.
     pub fn frame_generation(&self) -> u64 {
         self.shared.read().frame_generation
+    }
+
+    /// How long it has been since the last PDU was successfully read from
+    /// the server. A large value does not by itself mean the connection is
+    /// dead (RDP servers send nothing when the desktop is idle) - but
+    /// combined with the TCP keepalive now enabled on connect, a genuinely
+    /// dead transport is detected and disconnects within ~20-30s, so this
+    /// value should never grow unbounded on a still-alive session.
+    pub fn last_frame_age(&self) -> std::time::Duration {
+        self.shared.read().last_frame_at.elapsed()
     }
 
     /// Send input events to the remote desktop.
@@ -793,6 +835,7 @@ async fn run_frame_processor(
                         // Process frame and collect responses
                         let (frames_to_send, should_terminate, should_reactivate) = {
                             let mut state = shared.write();
+                            state.last_frame_at = std::time::Instant::now();
                             match active_stage.process(&mut state.image, action, &payload) {
                                 Ok(outputs) => {
                                     let mut frames = Vec::new();

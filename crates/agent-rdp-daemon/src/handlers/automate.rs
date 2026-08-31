@@ -5,13 +5,72 @@ use std::sync::Arc;
 use agent_rdp_protocol::{
     AccessibilityElement, AccessibilitySnapshot, AutomateRequest, AutomationStatus, ClickResult,
     ElementBounds, ElementValue, ErrorCode, Response, ResponseData, RunPollResult, RunResult,
-    WindowInfo,
+    WindowAction, WindowInfo,
 };
 use tokio::sync::Mutex;
 use tracing::error;
 
-use crate::automation::SharedAutomationState;
+use crate::automation::{AutomationBootstrap, SharedAutomationState};
 use crate::rdp_session::RdpSession;
+
+/// Relaunch the UI Automation agent without a full RDP reconnect.
+///
+/// Covers the case where the agent died mid-session or never came up after
+/// `connect`, but the RDP transport itself is fine - previously the only
+/// recovery was a full `disconnect` + `connect --enable-win-automation`,
+/// which invalidates every outstanding element ref for no reason (the RDP
+/// session, drive mapping, and DVC channel plumbing are all still intact).
+pub async fn handle_restart(
+    rdp_session: &Arc<Mutex<Option<RdpSession>>>,
+    automation_state: &SharedAutomationState,
+) -> Response {
+    {
+        let session = rdp_session.lock().await;
+        if session.is_none() {
+            return Response::error(ErrorCode::NotConnected, "Not connected to RDP server");
+        }
+    }
+
+    {
+        let state = automation_state.lock().await;
+        if !state.enabled {
+            return Response::error(
+                ErrorCode::AutomationNotEnabled,
+                "Automation was not initialized at connect - reconnect with \
+                 --enable-win-automation, restart cannot add it retroactively",
+            );
+        }
+    }
+
+    {
+        let mut state = automation_state.lock().await;
+        state.agent_ready = false;
+        state.agent_pid = None;
+    }
+
+    let session_dir = crate::get_session_dir("");
+    let bootstrap = AutomationBootstrap::new(session_dir);
+
+    match bootstrap.launch_and_wait(rdp_session, automation_state).await {
+        Ok(()) => {
+            let state = automation_state.lock().await;
+            let dvc_ipc = state.dvc_ipc.as_ref();
+            Response::success(ResponseData::AutomationStatus(AutomationStatus {
+                agent_running: true,
+                agent_pid: state.agent_pid,
+                capabilities: dvc_ipc.map(|ipc| ipc.capabilities()).unwrap_or_default(),
+                version: dvc_ipc.and_then(|ipc| ipc.agent_version()),
+                uptime_secs: dvc_ipc.and_then(|ipc| ipc.agent_uptime_secs()),
+                last_rtt_ms: None,
+                consecutive_failures: 0,
+            }))
+        }
+        Err(reason) => Response::error(
+            ErrorCode::AutomationError,
+            format!("Automation agent restart failed: {}", reason),
+        ),
+    }
+}
 
 /// Handle an automation request.
 pub async fn handle(
@@ -60,22 +119,114 @@ pub async fn handle(
 
     // Send request to PowerShell agent via DVC
     match ipc.send_request(&request).await {
-        Ok(data) => convert_response(request, data),
+        Ok(data) => convert_response(request, data, &ipc),
         Err(e) => {
             // A lost reply is not the same as a failed action - surface it under
             // its own code so callers can avoid retrying into a double-apply.
             if e.downcast_ref::<crate::automation::DvcIndeterminate>().is_some() {
                 error!("Automation request outcome unknown: {}", e);
-                return Response::error(ErrorCode::AutomationIndeterminate, e.to_string());
+                let message = if is_read_only(&request) {
+                    format!("{} This command is read-only - retrying is safe.", e)
+                } else {
+                    e.to_string()
+                };
+                return Response::error(ErrorCode::AutomationIndeterminate, message);
             }
             error!("Automation request failed: {}", e);
-            Response::error(ErrorCode::AutomationError, e.to_string())
+            Response::error(ErrorCode::AutomationError, stale_ref_hint(e.to_string()))
         }
     }
 }
 
+/// Append a "re-snapshot" hint when the agent's error text suggests the
+/// selector's ref is stale after a UI change - the ref is snapshot-scoped by
+/// design, but the raw PS error ("Element is disabled", "no longer exists")
+/// gives no clue that a fresh `automate snapshot` is the fix rather than a
+/// retry or a different selector.
+fn stale_ref_hint(message: String) -> String {
+    let lower = message.to_lowercase();
+    if lower.contains("disabled") || lower.contains("no longer exists") || lower.contains("not found") {
+        format!(
+            "{} (the ref may be stale after a UI change - re-run `automate snapshot` and retry \
+             with a fresh ref)",
+            message
+        )
+    } else {
+        message
+    }
+}
+
+/// Whether an automate command only observes state rather than changing it.
+///
+/// `AutomationIndeterminate` (a lost DVC reply - the request may or may not
+/// have been applied) is the same error for every command today, but the
+/// safe response to it is not: retrying a read is always safe, retrying a
+/// click or fill risks applying it twice.
+fn is_read_only(request: &AutomateRequest) -> bool {
+    matches!(
+        request,
+        AutomateRequest::Snapshot { .. }
+            | AutomateRequest::Get { .. }
+            | AutomateRequest::Status
+            | AutomateRequest::WaitFor { .. }
+            | AutomateRequest::RunPoll { .. }
+            | AutomateRequest::Window { action: WindowAction::List, .. }
+    )
+}
+
+#[cfg(test)]
+mod is_read_only_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_commands_are_marked_safe_to_retry() {
+        assert!(is_read_only(&AutomateRequest::Status));
+        assert!(is_read_only(&AutomateRequest::Get { selector: "e1".into(), property: None }));
+        assert!(is_read_only(&AutomateRequest::Snapshot {
+            interactive_only: false,
+            compact: false,
+            max_depth: 10,
+            selector: None,
+            focused: false,
+        }));
+        assert!(is_read_only(&AutomateRequest::Window {
+            action: WindowAction::List,
+            selector: None,
+        }));
+    }
+
+    #[test]
+    fn mutating_commands_are_not_marked_safe_to_retry() {
+        assert!(!is_read_only(&AutomateRequest::Click { selector: "e1".into(), double_click: false }));
+        assert!(!is_read_only(&AutomateRequest::Fill { selector: "e1".into(), text: "x".into() }));
+        assert!(!is_read_only(&AutomateRequest::Window {
+            action: WindowAction::Focus,
+            selector: None,
+        }));
+    }
+
+    #[test]
+    fn stale_ref_errors_get_a_resnapshot_hint() {
+        let hinted = stale_ref_hint("command_failed: Element is disabled".to_string());
+        assert!(hinted.contains("re-run `automate snapshot`"));
+
+        let hinted = stale_ref_hint("command_failed: element no longer exists".to_string());
+        assert!(hinted.contains("re-run `automate snapshot`"));
+    }
+
+    #[test]
+    fn unrelated_errors_are_left_alone() {
+        let message = "command_failed: invalid parameter".to_string();
+        assert_eq!(stale_ref_hint(message.clone()), message);
+    }
+}
+
 /// Convert the JSON response from PowerShell agent to protocol response.
-fn convert_response(request: AutomateRequest, data: serde_json::Value) -> Response {
+fn convert_response(
+    request: AutomateRequest,
+    data: serde_json::Value,
+    ipc: &crate::automation::DvcIpc,
+) -> Response {
     match request {
         AutomateRequest::Snapshot { .. } => {
             match parse_snapshot_response(data) {
@@ -140,7 +291,15 @@ fn convert_response(request: AutomateRequest, data: serde_json::Value) -> Respon
 
         AutomateRequest::Status => {
             match parse_status_response(data) {
-                Ok(status) => Response::success(ResponseData::AutomationStatus(status)),
+                Ok(mut status) => {
+                    // These come from the daemon's own DVC IPC bookkeeping,
+                    // not the PS agent's JSON - the PS side has no visibility
+                    // into DVC-layer timing or the daemon's failure counter.
+                    status.uptime_secs = ipc.agent_uptime_secs();
+                    status.last_rtt_ms = ipc.last_rtt_ms();
+                    status.consecutive_failures = ipc.consecutive_failures();
+                    Response::success(ResponseData::AutomationStatus(status))
+                }
                 Err(e) => {
                     error!("Failed to parse status response: {}", e);
                     Response::error(ErrorCode::AutomationError, e.to_string())
@@ -374,6 +533,9 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
         agent_pid,
         capabilities,
         version,
+        uptime_secs: None,
+        last_rtt_ms: None,
+        consecutive_failures: 0,
     })
 }
 

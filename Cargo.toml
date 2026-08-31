@@ -58,6 +58,9 @@ webpki-roots = "0.26"
 image = { version = "0.25", features = ["png", "jpeg"] }
 base64 = "0.22"
 
+# Low-level socket options (TCP keepalive)
+socket2 = "0.6"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

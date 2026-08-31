@@ -180,6 +180,70 @@ impl AutomationBootstrap {
         )
     }
 
+    /// Launch the agent and wait for its handshake, retrying the launch
+    /// itself if it doesn't take.
+    ///
+    /// Shared by `connect` (after `initialize()` has already mapped the
+    /// drive and written the scripts) and `automate restart` (which reuses
+    /// an already-initialized session's drive/scripts to relaunch a dead or
+    /// never-came-up agent without a full RDP reconnect). The launch drives
+    /// the remote desktop's Run dialog, so it silently does nothing if the
+    /// desktop isn't ready to accept input yet - the symptom is a launch
+    /// that reports success followed by a handshake timeout, hence the
+    /// retry rather than one long wait.
+    pub async fn launch_and_wait(
+        &self,
+        rdp_session: &Arc<Mutex<Option<RdpSession>>>,
+        automation_state: &Arc<Mutex<AutomationState>>,
+    ) -> Result<(), String> {
+        const LAUNCH_ATTEMPTS: usize = 3;
+        let mut last_reason = String::new();
+
+        for attempt in 1..=LAUNCH_ATTEMPTS {
+            let launched = {
+                let session = rdp_session.lock().await;
+                match session.as_ref() {
+                    Some(rdp) => {
+                        let auto_state = automation_state.lock().await;
+                        match self.launch_agent(rdp, &auto_state).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                warn!("Failed to launch automation agent: {}", e);
+                                last_reason = format!("Failed to launch automation agent: {}", e);
+                                false
+                            }
+                        }
+                    }
+                    None => {
+                        last_reason = "Not connected to an RDP server".to_string();
+                        false
+                    }
+                }
+            };
+
+            if launched {
+                let mut auto_state = automation_state.lock().await;
+                match self.wait_for_agent(&mut auto_state, 10).await {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        warn!(
+                            "Automation agent handshake failed (attempt {}/{}): {}",
+                            attempt, LAUNCH_ATTEMPTS, e
+                        );
+                        last_reason = format!("Automation agent handshake failed: {}", e);
+                    }
+                }
+            }
+
+            if attempt < LAUNCH_ATTEMPTS {
+                info!("Retrying automation agent launch...");
+            }
+        }
+
+        warn!("Automation agent did not come up after {} attempts", LAUNCH_ATTEMPTS);
+        Err(last_reason)
+    }
+
     /// Full bootstrap sequence: initialize, launch, and verify handshake.
     pub async fn bootstrap(
         &self,

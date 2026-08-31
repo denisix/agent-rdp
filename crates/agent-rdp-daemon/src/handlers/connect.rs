@@ -216,69 +216,17 @@ pub async fn handle(
             let session_dir = crate::get_session_dir("");
             let bootstrap = AutomationBootstrap::new(session_dir);
 
-            // Launch, then wait for the handshake - retrying the launch itself
-            // if it doesn't take.
-            //
-            // The launch drives the remote desktop's Run dialog, so it silently
-            // does nothing if the desktop isn't ready to accept input yet (a
-            // freshly connected session, a foreground app still taking focus).
-            // The symptom is a launch that reports success followed by a
-            // handshake timeout. Waiting longer up front would slow every
-            // connect, so retry instead and let the common case stay fast.
-            const LAUNCH_ATTEMPTS: usize = 3;
-            let mut ready = false;
-            let mut last_reason = String::new();
-
-            for attempt in 1..=LAUNCH_ATTEMPTS {
-                let launched = {
-                    let session = rdp_session.lock().await;
-                    match session.as_ref() {
-                        Some(rdp) => {
-                            let auto_state = automation_state.lock().await;
-                            match bootstrap.launch_agent(rdp, &auto_state).await {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    warn!("Failed to launch automation agent: {}", e);
-                                    last_reason = format!("Failed to launch automation agent: {}", e);
-                                    false
-                                }
-                            }
-                        }
-                        None => false,
-                    }
-                };
-
-                if launched {
-                    let mut auto_state = automation_state.lock().await;
-                    match bootstrap.wait_for_agent(&mut auto_state, 10).await {
-                        Ok(()) => {
-                            ready = true;
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Automation agent handshake failed (attempt {}/{}): {}",
-                                attempt, LAUNCH_ATTEMPTS, e
-                            );
-                            last_reason = format!("Automation agent handshake failed: {}", e);
-                        }
-                    }
-                }
-
-                if attempt < LAUNCH_ATTEMPTS {
-                    info!("Retrying automation agent launch...");
+            // RDP itself is fine even if this fails, so don't fail the
+            // connect - but do report it, otherwise the caller sees a clean
+            // "Connected" and only discovers the problem later as an
+            // unexplained "agent not ready".
+            match bootstrap.launch_and_wait(rdp_session, automation_state).await {
+                Ok(()) => automation_ready = Some(true),
+                Err(reason) => {
+                    automation_ready = Some(false);
+                    automation_error = Some(reason);
                 }
             }
-
-            if !ready {
-                // RDP itself is fine, so don't fail the connect - but do report
-                // it, otherwise the caller sees a clean "Connected" and only
-                // discovers the problem later as an unexplained "agent not
-                // ready".
-                warn!("Automation agent did not come up after {} attempts", LAUNCH_ATTEMPTS);
-                automation_error = Some(last_reason);
-            }
-            automation_ready = Some(ready);
         }
     }
 

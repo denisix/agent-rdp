@@ -25,6 +25,20 @@ pub async fn run(
         }
     };
 
+    // `restart` isn't an `AutomateRequest` at all - it has to work even when
+    // the DVC channel that carries every other automate command is dead,
+    // which is exactly the case it exists to recover from - so it's a
+    // separate top-level `Request` variant, dispatched before the mapping
+    // below.
+    if matches!(args.action, AutomateAction::Restart) {
+        let response = client.send(&Request::AutomationRestart, timeout_ms).await?;
+        output.print_response(&response);
+        if !response.success {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // `focused` is a snapshot under the hood, but its whole point is to be a
     // one-line answer to "which field am I typing into?", so it gets its own
     // rendering instead of the full tree dump.
@@ -192,6 +206,12 @@ fn build_request(action: AutomateAction) -> Result<AutomateRequest, String> {
         }
 
         AutomateAction::Status => AutomateRequest::Status,
+
+        // Handled directly in `run` before this function is called - it maps
+        // to a top-level `Request` variant, not an `AutomateRequest`.
+        AutomateAction::Restart => {
+            return Err("restart is not an AutomateRequest - this is a bug".to_string())
+        }
     })
 }
 

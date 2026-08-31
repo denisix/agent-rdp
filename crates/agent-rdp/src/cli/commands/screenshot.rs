@@ -54,6 +54,7 @@ pub async fn run(
         base64,
         offset_x,
         offset_y,
+        frame_age_ms,
         ..
     }) = response.data
     {
@@ -87,6 +88,18 @@ pub async fn run(
             );
         } else {
             println!("Screenshot saved to {} ({}x{})", path.display(), width, height);
+        }
+
+        // The frame itself is always the last one the background decoder
+        // painted, even if the transport died since - a large, stale age is
+        // the only signal that this frame might not reflect current state.
+        if frame_age_ms > 5000 {
+            eprintln!(
+                "Warning: this frame is {}s old. The desktop may simply be idle (RDP servers \
+                 send nothing when nothing changes), but if the connection has actually died \
+                 this is a stale frame - check `session info` for connection health.",
+                frame_age_ms / 1000
+            );
         }
     }
 
