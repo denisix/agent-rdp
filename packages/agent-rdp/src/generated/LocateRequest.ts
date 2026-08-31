@@ -15,6 +15,19 @@ text: string,
  */
 pattern: boolean, 
 /**
+ * Require the whole OCR line to equal `text` (respecting
+ * `ignore_case`), instead of substring containment. Takes precedence
+ * over `pattern` when both are set.
+ *
+ * Default substring mode matches "Провести" against a line reading
+ * "Провести и закрыть" - usually harmless (`--click` already refuses to
+ * guess when a query is ambiguous), but `exact` gives a named way to
+ * avoid the ambiguity in the first place rather than relying on
+ * `--pattern` with no wildcards, which happens to require a full match
+ * as an undocumented side effect of glob anchoring.
+ */
+exact: boolean, 
+/**
  * Case-insensitive matching (default: true).
  */
 ignore_case: boolean, 

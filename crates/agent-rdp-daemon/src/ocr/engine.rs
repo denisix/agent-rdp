@@ -58,11 +58,12 @@ impl OcrService {
         query: &str,
         pattern: bool,
         ignore_case: bool,
+        exact: bool,
     ) -> Result<(Vec<OcrMatch>, u32)> {
         let img = image::load_from_memory(image_data)
             .context("Failed to decode image")?
             .into_rgb8();
-        self.find_text_rgb(&img, query, pattern, ignore_case)
+        self.find_text_rgb(&img, query, pattern, ignore_case, exact)
     }
 
     /// Same as [`Self::find_text`], operating on an already-decoded RGB image.
@@ -70,12 +71,17 @@ impl OcrService {
     /// The daemon holds the framebuffer as RGBA already; PNG-encoding it just
     /// for this function to `load_from_memory` it back was a pure-overhead
     /// encode+decode round trip on every `locate` call.
+    ///
+    /// `exact` takes precedence over `pattern` when both are set - matching a
+    /// whole line and glob-matching are both "whole string" modes, so there is
+    /// no useful combination of the two.
     pub fn find_text_rgb(
         &self,
         img: &RgbImage,
         query: &str,
         pattern: bool,
         ignore_case: bool,
+        exact: bool,
     ) -> Result<(Vec<OcrMatch>, u32)> {
         let (all_lines, total_lines) = self.get_all_lines_rgb(img)?;
 
@@ -94,13 +100,7 @@ impl OcrService {
                 } else {
                     line.text.clone()
                 };
-
-                if pattern {
-                    glob_match(&query_cmp, &text_cmp)
-                } else {
-                    // Contains search for non-pattern mode
-                    text_cmp.contains(&query_cmp)
-                }
+                text_matches(&text_cmp, &query_cmp, pattern, exact)
             })
             .collect();
 
@@ -212,6 +212,28 @@ impl OcrService {
         debug!("Detected {} text lines", total_lines);
 
         Ok((lines, total_lines))
+    }
+}
+
+/// Decide whether an OCR line's (already case-folded) text matches a query,
+/// given which matching mode is active.
+///
+/// `text_cmp`/`query_cmp` are expected to already have `ignore_case` applied
+/// by the caller - this function only picks the comparison strategy. Kept
+/// free of `OcrMatch`/`OcrService` so the matching logic is testable without
+/// a loaded OCR model.
+fn text_matches(text_cmp: &str, query_cmp: &str, pattern: bool, exact: bool) -> bool {
+    if exact {
+        // A named, documented way to get what a wildcard-free `--pattern`
+        // already does as an undocumented side effect of glob_match's
+        // end-to-end anchoring - this is the fix for "Провести" matching
+        // "Провести и закрыть" under plain substring mode.
+        text_cmp == query_cmp
+    } else if pattern {
+        glob_match(query_cmp, text_cmp)
+    } else {
+        // Contains search for non-pattern mode
+        text_cmp.contains(query_cmp)
     }
 }
 
@@ -328,6 +350,36 @@ mod tests {
     fn test_glob_match_combined() {
         assert!(glob_match("h*o", "hello"));
         assert!(glob_match("h?ll*", "helloworld"));
+    }
+
+    #[test]
+    fn test_text_matches_exact_rejects_a_longer_line() {
+        // The load-bearing regression: "Провести" must not match a line that
+        // reads "Провести и закрыть" once --exact is set, even though it
+        // would under the default substring mode.
+        assert!(text_matches("провести", "провести", false, true));
+        assert!(!text_matches("провести и закрыть", "провести", false, true));
+    }
+
+    #[test]
+    fn test_text_matches_default_is_substring_containment() {
+        assert!(text_matches("провести и закрыть", "провести", false, false));
+        assert!(!text_matches("провести", "провести и закрыть", false, false));
+    }
+
+    #[test]
+    fn test_text_matches_exact_beats_pattern_when_both_set() {
+        // exact must win even if a caller also passes pattern=true - the two
+        // are both "whole string" modes and there's no useful combination.
+        assert!(!text_matches("провести и закрыть", "провест*", true, true));
+        // But pattern alone still glob-matches through to the end of the line.
+        assert!(text_matches("провести и закрыть", "провест*", true, false));
+    }
+
+    #[test]
+    fn test_text_matches_exact_requires_full_equality_not_prefix_or_suffix() {
+        assert!(!text_matches("провести", "прове", false, true));
+        assert!(!text_matches("прове", "провести", false, true));
     }
 
     /// Both env-var cases live in one test: `AGENT_RDP_MODELS_DIR` is

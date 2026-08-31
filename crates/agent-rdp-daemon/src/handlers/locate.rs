@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_rdp_protocol::{
-    ErrorCode, LocateRequest, LocateResult, OcrMatch, Region, Response, ResponseData,
+    ClickAtRequest, ClickAtResult, ErrorCode, LocateRequest, LocateResult, OcrMatch, Region,
+    Response, ResponseData,
 };
 use tokio::sync::Mutex;
 use tracing::info;
@@ -153,6 +154,7 @@ async fn run_one_pass(
     let text = params.text.clone();
     let pattern = params.pattern;
     let ignore_case = params.ignore_case;
+    let exact = params.exact;
 
     // OCR is CPU-bound and can run to multiple seconds on a full desktop;
     // keep it off the async worker so other requests keep being served.
@@ -160,7 +162,7 @@ async fn run_one_pass(
         if all {
             ocr.get_all_lines_rgb(&rgb_image)
         } else {
-            ocr.find_text_rgb(&rgb_image, &text, pattern, ignore_case)
+            ocr.find_text_rgb(&rgb_image, &text, pattern, ignore_case, exact)
         }
     })
     .await
@@ -183,8 +185,8 @@ pub async fn handle(
     params: LocateRequest,
 ) -> Response {
     info!(
-        "Locate request: text='{}', pattern={}, ignore_case={}, all={}, region={:?}, wait_ms={:?}",
-        params.text, params.pattern, params.ignore_case, params.all, params.region, params.wait_ms
+        "Locate request: text='{}', pattern={}, exact={}, ignore_case={}, all={}, region={:?}, wait_ms={:?}",
+        params.text, params.pattern, params.exact, params.ignore_case, params.all, params.region, params.wait_ms
     );
 
     let ocr = match get_or_init_ocr_service().await {
@@ -232,6 +234,197 @@ pub async fn handle(
             },
         }
     }
+}
+
+/// Chebyshev (axis-aligned) distance from a point to an `OcrMatch` box: 0
+/// when the point is inside the box, otherwise the larger of the
+/// horizontal/vertical gaps to its nearest edge.
+///
+/// Chosen over Euclidean distance for simplicity and because it matches how
+/// "still in the same visual cluster" reads for roughly text-height-scaled UI
+/// labels - two labels stacked closely either horizontally or vertically are
+/// exactly the ambiguous case, and Chebyshev distance catches both without
+/// needing floating point.
+fn rect_distance(m: &OcrMatch, x: i32, y: i32) -> i32 {
+    let dx = (m.x - x).max(0).max(x - (m.x + m.width));
+    let dy = (m.y - y).max(0).max(y - (m.y + m.height));
+    dx.max(dy)
+}
+
+/// Result of checking whether `(x, y)` is safe to click.
+struct ClickAtCheck {
+    /// Recognized text of the sole nearby region, when there was exactly one.
+    matched_text: Option<String>,
+    /// The nearby regions, populated (2 or more) only when the click should
+    /// be refused as ambiguous.
+    nearby: Vec<OcrMatch>,
+}
+
+/// Decide whether clicking `(x, y)` is safe, given the OCR-detected regions
+/// in the surrounding window.
+///
+/// Pure geometry over already-detected boxes, so it is testable with
+/// synthetic boxes and does not depend on OCR *recognition* being correct -
+/// only on *detection* having found that something is there, a separate,
+/// script-agnostic stage. Zero or one region within `min_gap` of the point is
+/// safe (nothing nearby, or exactly the target); two or more is the ambiguous
+/// case this command exists to catch.
+fn check_click_safety(boxes: &[OcrMatch], x: i32, y: i32, min_gap: i32) -> ClickAtCheck {
+    let candidates: Vec<OcrMatch> = boxes
+        .iter()
+        .filter(|m| rect_distance(m, x, y) <= min_gap)
+        .cloned()
+        .collect();
+
+    match candidates.len() {
+        0 => ClickAtCheck { matched_text: None, nearby: Vec::new() },
+        1 => ClickAtCheck {
+            matched_text: Some(candidates[0].text.clone()),
+            nearby: Vec::new(),
+        },
+        _ => ClickAtCheck { matched_text: None, nearby: candidates },
+    }
+}
+
+/// Handle a `ClickAt` request.
+pub async fn handle_click_at(
+    rdp_session: &Arc<Mutex<Option<RdpSession>>>,
+    params: ClickAtRequest,
+) -> Response {
+    info!(
+        "ClickAt request: ({}, {}), window={}x{}, min_gap={}",
+        params.x, params.y, params.window_width, params.window_height, params.min_gap
+    );
+
+    let ocr = match get_or_init_ocr_service().await {
+        Some(ocr) => ocr,
+        None => {
+            return Response::error(
+                ErrorCode::InternalError,
+                "OCR service not available. Make sure OCR models are installed.",
+            );
+        }
+    };
+
+    let (px, py) = (params.x as i32, params.y as i32);
+
+    let rgb_image = {
+        let session = rdp_session.lock().await;
+        let rdp = match session.as_ref() {
+            Some(rdp) => rdp,
+            None => {
+                return Response::error(ErrorCode::NotConnected, "Not connected to an RDP server");
+            }
+        };
+
+        let (full_width, full_height) = (rdp.width() as u32, rdp.height() as u32);
+
+        // The point itself must be on the desktop - the detection window can
+        // still overlap the desktop even when the point isn't, so the
+        // clamp_to check below would not catch this on its own.
+        if params.x as u32 >= full_width || params.y as u32 >= full_height {
+            return Response::error(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "Point ({}, {}) lies outside the {}x{} desktop",
+                    params.x, params.y, full_width, full_height
+                ),
+            );
+        }
+
+        // Window centered on the point, clamped to the desktop. Restricting
+        // detection to a local window (rather than the whole screen) is not
+        // just an optimization - "ambiguously close to a neighboring label"
+        // is inherently about labels near this point, not ones elsewhere on
+        // screen.
+        let region = Region {
+            x: (params.x as u32).saturating_sub(params.window_width / 2),
+            y: (params.y as u32).saturating_sub(params.window_height / 2),
+            width: params.window_width,
+            height: params.window_height,
+        };
+        let Some(clamped) = region.clamp_to(full_width, full_height) else {
+            return Response::error(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "Point ({}, {}) lies outside the {}x{} desktop",
+                    params.x, params.y, full_width, full_height
+                ),
+            );
+        };
+
+        let data = match rdp.get_region_data(clamped) {
+            Some(data) => data,
+            None => {
+                return Response::error(
+                    ErrorCode::InternalError,
+                    "Failed to read the requested region from the framebuffer",
+                );
+            }
+        };
+        let rgba = match image::RgbaImage::from_raw(clamped.width, clamped.height, data) {
+            Some(img) => img,
+            None => {
+                return Response::error(ErrorCode::InternalError, "Failed to create image from desktop data");
+            }
+        };
+        (image::DynamicImage::ImageRgba8(rgba).into_rgb8(), clamped)
+    }; // session lock dropped here
+
+    let (rgb_image, region) = rgb_image;
+    let ocr = Arc::clone(&ocr);
+
+    // OCR detection can take real time even over a small window; keep it off
+    // the async worker.
+    let result = tokio::task::spawn_blocking(move || ocr.get_all_lines_rgb(&rgb_image))
+        .await
+        .map_err(|e| format!("OCR task failed: {}", e))
+        .and_then(|r| r.map_err(|e| format!("OCR failed: {}", e)));
+
+    let mut boxes = match result {
+        Ok((boxes, _total)) => boxes,
+        Err(message) => return Response::error(ErrorCode::InternalError, message),
+    };
+    offset_matches(&mut boxes, region);
+
+    let min_gap = params.min_gap as i32;
+    let check = check_click_safety(&boxes, px, py, min_gap);
+
+    if !check.nearby.is_empty() {
+        info!(
+            "ClickAt ({}, {}) refused: {} regions within {}px",
+            params.x, params.y, check.nearby.len(), params.min_gap
+        );
+        return Response::success(ResponseData::ClickAtResult(ClickAtResult {
+            clicked: false,
+            x: params.x,
+            y: params.y,
+            matched_text: None,
+            nearby: check.nearby,
+        }));
+    }
+
+    let mouse_action = if params.double_click {
+        agent_rdp_protocol::MouseRequest::DoubleClick { x: params.x, y: params.y }
+    } else if params.right_click {
+        agent_rdp_protocol::MouseRequest::RightClick { x: params.x, y: params.y }
+    } else {
+        agent_rdp_protocol::MouseRequest::Click { x: params.x, y: params.y }
+    };
+
+    let click_response = crate::handlers::mouse::handle(rdp_session, mouse_action).await;
+    if !click_response.success {
+        return click_response;
+    }
+
+    info!("ClickAt clicked ({}, {})", params.x, params.y);
+    Response::success(ResponseData::ClickAtResult(ClickAtResult {
+        clicked: true,
+        x: params.x,
+        y: params.y,
+        matched_text: check.matched_text,
+        nearby: Vec::new(),
+    }))
 }
 
 #[cfg(test)]
@@ -335,5 +528,105 @@ mod tests {
     #[test]
     fn test_decide_wait_zero_budget_gives_up_immediately() {
         assert_eq!(decide_wait(Duration::from_millis(0), 0), WaitDecision::GiveUp);
+    }
+
+    fn boxed(text: &str, x: i32, y: i32, width: i32, height: i32) -> OcrMatch {
+        OcrMatch {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height,
+            center_x: x + width / 2,
+            center_y: y + height / 2,
+        }
+    }
+
+    #[test]
+    fn test_rect_distance_inside_is_zero() {
+        let m = boxed("Провести", 600, 200, 100, 20);
+        assert_eq!(rect_distance(&m, 650, 210), 0);
+        // Exactly on the edges counts as inside/touching, not a gap.
+        assert_eq!(rect_distance(&m, 600, 200), 0);
+        assert_eq!(rect_distance(&m, 700, 220), 0);
+    }
+
+    #[test]
+    fn test_rect_distance_outside_measures_the_gap() {
+        let m = boxed("Провести", 600, 200, 100, 20);
+        assert_eq!(rect_distance(&m, 710, 210), 10); // 10px right of the box
+        assert_eq!(rect_distance(&m, 650, 190), 10); // 10px above
+        assert_eq!(rect_distance(&m, 590, 190), 10); // diagonal: max of the axis gaps
+        assert_eq!(rect_distance(&m, 560, 170), 40);
+    }
+
+    #[test]
+    fn test_check_click_safety_single_containing_box_is_safe() {
+        // The reported scenario: clicking the center of «Провести» with
+        // «Провести и закрыть» far enough away (the smoke test had a 65px
+        // margin) must proceed - one region within the gap, the target.
+        let boxes = vec![
+            boxed("Провести", 620, 200, 90, 18),
+            boxed("Провести и закрыть", 730, 200, 170, 18),
+        ];
+        let check = check_click_safety(&boxes, 665, 209, 10);
+        assert!(check.nearby.is_empty(), "click must be allowed");
+        assert_eq!(check.matched_text.as_deref(), Some("Провести"));
+    }
+
+    #[test]
+    fn test_check_click_safety_two_close_boxes_refuse() {
+        // Point on the boundary between two labels only min_gap apart on each
+        // side: exactly the "which button did I mean" ambiguity.
+        let boxes = vec![
+            boxed("Провести", 600, 200, 100, 18),
+            boxed("Провести и закрыть", 710, 200, 170, 18),
+        ];
+        let check = check_click_safety(&boxes, 705, 209, 10);
+        assert_eq!(check.nearby.len(), 2, "both neighbors must be reported");
+        assert!(check.matched_text.is_none());
+    }
+
+    #[test]
+    fn test_check_click_safety_no_boxes_at_all_is_safe() {
+        // An icon-only button with no detectable text nearby is legitimate -
+        // refusing would make the command useless for exactly the custom-
+        // rendered UIs it exists for.
+        let check = check_click_safety(&[], 665, 209, 10);
+        assert!(check.nearby.is_empty());
+        assert!(check.matched_text.is_none());
+
+        // Same when text exists on screen but nowhere near the point.
+        let boxes = vec![boxed("Далеко", 10, 10, 60, 14)];
+        let check = check_click_safety(&boxes, 665, 209, 10);
+        assert!(check.nearby.is_empty());
+        assert!(check.matched_text.is_none());
+    }
+
+    #[test]
+    fn test_check_click_safety_gap_boundary() {
+        let target = boxed("Провести", 600, 200, 100, 18);
+        // Neighbor exactly min_gap past the point: still counted (<=), so
+        // refused - the boundary errs toward safety.
+        let at_gap = boxed("Провести и закрыть", 715, 200, 170, 18);
+        let check = check_click_safety(&[target.clone(), at_gap], 705, 209, 10);
+        assert_eq!(check.nearby.len(), 2);
+
+        // One pixel past the gap: allowed.
+        let past_gap = boxed("Провести и закрыть", 716, 200, 170, 18);
+        let check = check_click_safety(&[target, past_gap], 705, 209, 10);
+        assert!(check.nearby.is_empty());
+        assert_eq!(check.matched_text.as_deref(), Some("Провести"));
+    }
+
+    #[test]
+    fn test_check_click_safety_larger_gap_is_stricter() {
+        let boxes = vec![
+            boxed("Провести", 600, 200, 100, 18),
+            boxed("Провести и закрыть", 760, 200, 170, 18),
+        ];
+        // 50px gap between point (705) and the neighbor at 760.
+        assert!(check_click_safety(&boxes, 705, 209, 10).nearby.is_empty());
+        assert_eq!(check_click_safety(&boxes, 705, 209, 60).nearby.len(), 2);
     }
 }

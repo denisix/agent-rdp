@@ -1,8 +1,10 @@
 //! Locate command implementation (OCR-based text location).
 
-use agent_rdp_protocol::{LocateRequest, MouseRequest, OcrMatch, Request, ResponseData};
+use agent_rdp_protocol::{
+    ClickAtRequest, LocateRequest, MouseRequest, OcrMatch, Request, ResponseData,
+};
 
-use crate::cli::LocateArgs;
+use crate::cli::{ClickAtArgs, LocateArgs};
 use crate::output::Output;
 use crate::session_manager::SessionManager;
 
@@ -93,6 +95,7 @@ pub async fn run(
     let request = Request::Locate(LocateRequest {
         text: search_text.clone(),
         pattern: args.pattern,
+        exact: args.exact,
         ignore_case: !args.case_sensitive,
         all: args.all,
         region: args.region,
@@ -213,6 +216,89 @@ pub async fn run(
     Ok(())
 }
 
+/// Run the `click-at` command: click a caller-supplied point with a
+/// geometric ambiguity check.
+pub async fn run_click_at(
+    session: &str,
+    args: ClickAtArgs,
+    output: &Output,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let manager = SessionManager::new(session.to_string());
+
+    let mut client = match manager.connect_existing().await {
+        Ok(client) => client,
+        Err(message) => {
+            output.print_error("daemon_not_running", &message);
+            std::process::exit(1);
+        }
+    };
+
+    let (window_width, window_height) = args.window.unwrap_or((400, 160));
+
+    let request = Request::ClickAt(ClickAtRequest {
+        x: args.x,
+        y: args.y,
+        window_width,
+        window_height,
+        min_gap: args.min_gap.unwrap_or(10),
+        double_click: args.double_click,
+        right_click: args.right_click,
+    });
+
+    let response = client.send(&request, timeout_ms).await?;
+
+    if !response.success {
+        output.print_response(&response);
+        std::process::exit(1);
+    }
+
+    if let Some(ResponseData::ClickAtResult(result)) = &response.data {
+        if output.is_json() {
+            output.print_response(&response);
+        } else if result.clicked {
+            match &result.matched_text {
+                Some(text) => println!(
+                    "Clicked at ({}, {}) - OCR read '{}' nearby (best-effort; recognition \
+                     may be wrong for text OCR struggles with)",
+                    result.x, result.y, text
+                ),
+                None => println!(
+                    "Clicked at ({}, {}) - no text detected nearby",
+                    result.x, result.y
+                ),
+            }
+        } else {
+            // Refused: mirror the ambiguous-match formatting `locate --click`
+            // uses, so the two commands read the same way when they decline.
+            output.print_error(
+                "ambiguous_click",
+                &format!(
+                    "{} text regions detected near ({}, {}) - move the point or pass a \
+                     smaller --min-gap",
+                    result.nearby.len(),
+                    result.x,
+                    result.y
+                ),
+            );
+            for (i, m) in result.nearby.iter().enumerate() {
+                eprintln!(
+                    "  [{}] '{}' at ({}, {}) size {}x{}",
+                    i, m.text, m.x, m.y, m.width, m.height
+                );
+            }
+            std::process::exit(1);
+        }
+        if !result.clicked {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    output.print_response(&response);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +405,7 @@ mod tests {
         let base = |click, double_click, right_click| LocateArgs {
             text: Some("x".to_string()),
             pattern: false,
+            exact: false,
             case_sensitive: false,
             all: false,
             region: None,

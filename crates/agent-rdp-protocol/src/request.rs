@@ -39,6 +39,10 @@ pub enum Request {
     /// OCR-based text location.
     Locate(LocateRequest),
 
+    /// Click a caller-supplied point, refusing if it is ambiguously close to
+    /// more than one detected text region.
+    ClickAt(ClickAtRequest),
+
     /// Get session info.
     SessionInfo,
 
@@ -368,6 +372,19 @@ pub struct LocateRequest {
     #[serde(default)]
     pub pattern: bool,
 
+    /// Require the whole OCR line to equal `text` (respecting
+    /// `ignore_case`), instead of substring containment. Takes precedence
+    /// over `pattern` when both are set.
+    ///
+    /// Default substring mode matches "Провести" against a line reading
+    /// "Провести и закрыть" - usually harmless (`--click` already refuses to
+    /// guess when a query is ambiguous), but `exact` gives a named way to
+    /// avoid the ambiguity in the first place rather than relying on
+    /// `--pattern` with no wildcards, which happens to require a full match
+    /// as an undocumented side effect of glob anchoring.
+    #[serde(default)]
+    pub exact: bool,
+
     /// Case-insensitive matching (default: true).
     #[serde(default = "default_true")]
     pub ignore_case: bool,
@@ -397,6 +414,54 @@ pub struct LocateRequest {
 
 fn default_true() -> bool {
     true
+}
+
+/// Click a caller-supplied point, refusing if it's ambiguously close to more
+/// than one OCR-detected text region.
+///
+/// For callers that already know where to click (e.g. a screenshot read by a
+/// vision model) and want the same "don't guess when it's ambiguous" safety
+/// `locate --click` gives text search - without needing OCR to correctly
+/// *read* the label, only to detect that one exists nearby. Detection and
+/// recognition are separate OCR stages, so this works even for text OCR
+/// recognition can't read (e.g. some Cyrillic renderers).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct ClickAtRequest {
+    pub x: u16,
+    pub y: u16,
+
+    /// Width of the OCR detection window centered on the point (default: 400).
+    #[serde(default = "default_click_at_window_w")]
+    pub window_width: u32,
+
+    /// Height of the OCR detection window centered on the point (default: 160).
+    #[serde(default = "default_click_at_window_h")]
+    pub window_height: u32,
+
+    /// Minimum pixel gap between the point's containing region and any other
+    /// detected region's boundary, below which the click is refused as
+    /// ambiguous (default: 10).
+    #[serde(default = "default_click_at_min_gap")]
+    pub min_gap: u32,
+
+    #[serde(default)]
+    pub double_click: bool,
+
+    #[serde(default)]
+    pub right_click: bool,
+}
+
+fn default_click_at_window_w() -> u32 {
+    400
+}
+
+fn default_click_at_window_h() -> u32 {
+    160
+}
+
+fn default_click_at_min_gap() -> u32 {
+    10
 }
 
 #[cfg(test)]

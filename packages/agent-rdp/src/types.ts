@@ -20,6 +20,7 @@ export type {
   ClipboardRequest,
   DriveRequest,
   LocateRequest,
+  ClickAtRequest,
   AutomateRequest,
 
   // Response types
@@ -31,6 +32,7 @@ export type {
   SessionSummary,
   MappedDrive,
   LocateResult,
+  ClickAtResult,
   OcrMatch,
 
   // Supporting types
@@ -198,6 +200,13 @@ export interface LocateOptions {
   all?: boolean;
   /** Use glob-style pattern matching (* and ?). */
   pattern?: boolean;
+  /**
+   * Require the whole OCR line to equal the search text, not just contain
+   * it. Default substring mode matches "Провести" against a line reading
+   * "Провести и закрыть"; `exact` avoids that ambiguity. Takes precedence
+   * over `pattern`.
+   */
+  exact?: boolean;
   /** Case-sensitive matching (default: false). */
   caseSensitive?: boolean;
   /**
@@ -234,6 +243,23 @@ export interface LocateClickResult {
   text: string;
   x: number;
   y: number;
+}
+
+/** Options for `clickAt()`. */
+export interface ClickAtOptions {
+  /** OCR detection window width around the point (default: 400). */
+  windowWidth?: number;
+  /** OCR detection window height around the point (default: 160). */
+  windowHeight?: number;
+  /**
+   * Refuse the click if another detected text region is within this many
+   * pixels of the target (default: 10).
+   */
+  minGap?: number;
+  /** Double-click instead of single click. */
+  doubleClick?: boolean;
+  /** Right-click instead of left click. */
+  rightClick?: boolean;
 }
 
 // --- Automation convenience types (aliases for backwards compatibility) ---

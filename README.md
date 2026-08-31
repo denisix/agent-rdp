@@ -286,6 +286,12 @@ agent-rdp locate "Cancel"
 # Pattern matching (glob-style)
 agent-rdp locate "Save*" --pattern
 
+# Exact whole-line matching. Default mode is substring containment, so
+# "Провести" also matches a button reading "Провести и закрыть" - two matches,
+# and --click refuses to guess between them. --exact matches only the line
+# that reads exactly "Провести".
+agent-rdp locate "Провести" --exact --click
+
 # Get all text on screen
 agent-rdp locate --all
 
@@ -317,7 +323,32 @@ To click it: agent-rdp locate 'Cancel' --click
 
 Clicking is deliberately strict: no match, or several matches without
 `--index`, is an error rather than a guess. Prefer narrowing with `--region`
-over picking an index.
+over picking an index. When two buttons share a prefix ("Провести" /
+"Провести и закрыть"), use `--exact` so the ambiguity never arises.
+
+### Click-at (safe clicking of externally-computed coordinates)
+
+When the click point comes from outside agent-rdp — a vision model reading a
+screenshot, a manual crop — `locate --click` can't help, and a raw
+`mouse click X Y` has no safety net. `click-at` clicks the point only if it
+isn't ambiguously close to more than one detected text region:
+
+```bash
+# Click, refusing if another label is within 10px of the target
+agent-rdp click-at 665 209
+
+# Tune the detection window and gap
+agent-rdp click-at 665 209 --window 400x160 --min-gap 20
+
+# Variants
+agent-rdp click-at 665 209 --double-click
+agent-rdp click-at 665 209 --right-click
+```
+
+The check uses OCR *detection* only (bounding boxes, script-agnostic), not
+recognition — so it works even for text OCR can't read, e.g. custom-rendered
+Cyrillic UIs where both UI Automation and `locate` text search fail. On
+refusal it lists the nearby regions and exits non-zero; nothing is clicked.
 
 ### Clipboard
 
@@ -563,8 +594,16 @@ const allText = await rdp.locate({ all: true });
 // Click a match directly - the coordinate never leaves the process
 await rdp.locate({ text: 'Cancel', click: 'left' });
 
+// Exact whole-line match - won't also hit "Провести и закрыть"
+await rdp.locate({ text: 'Провести', exact: true, click: 'left' });
+
 // Block until text appears, instead of polling in a loop
 await rdp.locate({ text: 'OK', waitMs: 10000, click: 'left' });
+
+// Safe click of an externally-computed point (e.g. a vision-model bbox):
+// refuses if it's ambiguously close to more than one detected label
+const result = await rdp.clickAt(665, 209);
+if (!result.clicked) console.log('Ambiguous:', result.nearby);
 
 // Automation (requires --enable-win-automation at connect)
 const snapshot = await rdp.automation.snapshot({ interactive: true });

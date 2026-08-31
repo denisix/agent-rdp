@@ -151,14 +151,30 @@ agent-rdp drive list                       # remote path: \\tsclient\Share
 # OCR / locate
 agent-rdp locate "Cancel"                  # substring match, returns coords
 agent-rdp locate "Save*" --pattern         # glob match
+agent-rdp locate "Провести" --exact        # whole-line match - won't hit "Провести и закрыть"
 agent-rdp locate --all                     # all text on screen
 agent-rdp locate "Cancel" --click          # click the match directly - no coordinate hand-off
 agent-rdp locate "OK" --wait 10000 --click # block until it appears, then click it
 agent-rdp locate --all --region 100,380,600,30  # verify one row; coords stay full-screen
+
+# Safe click of an externally-computed point (vision-model bbox, manual crop):
+# refuses if another detected label is within --min-gap px of the target.
+# Detection-only, so it works even where OCR can't READ the text (AR-003-style
+# Cyrillic custom renderers) and UIA is blind.
+agent-rdp click-at 665 209
+agent-rdp click-at 665 209 --min-gap 20 --double-click
 ```
+
+Substring matching means a query that is a prefix of a longer button label
+matches both ("Провести" matches "Провести и закрыть" too). `--click` refuses
+to guess between multiple matches, so the worst case is an error, not a wrong
+click - but prefer `--exact` so the ambiguity never arises.
 
 Never estimate a coordinate by reading a screenshot image - always `--click`,
 or read the printed coordinate straight from `locate`/`automate get` output.
+If the coordinate must come from a vision model (OCR/UIA both fail), click it
+through `click-at` rather than raw `mouse click` - it adds the ambiguity check
+you'd otherwise have to do by hand.
 
 ## UI Automation (`--enable-win-automation`)
 

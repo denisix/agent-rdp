@@ -6,6 +6,8 @@ export type { AutomateRequest } from './AutomateRequest.js';
 export type { AutomationHandshake } from './AutomationHandshake.js';
 export type { AutomationScrollDirection } from './AutomationScrollDirection.js';
 export type { AutomationStatus } from './AutomationStatus.js';
+export type { ClickAtRequest } from './ClickAtRequest.js';
+export type { ClickAtResult } from './ClickAtResult.js';
 export type { ClickResult } from './ClickResult.js';
 export type { ClipboardRequest } from './ClipboardRequest.js';
 export type { ConnectRequest } from './ConnectRequest.js';

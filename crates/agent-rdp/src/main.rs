@@ -115,6 +115,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Commands::Locate(args) => {
             cli::commands::locate::run(&cli.session, args, &output, timeout).await
         }
+        Commands::ClickAt(args) => {
+            cli::commands::locate::run_click_at(&cli.session, args, &output, timeout).await
+        }
         Commands::Session(args) => {
             cli::commands::session::run(&cli.session, args, &output, timeout).await
         }

@@ -74,6 +74,16 @@ pub enum Commands {
     /// OCR-based text location (find text on screen)
     Locate(LocateArgs),
 
+    /// Click a known point, refusing if it's ambiguously close to more than
+    /// one detected text region
+    ///
+    /// The safety net for coordinates computed outside agent-rdp (a vision
+    /// model reading a screenshot, a manual crop) where OCR text search
+    /// can't be used - detection-only, so it works even for text OCR can't
+    /// read.
+    #[command(name = "click-at")]
+    ClickAt(ClickAtArgs),
+
     /// Session management
     Session(SessionArgs),
 
@@ -576,8 +586,17 @@ pub struct LocateArgs {
     pub text: Option<String>,
 
     /// Use pattern matching (glob-style: * and ?)
-    #[arg(long, short = 'p')]
+    #[arg(long, short = 'p', conflicts_with = "exact")]
     pub pattern: bool,
+
+    /// Require the whole line to equal the search text, not just contain it
+    ///
+    /// Default substring mode matches "Провести" against a line reading
+    /// "Провести и закрыть" - usually harmless (--click already refuses to
+    /// guess when a search is ambiguous), but --exact avoids the ambiguity
+    /// in the first place.
+    #[arg(long, short = 'e')]
+    pub exact: bool,
 
     /// Case-sensitive matching (default is case-insensitive)
     #[arg(long, short = 'c')]
@@ -616,4 +635,31 @@ pub struct LocateArgs {
     /// Without it, clicking requires an unambiguous single match.
     #[arg(long, value_name = "N", requires = "click_action")]
     pub index: Option<usize>,
+}
+
+/// Click-at command arguments (geometric click-safety check).
+#[derive(Parser)]
+pub struct ClickAtArgs {
+    /// X coordinate to click
+    pub x: u16,
+
+    /// Y coordinate to click
+    pub y: u16,
+
+    /// OCR detection window around the point, WIDTHxHEIGHT (default 400x160)
+    #[arg(long, value_name = "WxH", value_parser = crate::cli::commands::parse_window)]
+    pub window: Option<(u32, u32)>,
+
+    /// Refuse the click if another detected text region is within this many
+    /// pixels of the target (default: 10)
+    #[arg(long, value_name = "PX", value_parser = clap::value_parser!(u32).range(0..=200))]
+    pub min_gap: Option<u32>,
+
+    /// Double-click instead of single click
+    #[arg(long, conflicts_with = "right_click")]
+    pub double_click: bool,
+
+    /// Right-click instead of left click
+    #[arg(long)]
+    pub right_click: bool,
 }

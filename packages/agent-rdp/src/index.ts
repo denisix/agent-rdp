@@ -42,6 +42,8 @@ import {
   ClipboardSetOptions,
   LocateOptions,
   LocateClickResult,
+  ClickAtOptions,
+  ClickAtResult,
   OcrMatch,
   Request,
   Response,
@@ -446,6 +448,7 @@ export class RdpSession {
       type: 'locate',
       text: options.text ?? '',
       pattern: options.pattern ?? false,
+      exact: options.exact ?? false,
       ignore_case: !(options.caseSensitive ?? false),
       all: options.all ?? false,
       ...(options.region ? { region: options.region } : {}),
@@ -493,6 +496,48 @@ export class RdpSession {
     await this._send({ type: 'mouse', action, x: target.center_x, y: target.center_y });
 
     return { clicked: true, text: target.text, x: target.center_x, y: target.center_y };
+  }
+
+  /**
+   * Click a known point, refusing if it's ambiguously close to more than one
+   * detected text region.
+   *
+   * The safety net for coordinates computed outside agent-rdp - a vision
+   * model reading a screenshot, a manual crop - where `locate({ click })`
+   * can't be used. Uses OCR *detection* (bounding boxes) only, so it works
+   * even for text OCR recognition can't read.
+   *
+   * Returns the result including any nearby regions; `clicked: false` with a
+   * populated `nearby` array means the click was refused as ambiguous.
+   *
+   * @example
+   * ```typescript
+   * const result = await rdp.clickAt(665, 209);
+   * if (!result.clicked) {
+   *   console.log('Ambiguous:', result.nearby);
+   * }
+   * ```
+   */
+  async clickAt(x: number, y: number, options: ClickAtOptions = {}): Promise<ClickAtResult> {
+    const response = await this._send({
+      type: 'click_at',
+      x,
+      y,
+      window_width: options.windowWidth ?? 400,
+      window_height: options.windowHeight ?? 160,
+      min_gap: options.minGap ?? 10,
+      double_click: options.doubleClick ?? false,
+      right_click: options.rightClick ?? false,
+    });
+
+    const data = response.data as unknown as { type: 'click_at_result' } & ClickAtResult;
+    return {
+      clicked: data.clicked,
+      x: data.x,
+      y: data.y,
+      matched_text: data.matched_text,
+      nearby: data.nearby ?? [],
+    };
   }
 
   /**

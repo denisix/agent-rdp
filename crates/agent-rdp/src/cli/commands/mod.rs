@@ -29,6 +29,30 @@ pub fn parse_region(s: &str) -> Result<Region, String> {
     Ok(Region { x, y, width, height })
 }
 
+/// Parse a `--window WIDTHxHEIGHT` argument (e.g. `400x160`).
+pub fn parse_window(s: &str) -> Result<(u32, u32), String> {
+    let parts: Vec<&str> = s.split('x').map(str::trim).collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "expected WIDTHxHEIGHT (e.g. 400x160), got '{}'",
+            s
+        ));
+    }
+
+    let width: u32 = parts[0]
+        .parse()
+        .map_err(|_| format!("'{}' is not a non-negative integer", parts[0]))?;
+    let height: u32 = parts[1]
+        .parse()
+        .map_err(|_| format!("'{}' is not a non-negative integer", parts[1]))?;
+
+    if width == 0 || height == 0 {
+        return Err("width and height must be greater than zero".to_string());
+    }
+
+    Ok((width, height))
+}
+
 pub mod automate;
 pub mod clipboard;
 pub mod connect;
@@ -131,5 +155,23 @@ mod tests {
         // the format rather than just saying "invalid".
         let err = parse_region("1,2,3").unwrap_err();
         assert!(err.contains("X,Y,WIDTH,HEIGHT"), "unhelpful message: {}", err);
+    }
+
+    #[test]
+    fn test_parse_window_valid() {
+        assert_eq!(parse_window("400x160"), Ok((400, 160)));
+        assert_eq!(parse_window(" 400 x 160 "), Ok((400, 160)));
+        assert_eq!(parse_window("1x1"), Ok((1, 1)));
+    }
+
+    #[test]
+    fn test_parse_window_rejects_bad_input() {
+        assert!(parse_window("400").is_err());
+        assert!(parse_window("400x160x2").is_err());
+        assert!(parse_window("400,160").is_err());
+        assert!(parse_window("0x160").is_err());
+        assert!(parse_window("400x0").is_err());
+        assert!(parse_window("wxh").is_err());
+        assert!(parse_window("").is_err());
     }
 }
