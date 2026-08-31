@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.8](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.7...agent-rdp-rust-v0.7.8) (2026-08-31)
+
+
+### Features
+
+* add locate --near and click-at --confirm cross-check ([e14437f](https://github.com/denisix/agent-rdp/commit/e14437f798bf147f8b57e707885ca41bb57f4d14))
+
+
+### Bug Fixes
+
+* detect dead RDP transport quickly, add automation diagnostics and restart ([ec71ab1](https://github.com/denisix/agent-rdp/commit/ec71ab157a445ecebe50526a4f0fff5336b845db))
+
 ## [0.7.7](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.6...agent-rdp-rust-v0.7.7) (2026-08-31)
 
 

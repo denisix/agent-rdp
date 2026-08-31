@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.8](https://github.com/denisix/agent-rdp/compare/darwin-x64-v0.7.7...darwin-x64-v0.7.8) (2026-08-31)
+
+
+### Miscellaneous Chores
+
+* **darwin-x64:** Synchronize agent-rdp packages versions
+
 ## [0.7.7](https://github.com/denisix/agent-rdp/compare/darwin-x64-v0.7.6...darwin-x64-v0.7.7) (2026-08-31)
 
 
