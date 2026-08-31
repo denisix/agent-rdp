@@ -41,6 +41,7 @@ import {
   KeyboardPressOptions,
   ClipboardSetOptions,
   LocateOptions,
+  LocateClickResult,
   OcrMatch,
   Request,
   Response,
@@ -128,6 +129,27 @@ export class KeyboardController {
   /** Press a key combination (e.g., 'ctrl+c', 'alt+tab') or single key (e.g., 'enter'). */
   async press(options: KeyboardPressOptions): Promise<void> {
     await this.rdp._send({ type: 'keyboard', action: 'press', keys: options.keys });
+  }
+
+  /** Press and hold a key without releasing it (for shift-click, hold-and-drag, ...). */
+  async down(key: string): Promise<void> {
+    await this.rdp._send({ type: 'keyboard', action: 'key_down', key });
+  }
+
+  /** Release a key previously held with `down`. */
+  async up(key: string): Promise<void> {
+    await this.rdp._send({ type: 'keyboard', action: 'key_up', key });
+  }
+
+  /**
+   * Set the clipboard to `text` and paste it with Ctrl+V, as one command.
+   *
+   * More reliable than `type` for long or non-Latin text: it cannot lose
+   * individual keystrokes, and setting the clipboard then pasting in one
+   * daemon-side command means focus cannot move in between.
+   */
+  async paste(text: string): Promise<void> {
+    await this.rdp._send({ type: 'keyboard', action: 'paste', text });
   }
 }
 
@@ -298,6 +320,7 @@ export class RdpSession {
     const response = await this._send({
       type: 'screenshot',
       format: options.format ?? 'png',
+      ...(options.region ? { region: options.region } : {}),
     });
 
     const data = response.data as {
@@ -306,7 +329,14 @@ export class RdpSession {
       height: number;
       format: string;
       base64: string;
+      offset_x?: number;
+      offset_y?: number;
     };
+
+    // A full-desktop capture has no offset; report 0 rather than undefined so
+    // callers can add it unconditionally.
+    const offsetX = data.offset_x ?? 0;
+    const offsetY = data.offset_y ?? 0;
 
     if (options.path) {
       fs.writeFileSync(options.path, Buffer.from(data.base64, 'base64'));
@@ -315,6 +345,8 @@ export class RdpSession {
         width: data.width,
         height: data.height,
         format: data.format,
+        offsetX,
+        offsetY,
       };
     }
 
@@ -323,7 +355,21 @@ export class RdpSession {
       width: data.width,
       height: data.height,
       format: data.format,
+      offsetX,
+      offsetY,
     };
+  }
+
+  /**
+   * Wait for the given number of milliseconds.
+   *
+   * A plain client-side sleep - no daemon round-trip. Prefer
+   * `locate({ text, waitMs, ... })` when you are actually waiting on
+   * something appearing on screen: it blocks server-side and returns as soon
+   * as the text shows up, instead of guessing a fixed delay.
+   */
+  async wait(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -361,7 +407,12 @@ export class RdpSession {
    * @param options.all If true, returns all text on screen
    * @param options.pattern Use glob-style pattern matching (* and ?)
    * @param options.caseSensitive Case-sensitive matching (default: false)
+   * @param options.region Search only part of the screen (results stay in
+   *   full-screen coordinates)
    * @returns Array of matching text lines with coordinates
+   *
+   * Coordinates come back in screen pixels, ready to click. Never estimate a
+   * coordinate by looking at a screenshot — use these, or `automation.click()`.
    *
    * @example
    * ```typescript
@@ -374,21 +425,74 @@ export class RdpSession {
    * // Pattern matching
    * const saveButtons = await rdp.locate({ text: 'Save*', pattern: true });
    *
+   * // Read one table row - a tight region reads more reliably, and the
+   * // coordinates are still full-screen ones
+   * const row = await rdp.locate({ all: true, region: { x: 100, y: 380, width: 600, height: 30 } });
+   *
    * // Get all text on screen
    * const allLines = await rdp.locate({ all: true });
+   *
+   * // Click a match without the coordinate passing through your code
+   * await rdp.locate({ text: 'Добавить', click: 'left' });
+   *
+   * // Block until a dialog's text appears, instead of polling in a loop
+   * const ok = await rdp.locate({ text: 'OK', waitMs: 10000, click: 'left' });
    * ```
    */
-  async locate(options: LocateOptions): Promise<OcrMatch[]> {
+  async locate(options: LocateOptions & { click: 'left' | 'double' | 'right' }): Promise<LocateClickResult>;
+  async locate(options: LocateOptions): Promise<OcrMatch[]>;
+  async locate(options: LocateOptions): Promise<OcrMatch[] | LocateClickResult> {
     const response = await this._send({
       type: 'locate',
       text: options.text ?? '',
       pattern: options.pattern ?? false,
       ignore_case: !(options.caseSensitive ?? false),
       all: options.all ?? false,
+      ...(options.region ? { region: options.region } : {}),
+      ...(options.waitMs !== undefined ? { wait_ms: options.waitMs } : {}),
     });
 
     const data = response.data as { matches: OcrMatch[] };
-    return data.matches ?? [];
+    const matches = data.matches ?? [];
+
+    if (!options.click) {
+      return matches;
+    }
+
+    // Clicking is deliberately strict: no match, or several matches without
+    // `index`, is an error rather than a guess - the wrong one of several
+    // identically-named controls is worse than not clicking at all.
+    if (matches.length === 0) {
+      throw new RdpError(
+        'invalid_request',
+        `No text matching '${options.text ?? ''}' found`,
+      );
+    }
+
+    let target: OcrMatch;
+    if (options.index !== undefined) {
+      const m = matches[options.index];
+      if (!m) {
+        throw new RdpError(
+          'invalid_request',
+          `index ${options.index} is out of range: only ${matches.length} match(es) found`,
+        );
+      }
+      target = m;
+    } else if (matches.length === 1) {
+      target = matches[0]!;
+    } else {
+      throw new RdpError(
+        'invalid_request',
+        `${matches.length} matches found - pass index to choose one, or narrow the search with region`,
+      );
+    }
+
+    const action =
+      options.click === 'double' ? 'double_click' : options.click === 'right' ? 'right_click' : 'click';
+    await this._send({ type: 'mouse', action, x: target.center_x, y: target.center_y });
+
+    return { clicked: true, text: target.text, x: target.center_x, y: target.center_y };
   }
 
   /**

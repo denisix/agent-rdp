@@ -51,7 +51,18 @@ format: string,
 /**
  * Base64-encoded image data.
  */
-base64: string, } | { "type": "clipboard", 
+base64: string, 
+/**
+ * X offset of the image within the full desktop (region captures only).
+ *
+ * Add this to an x coordinate read off the image to get a coordinate
+ * that can be clicked.
+ */
+offset_x?: number, 
+/**
+ * Y offset of the image within the full desktop (region captures only).
+ */
+offset_y?: number, } | { "type": "clipboard", 
 /**
  * Text content.
  */

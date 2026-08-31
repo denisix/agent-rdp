@@ -86,9 +86,24 @@ export interface ConnectResult {
   height: number;
 }
 
+/**
+ * A rectangular part of the screen, in screen pixels.
+ *
+ * Coordinates a region request reports back are always translated into
+ * full-screen space, so they can be passed straight to `mouse.click()`.
+ */
+export interface ScreenRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /** Options for taking a screenshot. */
 export interface ScreenshotOptions {
   format?: 'png' | 'jpeg';
+  /** Capture only this part of the screen instead of the whole desktop. */
+  region?: ScreenRegion;
   /**
    * Write the image to this file path instead of returning it as base64.
    * Use this when the caller doesn't need the raw image bytes in memory
@@ -105,6 +120,10 @@ export interface ScreenshotFileResult {
   width: number;
   height: number;
   format: string;
+  /** X offset of the image within the full desktop (0 unless `region` was used). */
+  offsetX: number;
+  /** Y offset of the image within the full desktop (0 unless `region` was used). */
+  offsetY: number;
 }
 
 /** Result of a screenshot operation returned as base64. */
@@ -113,6 +132,10 @@ export interface ScreenshotResult {
   width: number;
   height: number;
   format: string;
+  /** X offset of the image within the full desktop (0 unless `region` was used). */
+  offsetX: number;
+  /** Y offset of the image within the full desktop (0 unless `region` was used). */
+  offsetY: number;
 }
 
 /** A point representing x,y coordinates. */
@@ -177,6 +200,40 @@ export interface LocateOptions {
   pattern?: boolean;
   /** Case-sensitive matching (default: false). */
   caseSensitive?: boolean;
+  /**
+   * Search only this part of the screen. A tight region also reads more
+   * reliably than a full-screen pass. Match coordinates stay in full-screen
+   * space.
+   */
+  region?: ScreenRegion;
+  /**
+   * Keep retrying until the text appears, up to this many milliseconds.
+   * Blocks server-side instead of polling `locate` in a loop from the
+   * outside. Ignored when `all` is true - there is no target text to wait
+   * for.
+   */
+  waitMs?: number;
+  /**
+   * Click the match instead of just returning its position. Never estimate
+   * a coordinate by reading a screenshot - use this, or `automation.click()`.
+   */
+  click?: 'left' | 'double' | 'right';
+  /**
+   * Which match to click when several are found (0-based). Required
+   * whenever `click` is set and more than one match comes back - clicking
+   * the wrong one of several identically-named controls is worse than not
+   * clicking at all, so an ambiguous match throws rather than guessing.
+   */
+  index?: number;
+}
+
+/** Result of `locate()` when `click` is set. */
+export interface LocateClickResult {
+  clicked: true;
+  /** Text of the match that was clicked. */
+  text: string;
+  x: number;
+  y: number;
 }
 
 // --- Automation convenience types (aliases for backwards compatibility) ---

@@ -5,6 +5,7 @@
 import type { RdpSession } from './index.js';
 import type {
   AutomationSnapshot,
+  AutomationElement,
   AutomationElementValue,
   AutomationWindowInfo,
   AutomationStatus,
@@ -22,6 +23,13 @@ export interface SnapshotOptions {
   depth?: number;
   /** Scope to a specific element (window, panel, etc.) via selector. */
   selector?: string;
+  /**
+   * Start from the currently focused element instead of the desktop root.
+   * Prefer `automation.focused()` for "what has focus right now" - it also
+   * picks safe defaults for `interactive`/`compact`, which can otherwise
+   * prune the focused element itself away.
+   */
+  focused?: boolean;
 }
 
 export interface GetOptions {
@@ -127,10 +135,37 @@ export class AutomationController {
       compact: options.compact ?? false,
       max_depth: options.depth ?? 10,
       selector: options.selector,
-      focused: false,
+      focused: options.focused ?? false,
     };
     const response = await this.rdp._send(request);
     return response.data as unknown as AutomationSnapshot;
+  }
+
+  /**
+   * Get the element that currently has keyboard focus.
+   *
+   * Use this after `keyboard.press('tab')` or similar to confirm which field
+   * the keystrokes will actually land in before typing into it - an app's Tab
+   * order is its own business and cannot be predicted from the outside.
+   *
+   * Deliberately not compact and not interactive-only: both filters can prune
+   * the focused element itself, and the element most likely to be pruned - an
+   * unnamed container with no value - is exactly the half-edited form field
+   * this method exists to identify.
+   */
+  async focused(): Promise<AutomationElement> {
+    const request = {
+      type: 'automate' as const,
+      op: 'snapshot' as const,
+      interactive_only: false,
+      compact: false,
+      max_depth: 1,
+      selector: undefined,
+      focused: true,
+    };
+    const response = await this.rdp._send(request);
+    const snapshot = response.data as unknown as AutomationSnapshot;
+    return snapshot.root;
   }
 
   /**

@@ -27,6 +27,7 @@ export type { MappedDrive } from './MappedDrive.js';
 export type { MouseButton } from './MouseButton.js';
 export type { MouseRequest } from './MouseRequest.js';
 export type { OcrMatch } from './OcrMatch.js';
+export type { Region } from './Region.js';
 export type { Request } from './Request.js';
 export type { Response } from './Response.js';
 export type { ResponseData } from './ResponseData.js';
