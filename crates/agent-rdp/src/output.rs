@@ -200,8 +200,12 @@ impl Output {
                 }
             }
             ResponseData::RunResult(result) => {
+                // Status lines go to stderr so stdout carries only what the
+                // remote command actually printed - otherwise every parser
+                // has to strip an "Exit code: 0" line the program never
+                // produced.
                 if let Some(code) = result.exit_code {
-                    println!("Exit code: {}", code);
+                    eprintln!("Exit code: {}", code);
                 }
                 if let Some(ref stdout) = result.stdout {
                     if !stdout.is_empty() {
@@ -214,7 +218,7 @@ impl Output {
                     }
                 }
                 if let Some(pid) = result.pid {
-                    println!("Process ID: {}", pid);
+                    eprintln!("Process ID: {}", pid);
                 }
             }
             ResponseData::RunPollResult(result) => {
@@ -225,7 +229,7 @@ impl Output {
                     eprintln!("{}", result.stderr_chunk);
                 }
                 if result.exited {
-                    println!(
+                    eprintln!(
                         "Process {} exited{}",
                         result.pid,
                         result
@@ -259,6 +263,13 @@ impl Output {
                         result.y
                     );
                 }
+            }
+            ResponseData::FileTransferResult(result) => {
+                println!(
+                    "Transferred {} bytes to {} in {} chunk(s)",
+                    result.bytes, result.path, result.chunks
+                );
+                println!("SHA-256: {}", result.sha256);
             }
             ResponseData::ClickResult(result) => {
                 if result.method == "double_click" {

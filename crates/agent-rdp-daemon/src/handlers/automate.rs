@@ -8,7 +8,7 @@ use agent_rdp_protocol::{
     WindowAction, WindowInfo,
 };
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::automation::{AutomationBootstrap, SharedAutomationState};
 use crate::rdp_session::RdpSession;
@@ -117,24 +117,136 @@ pub async fn handle(
     let ipc = dvc_ipc.clone();
     drop(state);
 
-    // Send request to PowerShell agent via DVC
-    match ipc.send_request(&request).await {
+    // Send request to PowerShell agent via DVC, giving commands that carry
+    // their own budget the time they asked for.
+    let response_timeout = request_timeout(&request, ipc.default_timeout());
+    match ipc.send_request_with_timeout(&request, response_timeout).await {
         Ok(data) => convert_response(request, data, &ipc),
         Err(e) => {
             // A lost reply is not the same as a failed action - surface it under
             // its own code so callers can avoid retrying into a double-apply.
-            if e.downcast_ref::<crate::automation::DvcIndeterminate>().is_some() {
+            if let Some(indeterminate) =
+                e.downcast_ref::<crate::automation::DvcIndeterminate>()
+            {
                 error!("Automation request outcome unknown: {}", e);
-                let message = if is_read_only(&request) {
-                    format!("{} This command is read-only - retrying is safe.", e)
-                } else {
-                    e.to_string()
-                };
-                return Response::error(ErrorCode::AutomationIndeterminate, message);
+                return resolve_indeterminate(&ipc, &request, &indeterminate.request_id, &e).await;
             }
             error!("Automation request failed: {}", e);
             Response::error(ErrorCode::AutomationError, stale_ref_hint(e.to_string()))
         }
+    }
+}
+
+/// Turn "we don't know what happened" into a definite answer where possible.
+///
+/// The agent keeps the results of the last few requests, so once it is
+/// answering again it can say whether a given request ever ran. That matters
+/// most for the case this whole error exists to protect: a mutating command
+/// whose acknowledgement was lost, where retrying blindly risks applying it
+/// twice and not retrying risks skipping it entirely.
+async fn resolve_indeterminate(
+    ipc: &crate::automation::DvcIpc,
+    request: &AutomateRequest,
+    request_id: &str,
+    original: &anyhow::Error,
+) -> Response {
+    if !ipc.capabilities().iter().any(|c| c == "query_result") {
+        // Older agent - nothing to ask.
+        return Response::error(
+            ErrorCode::AutomationIndeterminate,
+            indeterminate_message(request, original),
+        );
+    }
+
+    let query = AutomateRequest::QueryResult { id: request_id.to_string() };
+
+    // The agent is single-threaded: if it is still executing the original
+    // command, the query queues behind it and answers once it frees up.
+    // Retrying with backoff is what turns "busy" into an answer rather than
+    // a second unknown.
+    for attempt in 1..=QUERY_RESULT_ATTEMPTS {
+        match ipc.send_request_with_timeout(&query, QUERY_RESULT_TIMEOUT).await {
+            Ok(value) => {
+                if value["known"].as_bool().unwrap_or(false) {
+                    info!(
+                        "Recovered the outcome of request {} from the agent's journal",
+                        request_id
+                    );
+                    if value["success"].as_bool().unwrap_or(false) {
+                        let data = value.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                        return convert_response(request.clone(), data, ipc);
+                    }
+                    let message = value["error"]["message"]
+                        .as_str()
+                        .unwrap_or("the command failed on the agent")
+                        .to_string();
+                    return Response::error(ErrorCode::AutomationError, stale_ref_hint(message));
+                }
+
+                // The agent is responsive and has no record of it, so it
+                // never ran - the one case where retrying is unambiguously
+                // safe, and worth saying outright.
+                return Response::error(
+                    ErrorCode::AutomationError,
+                    format!(
+                        "The automation agent never received request {} - it did not run, so                          retrying is safe.",
+                        request_id
+                    ),
+                );
+            }
+            Err(_) if attempt < QUERY_RESULT_ATTEMPTS => {
+                tokio::time::sleep(QUERY_RESULT_BACKOFF * attempt).await;
+            }
+            Err(_) => break,
+        }
+    }
+
+    // Still busy: the original command is most likely still running.
+    Response::error(
+        ErrorCode::AutomationIndeterminate,
+        format!(
+            "{} The agent is still busy; once it responds, the outcome of request {} can be              recovered rather than guessed.",
+            indeterminate_message(request, original),
+            request_id
+        ),
+    )
+}
+
+/// How many times to ask the agent about a lost request before giving up.
+const QUERY_RESULT_ATTEMPTS: u32 = 3;
+
+/// Deadline for a single journal lookup.
+const QUERY_RESULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Base backoff between lookups, multiplied by the attempt number.
+const QUERY_RESULT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn indeterminate_message(request: &AutomateRequest, error: &anyhow::Error) -> String {
+    if is_read_only(request) {
+        format!("{} This command is read-only - retrying is safe.", error)
+    } else {
+        error.to_string()
+    }
+}
+
+/// How long to wait for the agent's reply to a given request.
+///
+/// Most commands are fast and keep the default ceiling. `run --wait` and
+/// `wait-for` carry an explicit budget for how long the *remote* work may
+/// take; the DVC reply cannot arrive before that work finishes, so the
+/// transport deadline has to cover it plus room for the round trip itself.
+/// Without this every long command reported `indeterminate` at the default
+/// while the agent was still dutifully running it.
+fn request_timeout(request: &AutomateRequest, default: std::time::Duration) -> std::time::Duration {
+    let command_budget_ms = match request {
+        AutomateRequest::Run { wait: true, timeout_ms, .. } => Some(*timeout_ms),
+        AutomateRequest::WaitFor { timeout_ms, .. } => Some(*timeout_ms),
+        _ => None,
+    };
+
+    match command_budget_ms {
+        Some(ms) => std::time::Duration::from_millis(ms).saturating_add(default),
+        None => default,
     }
 }
 
@@ -218,6 +330,53 @@ mod is_read_only_tests {
     fn unrelated_errors_are_left_alone() {
         let message = "command_failed: invalid parameter".to_string();
         assert_eq!(stale_ref_hint(message.clone()), message);
+    }
+
+    fn run_request(wait: bool, timeout_ms: u64) -> AutomateRequest {
+        AutomateRequest::Run {
+            command: "build.cmd".into(),
+            args: Vec::new(),
+            wait,
+            hidden: false,
+            timeout_ms,
+            shell: None,
+            stream: false,
+        }
+    }
+
+    #[test]
+    fn long_run_wait_gets_its_full_budget_plus_transport_slack() {
+        let default = std::time::Duration::from_secs(10);
+        // A 4-minute command must not be cut off at the 10s default.
+        let got = request_timeout(&run_request(true, 240_000), default);
+        assert_eq!(got, std::time::Duration::from_secs(250));
+    }
+
+    #[test]
+    fn wait_for_gets_its_budget_too() {
+        let default = std::time::Duration::from_secs(10);
+        let request = AutomateRequest::WaitFor {
+            selector: "@e1".into(),
+            timeout_ms: 60_000,
+            state: agent_rdp_protocol::WaitState::Visible,
+        };
+        assert_eq!(request_timeout(&request, default), std::time::Duration::from_secs(70));
+    }
+
+    #[test]
+    fn fire_and_forget_run_keeps_the_default() {
+        let default = std::time::Duration::from_secs(10);
+        // Without --wait the agent replies immediately, so the long
+        // process timeout is irrelevant to the transport deadline.
+        assert_eq!(request_timeout(&run_request(false, 240_000), default), default);
+    }
+
+    #[test]
+    fn ordinary_commands_keep_the_default() {
+        let default = std::time::Duration::from_secs(10);
+        let request = AutomateRequest::Click { selector: "@e1".into(), double_click: false };
+        assert_eq!(request_timeout(&request, default), default);
+        assert_eq!(request_timeout(&AutomateRequest::Status, default), default);
     }
 }
 

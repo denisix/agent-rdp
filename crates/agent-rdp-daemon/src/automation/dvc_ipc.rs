@@ -61,9 +61,9 @@ impl DvcIpc {
         }
     }
 
-    /// Set the timeout for responses.
-    pub fn set_timeout(&mut self, timeout: Duration) {
-        self.timeout = timeout;
+    /// Timeout applied to requests that don't specify their own.
+    pub fn default_timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// Get the number of consecutive failures.
@@ -128,8 +128,25 @@ impl DvcIpc {
             .unwrap_or_default()
     }
 
-    /// Send a request to the PowerShell agent and wait for response.
+    /// Send a request to the PowerShell agent and wait for response, using
+    /// the default timeout.
     pub async fn send_request(&self, request: &AutomateRequest) -> anyhow::Result<serde_json::Value> {
+        self.send_request_with_timeout(request, self.timeout).await
+    }
+
+    /// Send a request with an explicit response deadline.
+    ///
+    /// Commands that legitimately take minutes - `run --wait` against a long
+    /// build, `wait-for` on a slow dialog - carry their own budget, and the
+    /// agent is still working on them well past the default. Holding every
+    /// request to one fixed ceiling meant those reported `indeterminate` at
+    /// 10s while the command ran on to completion, which is both a false
+    /// failure and the most dangerous answer to give about a mutating action.
+    pub async fn send_request_with_timeout(
+        &self,
+        request: &AutomateRequest,
+        response_timeout: Duration,
+    ) -> anyhow::Result<serde_json::Value> {
         let request_id = Uuid::new_v4().to_string()[..8].to_string();
 
         // Convert AutomateRequest to command name and params
@@ -184,7 +201,7 @@ impl DvcIpc {
         let sent_at = std::time::Instant::now();
 
         // Wait for response with timeout
-        let response = match timeout(self.timeout, rx).await {
+        let response = match timeout(response_timeout, rx).await {
             Ok(Ok(response)) => {
                 self.reset_failures();
                 self.last_rtt_ms.store(

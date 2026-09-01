@@ -184,6 +184,52 @@ pub enum AutomateRequest {
 
     /// Get automation agent status.
     Status,
+
+    /// Write one chunk of a file on the remote machine.
+    FileWriteChunk {
+        /// Destination path on the remote machine.
+        path: String,
+        /// Base64-encoded chunk bytes.
+        data_b64: String,
+        /// Truncate before writing (first chunk of a transfer).
+        #[serde(default)]
+        first: bool,
+        /// Last chunk - triggers hash verification.
+        #[serde(default)]
+        last: bool,
+        /// Expected SHA-256 of the complete file, checked when `last`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        sha256: Option<String>,
+    },
+
+    /// Read one chunk of a file from the remote machine.
+    FileReadChunk {
+        /// Source path on the remote machine.
+        path: String,
+        /// Byte offset to read from.
+        #[ts(type = "number")]
+        offset: u64,
+        /// Maximum bytes to read.
+        #[ts(type = "number")]
+        length: u64,
+    },
+
+    /// Size/hash/existence of a path on the remote machine.
+    FileStat {
+        /// Path on the remote machine.
+        path: String,
+    },
+
+    /// Ask the agent what it did with an earlier request.
+    ///
+    /// Answers the question a lost DVC reply leaves open: whether a command
+    /// ran. The agent keeps the last few results, so "unknown id" once it is
+    /// responding again means the request never executed.
+    QueryResult {
+        /// Id of the request to look up.
+        id: String,
+    },
 }
 
 fn default_max_depth() -> u32 {

@@ -188,6 +188,25 @@ pub enum ResponseData {
 
     /// Result of a `ClickAt` request.
     ClickAtResult(ClickAtResult),
+
+    /// Result of a file push/pull.
+    FileTransferResult(FileTransferResult),
+}
+
+/// Outcome of a file transfer in either direction.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct FileTransferResult {
+    /// Path written on the destination machine.
+    pub path: String,
+    /// Bytes transferred.
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// SHA-256 of the transferred file, verified on both ends.
+    pub sha256: String,
+    /// Number of chunks the transfer was split into.
+    #[ts(type = "number")]
+    pub chunks: u64,
 }
 
 /// Session information.

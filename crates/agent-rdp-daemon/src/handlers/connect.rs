@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::automation::{AutomationBootstrap, SharedAutomationState};
 use crate::daemon::{ClipboardChangedRx, SharedWsHandle};
-use crate::rdp_session::{DisconnectNotify, RdpConfig, RdpSession};
+use crate::rdp_session::{RdpConfig, RdpSession};
 use crate::ws_server::{WsServer, WsServerConfig};
 
 /// Handle a connect request.
@@ -17,8 +17,9 @@ pub async fn handle(
     automation_state: &SharedAutomationState,
     ws_handle: &SharedWsHandle,
     params: ConnectRequest,
-    disconnect_notify: DisconnectNotify,
+    disconnect_tx: tokio::sync::mpsc::Sender<u64>,
     clipboard_changed_rx: &ClipboardChangedRx,
+    session_generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Response {
     let enable_automation = params.enable_win_automation;
     let stream_port = params.stream_port;
@@ -127,8 +128,14 @@ pub async fn handle(
         automation_dvc_state,
     };
 
+    // Claim a fresh generation for the session about to be created. Anything
+    // the *previous* session's frame processor reports from here on is
+    // stale by definition, and the daemon will discard it rather than tear
+    // down the session we are establishing right now.
+    let generation = session_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
     // Attempt connection
-    let rdp = match RdpSession::connect(config, Some(disconnect_notify)).await {
+    let rdp = match RdpSession::connect(config, Some((disconnect_tx, generation))).await {
         Ok(rdp) => rdp,
         Err(e) => {
             let code = match &e {

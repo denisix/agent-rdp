@@ -34,6 +34,7 @@ import {
   ScreenshotFileResult,
   SessionInfo,
   MappedDrive,
+  FileTransferResult,
   MouseClickOptions,
   MouseDragOptions,
   ScrollOptions,
@@ -216,6 +217,38 @@ export class DriveController {
 }
 
 /**
+ * File transfer controller.
+ *
+ * Moves files in verified chunks over the automation channel, so it requires
+ * connecting with `enableWinAutomation`. Prefer it over writing file content
+ * through the clipboard or reaching for `\\TSCLIENT` paths - both stall on
+ * payloads of any real size.
+ */
+export class FileController {
+  constructor(private rdp: RdpSession) {}
+
+  /** Copy a local file to the remote machine. */
+  async push(localPath: string, remotePath: string): Promise<FileTransferResult> {
+    const response = await this.rdp._send({
+      type: 'file_push',
+      local_path: localPath,
+      remote_path: remotePath,
+    });
+    return response.data as unknown as FileTransferResult;
+  }
+
+  /** Copy a file from the remote machine. */
+  async pull(remotePath: string, localPath: string): Promise<FileTransferResult> {
+    const response = await this.rdp._send({
+      type: 'file_pull',
+      remote_path: remotePath,
+      local_path: localPath,
+    });
+    return response.data as unknown as FileTransferResult;
+  }
+}
+
+/**
  * Main RDP session class.
  */
 export class RdpSession {
@@ -229,6 +262,8 @@ export class RdpSession {
   readonly clipboard: ClipboardController;
   /** Drive controller. */
   readonly drives: DriveController;
+  /** File transfer controller. */
+  readonly files: FileController;
   /** Automation controller for Windows UI Automation. */
   readonly automation: AutomationController;
 
@@ -255,6 +290,7 @@ export class RdpSession {
     this.scroll = new ScrollController(this);
     this.clipboard = new ClipboardController(this);
     this.drives = new DriveController(this);
+    this.files = new FileController(this);
     this.automation = new AutomationController(this);
   }
 

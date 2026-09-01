@@ -4,6 +4,7 @@ import type { AutomationStatus } from "./AutomationStatus.js";
 import type { ClickAtResult } from "./ClickAtResult.js";
 import type { ClickResult } from "./ClickResult.js";
 import type { ElementValue } from "./ElementValue.js";
+import type { FileTransferResult } from "./FileTransferResult.js";
 import type { LocateResult } from "./LocateResult.js";
 import type { MappedDrive } from "./MappedDrive.js";
 import type { RunPollResult } from "./RunPollResult.js";
@@ -110,4 +111,4 @@ sessions: Array<SessionSummary>, } | { "type": "pong" } | { "type": "snapshot" }
 /**
  * List of windows.
  */
-windows: Array<WindowInfo>, } | { "type": "automation_status" } & AutomationStatus | { "type": "run_result" } & RunResult | { "type": "run_poll_result" } & RunPollResult | { "type": "click_result" } & ClickResult | { "type": "locate_result" } & LocateResult | { "type": "click_at_result" } & ClickAtResult;
+windows: Array<WindowInfo>, } | { "type": "automation_status" } & AutomationStatus | { "type": "run_result" } & RunResult | { "type": "run_poll_result" } & RunPollResult | { "type": "click_result" } & ClickResult | { "type": "locate_result" } & LocateResult | { "type": "click_at_result" } & ClickAtResult | { "type": "file_transfer_result" } & FileTransferResult;

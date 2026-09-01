@@ -571,7 +571,16 @@ function Invoke-Run {
     # `Test-Path "C:\Program Files\x"` was torn apart before PowerShell saw it,
     # and even backtick-escaping spaces still failed on literal parentheses like
     # `(x86)`. -EncodedCommand removes the command-line quoting layer entirely.
-    $script = if ($commandArgs) { "$command $commandArgs" } else { $command }
+    $userScript = if ($commandArgs) { "$command $commandArgs" } else { $command }
+
+    # Progress records render into redirected stdout, so module autoloading
+    # ("Preparing modules for first use...") lands in the middle of the
+    # output a caller is trying to parse. Forcing UTF-8 on the child's own
+    # console output keeps non-ASCII text intact: the default is the OEM
+    # codepage, which turns Cyrillic into mojibake on its way back to us.
+    $prelude = "$ProgressPreference='SilentlyContinue';" +
+               "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+    $script = $prelude + $userScript
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -582,6 +591,13 @@ function Invoke-Run {
     $startInfo.RedirectStandardOutput = $wait -or $stream
     $startInfo.RedirectStandardError = $wait -or $stream
     $startInfo.CreateNoWindow = $hidden
+    # Decode the child's output as UTF-8. Left unset, .NET decodes using the
+    # console's OEM codepage (cp866 on a Russian-locale host), which is where
+    # Cyrillic output came back as mojibake regardless of what the child sent.
+    if ($wait -or $stream) {
+        $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
+        $startInfo.StandardErrorEncoding = [Text.Encoding]::UTF8
+    }
 
     $process = [System.Diagnostics.Process]::Start($startInfo)
 
@@ -747,5 +763,189 @@ function Get-AgentStatus {
             "context_menu", "focus", "get", "fill", "clear",
             "scroll", "window", "run", "wait_for", "status"
         )
+    }
+}
+
+# ============ FILE TRANSFER ============
+#
+# Byte-oriented on purpose. Text-mode reads/writes re-encode the payload
+# through the console codepage, which corrupts anything that isn't plain
+# ASCII - the reason transferring files by pasting text through the clipboard
+# or Add-Content mangled non-Latin content. Base64 keeps the DVC message
+# JSON-safe; the bytes either side of it are never reinterpreted.
+
+function Invoke-FileWriteChunk {
+    param($Params)
+
+    $path = $Params.path
+    if (-not $path) { throw "file_write_chunk requires 'path'" }
+
+    $data = [Convert]::FromBase64String($Params.data_b64)
+
+    # first=true truncates, so a retried or restarted transfer cannot append
+    # onto a partial file left by an earlier attempt.
+    if ($Params.first) {
+        $dir = Split-Path -Parent $path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        [System.IO.File]::WriteAllBytes($path, $data)
+    } else {
+        $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
+        try {
+            $stream.Write($data, 0, $data.Length)
+        } finally {
+            $stream.Close()
+        }
+    }
+
+    $result = @{
+        bytes_written = $data.Length
+        total_size = (Get-Item -LiteralPath $path).Length
+    }
+
+    # Verify on the final chunk: a transfer that silently lost or duplicated
+    # a chunk is worse than one that fails, because the caller acts on a file
+    # it believes is correct.
+    if ($Params.last) {
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower()
+        $result.sha256 = $hash
+        if ($Params.sha256 -and $Params.sha256.ToLower() -ne $hash) {
+            throw "Transfer verification failed for '$path': expected $($Params.sha256), got $hash"
+        }
+    }
+
+    return $result
+}
+
+function Invoke-FileReadChunk {
+    param($Params)
+
+    $path = $Params.path
+    if (-not $path) { throw "file_read_chunk requires 'path'" }
+    if (-not (Test-Path -LiteralPath $path)) { throw "File not found: $path" }
+
+    $offset = [int64]$Params.offset
+    $length = [int]$Params.length
+
+    $stream = [System.IO.File]::OpenRead($path)
+    try {
+        $total = $stream.Length
+        if ($offset -ge $total) {
+            return @{ data_b64 = ""; bytes_read = 0; total_size = $total; eof = $true }
+        }
+
+        $stream.Seek($offset, [System.IO.SeekOrigin]::Begin) | Out-Null
+        $remaining = $total - $offset
+        if ($length -gt $remaining) { $length = [int]$remaining }
+
+        $buffer = New-Object byte[] $length
+        # A single Read can legally return fewer bytes than asked for; loop
+        # until the buffer is full or the file ends, or chunks silently
+        # truncate mid-transfer.
+        $read = 0
+        while ($read -lt $length) {
+            $n = $stream.Read($buffer, $read, $length - $read)
+            if ($n -le 0) { break }
+            $read += $n
+        }
+
+        if ($read -lt $length) {
+            $exact = New-Object byte[] $read
+            [Array]::Copy($buffer, $exact, $read)
+            $buffer = $exact
+        }
+
+        return @{
+            data_b64 = [Convert]::ToBase64String($buffer)
+            bytes_read = $read
+            total_size = $total
+            eof = ($offset + $read) -ge $total
+        }
+    } finally {
+        $stream.Close()
+    }
+}
+
+function Invoke-FileStat {
+    param($Params)
+
+    $path = $Params.path
+    if (-not $path) { throw "file_stat requires 'path'" }
+
+    if (-not (Test-Path -LiteralPath $path)) {
+        return @{ exists = $false }
+    }
+
+    $item = Get-Item -LiteralPath $path
+    if ($item.PSIsContainer) {
+        return @{ exists = $true; is_directory = $true; size = 0 }
+    }
+
+    return @{
+        exists = $true
+        is_directory = $false
+        size = $item.Length
+        sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower()
+    }
+}
+
+# ============ RESULT JOURNAL ============
+#
+# A lost DVC reply leaves the caller unable to tell "never ran" from "ran and
+# the acknowledgement was lost" - the difference between safely retrying a
+# mutating command and applying it twice. Keeping the last few results lets
+# the daemon come back and ask what actually happened instead of guessing.
+
+$script:ResultJournal = @{}
+$script:ResultJournalOrder = New-Object System.Collections.ArrayList
+$script:ResultJournalLimit = 64
+
+function Add-JournaledResult {
+    param(
+        [string]$Id,
+        [bool]$Success,
+        $Data,
+        $ErrorInfo
+    )
+
+    if (-not $Id) { return }
+
+    $script:ResultJournal[$Id] = @{
+        success = $Success
+        data = $Data
+        error = $ErrorInfo
+        at = (Get-Date).ToString("o")
+    }
+    [void]$script:ResultJournalOrder.Add($Id)
+
+    # Bounded: this is a safety net for the last few commands, not a log.
+    while ($script:ResultJournalOrder.Count -gt $script:ResultJournalLimit) {
+        $oldest = $script:ResultJournalOrder[0]
+        $script:ResultJournalOrder.RemoveAt(0)
+        $script:ResultJournal.Remove($oldest)
+    }
+}
+
+function Get-JournaledResult {
+    param($Params)
+
+    $id = $Params.id
+    if (-not $id) { throw "query_result requires 'id'" }
+
+    if (-not $script:ResultJournal.ContainsKey($id)) {
+        # Deliberately distinguishes "we never saw it" from "still running":
+        # the daemon only asks once the agent is answering again, so an
+        # unknown id at that point means the request never executed.
+        return @{ known = $false }
+    }
+
+    $entry = $script:ResultJournal[$id]
+    return @{
+        known = $true
+        success = $entry.success
+        data = $entry.data
+        error = $entry.error
+        at = $entry.at
     }
 }

@@ -68,6 +68,9 @@ pub enum Commands {
     /// Drive mapping operations
     Drive(DriveArgs),
 
+    /// Copy files to and from the remote machine
+    File(FileArgs),
+
     /// Windows UI Automation operations
     Automate(AutomateArgs),
 
@@ -655,6 +658,37 @@ pub struct LocateArgs {
     /// Max distance in pixels from the --near anchor (default: 150)
     #[arg(long, value_name = "PX", requires = "near", default_value = "150")]
     pub near_distance: u32,
+}
+
+/// File transfer arguments.
+#[derive(Parser)]
+pub struct FileArgs {
+    #[command(subcommand)]
+    pub action: FileAction,
+}
+
+#[derive(Subcommand)]
+pub enum FileAction {
+    /// Copy a local file to the remote machine
+    ///
+    /// Transfers in verified chunks over the automation channel. Requires
+    /// connect with --enable-win-automation. Use this rather than pasting
+    /// content through the clipboard or reaching for \\TSCLIENT paths, both
+    /// of which hang on payloads of any size.
+    Push {
+        /// Local file to copy
+        local: String,
+        /// Destination path on the remote machine
+        remote: String,
+    },
+
+    /// Copy a file from the remote machine
+    Pull {
+        /// Remote file to copy
+        remote: String,
+        /// Local destination path
+        local: String,
+    },
 }
 
 /// Click-at command arguments (geometric click-safety check).

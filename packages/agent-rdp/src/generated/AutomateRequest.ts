@@ -156,4 +156,44 @@ timeout_ms: number,
 /**
  * State to wait for.
  */
-state: WaitState, } | { "op": "status" };
+state: WaitState, } | { "op": "status" } | { "op": "file_write_chunk", 
+/**
+ * Destination path on the remote machine.
+ */
+path: string, 
+/**
+ * Base64-encoded chunk bytes.
+ */
+data_b64: string, 
+/**
+ * Truncate before writing (first chunk of a transfer).
+ */
+first: boolean, 
+/**
+ * Last chunk - triggers hash verification.
+ */
+last: boolean, 
+/**
+ * Expected SHA-256 of the complete file, checked when `last`.
+ */
+sha256?: string, } | { "op": "file_read_chunk", 
+/**
+ * Source path on the remote machine.
+ */
+path: string, 
+/**
+ * Byte offset to read from.
+ */
+offset: number, 
+/**
+ * Maximum bytes to read.
+ */
+length: number, } | { "op": "file_stat", 
+/**
+ * Path on the remote machine.
+ */
+path: string, } | { "op": "query_result", 
+/**
+ * Id of the request to look up.
+ */
+id: string, };

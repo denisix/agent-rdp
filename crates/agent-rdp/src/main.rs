@@ -117,8 +117,16 @@ fn watchdog_budget_ms(cli: &Cli) -> u64 {
                 process_timeout.unwrap_or(10_000)
             }
             cli::AutomateAction::WaitFor { timeout, .. } => timeout.unwrap_or(0),
+            // Relaunching the agent retries the Win+R/handshake sequence up
+            // to three times; the command's own IPC timeout is raised to
+            // match, so the watchdog has to clear that too.
+            cli::AutomateAction::Restart => 120_000,
             _ => 0,
         },
+        // A transfer is many chunked round trips plus a hash of the whole
+        // file at both ends; the command's own IPC timeout is raised to
+        // match, so the watchdog has to clear that too.
+        Commands::File(_) => 10 * 60 * 1000,
         Commands::Wait { ms } => *ms,
         _ => 0,
     };
@@ -170,6 +178,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Drive(args) => {
             cli::commands::drive::run(&cli.session, args, &output, timeout).await
+        }
+        Commands::File(args) => {
+            cli::commands::file::run(&cli.session, args, &output, timeout).await
         }
         Commands::Automate(args) => {
             cli::commands::automate::run(&cli.session, args, &output, timeout).await

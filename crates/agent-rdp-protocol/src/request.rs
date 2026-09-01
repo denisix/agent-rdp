@@ -43,6 +43,12 @@ pub enum Request {
     /// more than one detected text region.
     ClickAt(ClickAtRequest),
 
+    /// Copy a local file to the remote machine.
+    FilePush(FilePushRequest),
+
+    /// Copy a file from the remote machine to the local machine.
+    FilePull(FilePullRequest),
+
     /// Relaunch the UI Automation agent without a full RDP reconnect.
     ///
     /// Requires automation to have been initialized at `connect` (i.e.
@@ -518,6 +524,32 @@ fn default_click_at_min_gap() -> u32 {
 
 fn default_click_at_max_divergence() -> u32 {
     40
+}
+
+/// Copy a local file to the remote machine, in chunks over the automation
+/// channel.
+///
+/// The drive-redirection share (`\\TSCLIENT\...`) is not a usable substitute:
+/// reaching it from inside the automation agent blocks indefinitely, taking
+/// the session's frame processor with it. Chunked transfer goes over the same
+/// DVC channel every other automate command uses, and is verified end to end.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct FilePushRequest {
+    /// Path of the file to read on this machine.
+    pub local_path: String,
+    /// Destination path on the remote machine.
+    pub remote_path: String,
+}
+
+/// Copy a file from the remote machine to this one.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct FilePullRequest {
+    /// Path of the file to read on the remote machine.
+    pub remote_path: String,
+    /// Destination path on this machine.
+    pub local_path: String,
 }
 
 #[cfg(test)]

@@ -347,6 +347,10 @@ mod codegen {
             AutomateRequest::RunPoll { .. } => "run_poll",
             AutomateRequest::WaitFor { .. } => "wait_for",
             AutomateRequest::Status => "status",
+            AutomateRequest::FileWriteChunk { .. } => "file_write_chunk",
+            AutomateRequest::FileReadChunk { .. } => "file_read_chunk",
+            AutomateRequest::FileStat { .. } => "file_stat",
+            AutomateRequest::QueryResult { .. } => "query_result",
         }
         .to_string()
     }

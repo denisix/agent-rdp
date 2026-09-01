@@ -21,7 +21,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # Global state
 $script:RefMap = @{}  # ref number -> AutomationElement mapping
 $script:SnapshotId = $null
-$script:Version = "1.1.0"  # Version bump for DVC support
+$script:Version = "1.2.0"  # File transfer + result journal
 # Local log path on Windows machine (RDPDR not used for logging anymore)
 $script:LocalLogPath = "$env:TEMP\agent-rdp-automation.log"
 $script:DvcHandle = [IntPtr]::Zero
@@ -69,7 +69,8 @@ function Start-Agent {
     $capabilities = @(
         "snapshot", "click", "select", "toggle", "expand", "collapse",
         "context_menu", "focus", "get", "fill", "clear",
-        "scroll", "window", "run", "run_poll", "wait_for", "status"
+        "scroll", "window", "run", "run_poll", "wait_for", "status",
+        "file_write_chunk", "file_read_chunk", "file_stat", "query_result"
     )
 
     try {
@@ -95,7 +96,7 @@ function Start-Agent {
         try {
             # Read request from DVC (with short timeout for polling)
             # Rust sends requests proactively, we just need to read them
-            $request = Read-DvcMessage -Handle $script:DvcHandle -TimeoutMs 100
+            $request = Read-DvcMessage -Handle $script:DvcHandle
 
             if ($null -eq $request) {
                 # No message available, continue polling
@@ -133,6 +134,10 @@ function Start-Agent {
                     "run_poll"     { Invoke-RunPoll -Params $request.params }
                     "wait_for"     { Invoke-WaitFor -Params $request.params }
                     "status"       { Get-AgentStatus }
+                    "file_write_chunk" { Invoke-FileWriteChunk -Params $request.params }
+                    "file_read_chunk"  { Invoke-FileReadChunk -Params $request.params }
+                    "file_stat"        { Invoke-FileStat -Params $request.params }
+                    "query_result"     { Get-JournaledResult -Params $request.params }
                     default        { throw "Unknown command: $($request.command)" }
                 }
                 Write-Log "Command succeeded: $($request.command)"
@@ -143,6 +148,14 @@ function Start-Agent {
                     code = "command_failed"
                     message = $_.Exception.Message
                 }
+            }
+
+            # Journal before sending: if the send fails or the reply is lost
+            # in transit, the result is still here to be queried back.
+            # `query_result` itself is not journaled - it is a lookup, and
+            # recording lookups would evict the results being looked up.
+            if ($request.command -ne "query_result") {
+                Add-JournaledResult -Id $request.id -Success $success -Data $responseData -ErrorInfo $responseError
             }
 
             # Send response via DVC
@@ -178,7 +191,7 @@ function Stop-Agent {
 
     if ($script:DvcHandle -ne [IntPtr]::Zero) {
         try {
-            Close-DvcChannel -Handle $script:DvcHandle
+            Close-DvcChannel
             Write-Log "DVC channel closed"
         } catch {
             Write-Log "Error closing DVC channel: $($_.Exception.Message)" "WARN"

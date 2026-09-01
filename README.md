@@ -422,6 +422,29 @@ agent-rdp drive list
 
 On the remote Windows machine, mapped drives appear in File Explorer as network locations.
 
+> **Do not access `\\TSCLIENT\...` from `automate run`.** Drive redirection is
+> serviced by the same task that carries the automation channel, so reading
+> the share from inside the agent deadlocks: the command never returns and the
+> session stops responding until you reconnect. Use `file push`/`file pull`
+> below to move files instead.
+
+### File Transfer
+
+Copies files in verified chunks over the automation channel — requires
+`--enable-win-automation` at connect time. Both directions verify a SHA-256
+computed independently on each end, so a truncated or corrupted transfer
+fails loudly instead of leaving a plausible-looking file behind.
+
+```bash
+agent-rdp file push ./report.xlsx "C:\\Users\\Admin\\report.xlsx"
+agent-rdp file pull "C:\\Users\\Admin\\export.csv" ./export.csv
+```
+
+Transfers are byte-exact, which also makes this the reliable way to place a
+script with non-ASCII content on the remote: writing one through the
+clipboard or `Add-Content` re-encodes it and mangles anything outside ASCII.
+The size limit is 128MB.
+
 ### UI Automation
 
 Interact with Windows applications programmatically via the Windows UI Automation API using native patterns (InvokePattern, SelectionItemPattern, TogglePattern, etc.). When enabled, a PowerShell agent is injected into the remote session that captures the accessibility tree and performs actions. Communication between the CLI and the agent uses a Dynamic Virtual Channel (DVC) for fast bidirectional IPC.
@@ -483,11 +506,23 @@ agent-rdp automate restart
 ```
 
 An `automation indeterminate` error means the DVC reply was lost, not that
-the action necessarily failed or succeeded - check state before retrying, or
-a retried click/fill can apply twice. For read-only commands (`snapshot`,
-`get`, `status`, `wait-for`, `window list`) the error text now says so
-explicitly ("This command is read-only - retrying is safe"), since those can
-always be retried safely.
+the action necessarily failed or succeeded. The agent now keeps the results of
+its recent requests, so when a reply goes missing the daemon asks it what
+actually happened and usually returns the real outcome instead - or, if the
+agent has no record of the request, says outright that it never ran and
+retrying is safe. Only when the agent is still busy does a genuine
+`indeterminate` remain; check state before retrying in that case, or a
+retried click/fill can apply twice. Read-only commands (`snapshot`, `get`,
+`status`, `wait-for`, `window list`) say so explicitly, since those can always
+be retried safely.
+
+**Long-running commands.** `run --wait` and `wait-for` are given the time
+they ask for: the transport deadline, the CLI's socket timeout and the
+watchdog all extend to cover `--process-timeout`/`--timeout`. Note the agent
+processes one command at a time, so a long `run --wait` blocks every other
+`automate` command until it finishes — for anything beyond about a minute,
+prefer `run --stream` plus `run-poll`, which returns immediately and lets you
+drain output while the session stays responsive.
 
 Snapshots include `disabled` on interactive elements — a free pre-action
 state check. A disabled "Отменить проведение" menu item, for example, tells

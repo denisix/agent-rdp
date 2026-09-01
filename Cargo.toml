@@ -61,6 +61,9 @@ base64 = "0.22"
 # Low-level socket options (TCP keepalive)
 socket2 = "0.6"
 
+# File-transfer integrity verification
+sha2 = "0.11"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

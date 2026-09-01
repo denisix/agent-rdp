@@ -76,6 +76,7 @@ pub mod clipboard;
 pub mod connect;
 pub mod disconnect;
 pub mod drive;
+pub mod file;
 pub mod keyboard;
 pub mod locate;
 pub mod mouse;

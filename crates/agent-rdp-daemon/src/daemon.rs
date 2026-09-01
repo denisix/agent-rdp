@@ -54,11 +54,20 @@ pub struct Daemon {
     /// Shutdown signal sender.
     shutdown_tx: broadcast::Sender<()>,
 
-    /// Channel to receive connection drop notifications from RDP session.
-    disconnect_rx: tokio::sync::mpsc::Receiver<()>,
+    /// Channel to receive connection drop notifications from RDP session,
+    /// carrying the generation of the session that dropped.
+    disconnect_rx: tokio::sync::mpsc::Receiver<u64>,
 
     /// Sender for connection drop notifications (passed to RDP sessions).
-    disconnect_tx: tokio::sync::mpsc::Sender<()>,
+    disconnect_tx: tokio::sync::mpsc::Sender<u64>,
+
+    /// Generation of the session currently stored in `rdp_session`.
+    ///
+    /// Bumped by every `connect`. A drop notification tagged with an older
+    /// generation belongs to a session that has already been replaced and
+    /// must be ignored - acting on it would tear down the live session that
+    /// took its place.
+    session_generation: Arc<std::sync::atomic::AtomicU64>,
 
     /// WebSocket server handle for streaming (shared so connect handler can start it).
     ws_handle: SharedWsHandle,
@@ -82,7 +91,10 @@ impl Daemon {
 
         let ipc_server = IpcServer::bind(&socket_path).await?;
         let (shutdown_tx, _) = broadcast::channel(1);
-        let (disconnect_tx, disconnect_rx) = tokio::sync::mpsc::channel(1);
+        // Room for a few notifications: with capacity 1 a stale notice from
+        // an already-replaced session could sit buffered while the next
+        // session's processor blocked trying to send its own.
+        let (disconnect_tx, disconnect_rx) = tokio::sync::mpsc::channel(8);
 
         // Default frame rate (can be overridden by ConnectRequest)
         let stream_fps = crate::ws_server::get_stream_fps();
@@ -110,6 +122,7 @@ impl Daemon {
             shutdown_tx,
             disconnect_rx,
             disconnect_tx,
+            session_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ws_handle,
             stream_fps,
             clipboard_changed_rx,
@@ -159,9 +172,10 @@ impl Daemon {
                             let shutdown_tx = self.shutdown_tx.clone();
                             let disconnect_tx = self.disconnect_tx.clone();
                             let clipboard_changed_rx = Arc::clone(&self.clipboard_changed_rx);
+                            let session_generation = Arc::clone(&self.session_generation);
 
                             tokio::spawn(async move {
-                                if let Err(e) = handle_client(stream, session, automation_state, ws_handle, session_name, start_time, shutdown_tx, disconnect_tx, clipboard_changed_rx).await {
+                                if let Err(e) = handle_client(stream, session, automation_state, ws_handle, session_name, start_time, shutdown_tx, disconnect_tx, clipboard_changed_rx, session_generation).await {
                                     error!("Client handler error: {}", e);
                                 }
                             });
@@ -181,7 +195,23 @@ impl Daemon {
                 // caller had to respawn a daemon rather than simply reconnect.
                 // Drop the dead session instead and stay up, so commands report
                 // "not connected" and `connect` can re-establish in place.
-                _ = self.disconnect_rx.recv() => {
+                Some(dropped_generation) = self.disconnect_rx.recv() => {
+                    // A notification from a session that has already been
+                    // replaced must not touch the session that replaced it.
+                    // Without this check, a drop notice still in flight when
+                    // `connect` stored its new session tore that new session
+                    // down - the caller saw a successful "Connected" and then
+                    // `daemon_not_running`/"Not connected" on the very next
+                    // command, and only a second reconnect appeared to help.
+                    let current = self.session_generation.load(std::sync::atomic::Ordering::SeqCst);
+                    if is_stale_disconnect(dropped_generation, current) {
+                        info!(
+                            "Ignoring stale disconnect from session generation {} (current is {})",
+                            dropped_generation, current
+                        );
+                        continue;
+                    }
+
                     warn!("RDP connection dropped; session is now disconnected (daemon staying up)");
 
                     *self.rdp_session.lock().await = None;
@@ -310,8 +340,9 @@ async fn handle_client(
     session_name: String,
     start_time: Instant,
     shutdown_tx: broadcast::Sender<()>,
-    disconnect_tx: tokio::sync::mpsc::Sender<()>,
+    disconnect_tx: tokio::sync::mpsc::Sender<u64>,
     clipboard_changed_rx: ClipboardChangedRx,
+    session_generation: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -351,6 +382,7 @@ async fn handle_client(
             start_time,
             &disconnect_tx,
             &clipboard_changed_rx,
+            &session_generation,
         ).await;
 
         // `to_vec` + push instead of `to_string + "\n"`: appending to a String
@@ -380,8 +412,9 @@ async fn process_request(
     ws_handle: &SharedWsHandle,
     session_name: &str,
     start_time: Instant,
-    disconnect_tx: &tokio::sync::mpsc::Sender<()>,
+    disconnect_tx: &tokio::sync::mpsc::Sender<u64>,
     clipboard_changed_rx: &ClipboardChangedRx,
+    session_generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Response {
     match request {
         Request::Ping => Response::success(ResponseData::Pong),
@@ -418,7 +451,7 @@ async fn process_request(
         }
 
         Request::Connect(params) => {
-            handlers::connect::handle(rdp_session, automation_state, ws_handle, params, disconnect_tx.clone(), clipboard_changed_rx).await
+            handlers::connect::handle(rdp_session, automation_state, ws_handle, params, disconnect_tx.clone(), clipboard_changed_rx, session_generation).await
         }
 
         Request::Disconnect => {
@@ -464,5 +497,58 @@ async fn process_request(
         Request::AutomationRestart => {
             handlers::automate::handle_restart(rdp_session, automation_state).await
         }
+
+        Request::FilePush(params) => {
+            handlers::file_transfer::handle_push(rdp_session, automation_state, params).await
+        }
+
+        Request::FilePull(params) => {
+            handlers::file_transfer::handle_pull(rdp_session, automation_state, params).await
+        }
+    }
+}
+
+/// Whether a drop notification belongs to a session that has already been
+/// replaced, and so must not be acted on.
+///
+/// Split out as a pure function so the rule can be tested without standing up
+/// a daemon: getting it wrong in either direction is costly. Ignoring a live
+/// session's drop leaves the daemon believing a dead session is usable; acting
+/// on a stale one tears down the session that replaced it, which is exactly
+/// the failure this generation tag exists to prevent.
+fn is_stale_disconnect(dropped_generation: u64, current_generation: u64) -> bool {
+    dropped_generation != current_generation
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_generation_drop_is_acted_on() {
+        assert!(!is_stale_disconnect(7, 7));
+    }
+
+    #[test]
+    fn older_generation_drop_is_ignored() {
+        // The classic race: session 3 died, the notification was still in
+        // flight while `connect` established session 4.
+        assert!(is_stale_disconnect(3, 4));
+    }
+
+    #[test]
+    fn a_drop_before_any_connect_is_ignored() {
+        // Generation starts at 0 and no session can carry it, so anything
+        // arriving against it is stale.
+        assert!(is_stale_disconnect(1, 0));
+    }
+
+    #[test]
+    fn several_reconnects_only_the_latest_counts() {
+        let current = 10;
+        for stale in 1..current {
+            assert!(is_stale_disconnect(stale, current), "generation {} should be stale", stale);
+        }
+        assert!(!is_stale_disconnect(current, current));
     }
 }

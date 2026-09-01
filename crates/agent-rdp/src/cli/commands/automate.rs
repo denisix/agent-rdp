@@ -31,7 +31,11 @@ pub async fn run(
     // separate top-level `Request` variant, dispatched before the mapping
     // below.
     if matches!(args.action, AutomateAction::Restart) {
-        let response = client.send(&Request::AutomationRestart, timeout_ms).await?;
+        // Relaunching the agent drives the remote Run dialog and waits for a
+        // DVC handshake, retrying up to three times - legitimately close to
+        // 90s before it can honestly report failure.
+        let restart_timeout_ms = timeout_ms.max(RESTART_MIN_TIMEOUT_MS);
+        let response = client.send(&Request::AutomationRestart, restart_timeout_ms).await?;
         output.print_response(&response);
         if !response.success {
             std::process::exit(1);
@@ -53,7 +57,11 @@ pub async fn run(
     };
 
     let request = Request::Automate(automate_request);
-    let response = client.send(&request, timeout_ms).await?;
+    // The daemon can't answer until the remote command finishes, so the
+    // socket read has to outlast the command's own budget - otherwise the
+    // CLI gives up on a request the daemon and agent are still working on,
+    // and the caller is left not knowing whether it applied.
+    let response = client.send(&request, automate_timeout_ms(&request, timeout_ms)).await?;
 
     match (focused_shorthand, output.is_json(), response.success, &response.data) {
         (true, false, true, Some(ResponseData::Snapshot(snapshot))) => {
@@ -74,6 +82,30 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Minimum IPC timeout for `automate restart`.
+const RESTART_MIN_TIMEOUT_MS: u64 = 120_000;
+
+/// IPC timeout for an automate request: the base timeout, extended by the
+/// command's own budget when it carries one.
+///
+/// Mirrors what the daemon does for its DVC deadline (`request_timeout` in
+/// the daemon's automate handler) and what `locate --wait` already does for
+/// its poll budget. All three have to agree, or the shortest one silently
+/// decides the real limit.
+fn automate_timeout_ms(request: &Request, base_timeout_ms: u64) -> u64 {
+    let Request::Automate(automate) = request else {
+        return base_timeout_ms;
+    };
+
+    let command_budget_ms = match automate {
+        AutomateRequest::Run { wait: true, timeout_ms, .. } => *timeout_ms,
+        AutomateRequest::WaitFor { timeout_ms, .. } => *timeout_ms,
+        _ => 0,
+    };
+
+    base_timeout_ms.saturating_add(command_budget_ms)
 }
 
 /// Map a CLI action onto the wire request.
@@ -452,5 +484,53 @@ mod tests {
         let mut e = element("edit", Some("Поиск"), Some(""));
         e.bounds = Some(ElementBounds { x: -1920, y: 100, width: 200, height: 24 });
         assert!(describe_focused(&e).contains("at (-1920, 100)"));
+    }
+
+    #[test]
+    fn run_wait_extends_the_ipc_timeout_by_its_process_budget() {
+        let request = Request::Automate(AutomateRequest::Run {
+            command: "build.cmd".into(),
+            args: Vec::new(),
+            wait: true,
+            hidden: false,
+            timeout_ms: 240_000,
+            shell: None,
+            stream: false,
+        });
+        // Otherwise the CLI would abandon a 4-minute command at 30s.
+        assert_eq!(automate_timeout_ms(&request, 30_000), 270_000);
+    }
+
+    #[test]
+    fn wait_for_extends_the_ipc_timeout_too() {
+        let request = Request::Automate(AutomateRequest::WaitFor {
+            selector: "@e1".into(),
+            timeout_ms: 60_000,
+            state: WaitState::Visible,
+        });
+        assert_eq!(automate_timeout_ms(&request, 30_000), 90_000);
+    }
+
+    #[test]
+    fn short_commands_keep_the_base_timeout() {
+        let request = Request::Automate(AutomateRequest::Status);
+        assert_eq!(automate_timeout_ms(&request, 30_000), 30_000);
+
+        // Without --wait the agent answers immediately.
+        let detached = Request::Automate(AutomateRequest::Run {
+            command: "long.exe".into(),
+            args: Vec::new(),
+            wait: false,
+            hidden: false,
+            timeout_ms: 240_000,
+            shell: None,
+            stream: true,
+        });
+        assert_eq!(automate_timeout_ms(&detached, 30_000), 30_000);
+    }
+
+    #[test]
+    fn non_automate_requests_are_unchanged() {
+        assert_eq!(automate_timeout_ms(&Request::Ping, 30_000), 30_000);
     }
 }

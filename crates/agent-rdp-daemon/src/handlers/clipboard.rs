@@ -25,15 +25,28 @@ pub async fn handle(
             match rdp.clipboard_get().await {
                 Ok(Some(text)) => Response::success(ResponseData::Clipboard { text }),
                 Ok(None) => Response::success(ResponseData::Clipboard { text: String::new() }),
-                Err(e) => Response::error(ErrorCode::ClipboardError, format!("Failed to get clipboard: {}", e)),
+                Err(e) => Response::error(clipboard_error_code(&e), format!("Failed to get clipboard: {}", e)),
             }
         }
 
         ClipboardRequest::Set { text } => {
             match rdp.clipboard_set(text).await {
                 Ok(()) => Response::ok(),
-                Err(e) => Response::error(ErrorCode::ClipboardError, format!("Failed to set clipboard: {}", e)),
+                Err(e) => Response::error(clipboard_error_code(&e), format!("Failed to set clipboard: {}", e)),
             }
         }
+    }
+}
+
+/// A wedged session is a timeout, not a clipboard fault.
+///
+/// Reporting it as `clipboard_error` sent callers looking for a clipboard
+/// problem when the actual condition is that the whole session stopped
+/// responding and needs reconnecting - every other command is about to fail
+/// the same way.
+fn clipboard_error_code(error: &crate::rdp_session::RdpError) -> ErrorCode {
+    match error {
+        crate::rdp_session::RdpError::Unresponsive(_) => ErrorCode::Timeout,
+        _ => ErrorCode::ClipboardError,
     }
 }

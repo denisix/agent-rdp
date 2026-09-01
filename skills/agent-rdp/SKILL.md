@@ -7,7 +7,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 # agent-rdp
 
 Tested against agent-rdp 0.8.0+ (transport keepalive, `automate restart`,
-`locate --near`, `click-at --confirm`).
+`locate --near`, `click-at --confirm`, `file push/pull`).
 
 If `agent-rdp` is not on PATH, install it first — this is expected on a fresh
 machine and needs no confirmation:
@@ -39,11 +39,29 @@ says so explicitly — reconnect to retry rather than polling `automate status`.
 
 **A DVC timeout does NOT mean the action failed.** `automation indeterminate`
 means the request reached the agent but the reply was lost — it may well have
-been applied. Never blindly retry: check state first, or you double-apply
-(text typed twice, a button clicked twice). Exception: read-only commands
-(`snapshot`, `get`, `status`, `wait-for`, `window list`) now say so in the
-error text itself ("This command is read-only - retrying is safe") — those
-are always safe to retry.
+been applied. The agent now journals recent results, so the daemon asks it
+what happened and usually returns the real outcome, or states plainly that
+the request never ran. A surviving `indeterminate` means the agent is still
+busy: check state first, never blindly retry, or you double-apply (text typed
+twice, a button clicked twice). Read-only commands (`snapshot`, `get`,
+`status`, `wait-for`, `window list`) say so in the error text — those are
+always safe to retry.
+
+**Never touch `\\TSCLIENT\...` from `automate run`.** Drive redirection is
+serviced by the same task that carries the automation channel, so reading the
+share from inside the agent deadlocks — the command hangs and the session
+stops responding until you reconnect. Use `file push`/`file pull` instead.
+
+**Long commands are allowed to be long, but they block the agent.** The
+transport, IPC and watchdog budgets all extend to cover `--process-timeout`
+and `wait-for --timeout`, so a 4-minute command is no longer cut off. But the
+agent handles one command at a time, so a long `run --wait` stalls every other
+`automate` call. Past ~1 minute, prefer `run --stream` + `run-poll`:
+
+```bash
+agent-rdp automate run "long-build.cmd" --stream   # returns a pid immediately
+agent-rdp automate run-poll <pid>                  # drain output; repeat until exited
+```
 
 ```bash
 agent-rdp automate get "@e2"        # read back before retrying
@@ -196,6 +214,12 @@ agent-rdp clipboard get
 # Drive mapping
 agent-rdp connect --host <ip> -u <user> -p <pass> --drive /local/path:Share
 agent-rdp drive list                       # remote path: \\tsclient\Share
+
+# File transfer (needs --enable-win-automation). Chunked + SHA-256 verified on
+# both ends; byte-exact, so it is also the safe way to place a script with
+# non-ASCII content. Use instead of clipboard payloads or \\TSCLIENT access.
+agent-rdp file push ./local.txt "C:\Users\Admin\remote.txt"
+agent-rdp file pull "C:\Users\Admin\out.csv" ./out.csv
 
 # OCR / locate
 agent-rdp locate "Cancel"                  # substring match, returns coords

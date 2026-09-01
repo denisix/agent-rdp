@@ -57,6 +57,17 @@ pub enum RdpError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    /// The frame processor did not answer in time.
+    ///
+    /// Distinct from `SessionClosed`: the session still exists, but the task
+    /// that services it is wedged - typically the RDP transport stalled, or
+    /// remote-initiated drive I/O is blocking the processor. Without this the
+    /// caller waited forever and the command only ended when the CLI's
+    /// watchdog killed it, leaving the daemon-side task leaked and the user
+    /// with no idea why.
+    #[error("The RDP session is not responding ({0}). The transport may be wedged - reconnect with `agent-rdp connect ...`")]
+    Unresponsive(String),
 }
 
 /// Configuration for an RDP connection.
@@ -126,8 +137,32 @@ pub struct RdpSession {
     _task_handle: tokio::task::JoinHandle<()>,
 }
 
-/// Callback type for connection drop notification.
-pub type DisconnectNotify = mpsc::Sender<()>;
+/// How long to wait for the frame processor to accept a queued command.
+///
+/// Only bounded by channel capacity, so this expires solely when the
+/// processor is not draining its queue at all.
+const COMMAND_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to wait for the remote to acknowledge a clipboard write.
+const CLIPBOARD_SET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long to wait for the remote to hand back clipboard contents.
+///
+/// Longer than the write path: this is a full round trip to the remote
+/// clipboard owner, which may be a busy application.
+const CLIPBOARD_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Callback for connection drop notification, tagged with the generation of
+/// the session it belongs to.
+///
+/// The generation is what makes the notification safe to act on. Previously
+/// this was a bare `mpsc::Sender<()>`: a notification from a session that had
+/// already been replaced was indistinguishable from one for the current
+/// session, so a drop notice that arrived just after a reconnect stored its
+/// new session would tear that new session down instead - reported as
+/// "daemon_not_running" on the very next command, or as the automation agent
+/// failing to launch with "Not connected" moments after `connect` succeeded.
+pub type DisconnectNotify = (mpsc::Sender<u64>, u64);
 
 impl RdpSession {
     /// Enable OS-level TCP keepalive on the RDP socket so a black-holed
@@ -566,10 +601,7 @@ impl RdpSession {
     /// Send input events to the remote desktop.
     pub async fn send_input(&self, events: Vec<FastPathInputEvent>) -> Result<(), RdpError> {
         debug!("Sending {} input events to frame processor", events.len());
-        self.command_tx
-            .send(SessionCommand::SendInput(events))
-            .await
-            .map_err(|_| RdpError::SessionClosed)
+        self.send_command(SessionCommand::SendInput(events), "input").await
     }
 
     /// Send a key combination (e.g., "super+r", "ctrl+c").
@@ -639,29 +671,57 @@ impl RdpSession {
     /// Set clipboard text (will be available when remote pastes).
     pub async fn clipboard_set(&self, text: String) -> Result<(), RdpError> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.command_tx
-            .send(SessionCommand::ClipboardSet { text, response_tx })
-            .await
-            .map_err(|_| RdpError::SessionClosed)?;
+        self.send_command(SessionCommand::ClipboardSet { text, response_tx }, "clipboard set")
+            .await?;
 
-        response_rx
-            .await
-            .map_err(|_| RdpError::SessionClosed)?
-            .map_err(|e| RdpError::ProtocolError(e))
+        Self::await_processor(response_rx, CLIPBOARD_SET_TIMEOUT, "clipboard set")
+            .await?
+            .map_err(RdpError::ProtocolError)
     }
 
     /// Get clipboard text from remote.
     pub async fn clipboard_get(&self) -> Result<Option<String>, RdpError> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.command_tx
-            .send(SessionCommand::ClipboardGet { response_tx })
-            .await
-            .map_err(|_| RdpError::SessionClosed)?;
+        self.send_command(SessionCommand::ClipboardGet { response_tx }, "clipboard get")
+            .await?;
 
-        response_rx
-            .await
-            .map_err(|_| RdpError::SessionClosed)?
-            .map_err(|e| RdpError::ProtocolError(e))
+        // This one can park indefinitely by design: the reply only arrives
+        // when the *remote* answers the format-data request, and a remote
+        // that never answers leaves nothing to complete the oneshot.
+        Self::await_processor(response_rx, CLIPBOARD_GET_TIMEOUT, "clipboard get")
+            .await?
+            .map_err(RdpError::ProtocolError)
+    }
+
+    /// Queue a command for the frame processor, bounded so a wedged processor
+    /// surfaces as an error rather than an indefinite hang.
+    async fn send_command(&self, command: SessionCommand, what: &str) -> Result<(), RdpError> {
+        match tokio::time::timeout(COMMAND_SEND_TIMEOUT, self.command_tx.send(command)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(RdpError::SessionClosed),
+            Err(_) => Err(RdpError::Unresponsive(format!(
+                "{} could not be queued within {}s",
+                what,
+                COMMAND_SEND_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    /// Await a frame-processor reply with a deadline.
+    async fn await_processor<T>(
+        response_rx: tokio::sync::oneshot::Receiver<T>,
+        limit: std::time::Duration,
+        what: &str,
+    ) -> Result<T, RdpError> {
+        match tokio::time::timeout(limit, response_rx).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err(RdpError::SessionClosed),
+            Err(_) => Err(RdpError::Unresponsive(format!(
+                "{} got no reply within {}s",
+                what,
+                limit.as_secs()
+            ))),
+        }
     }
 
     /// Disconnect from the RDP server.
@@ -822,7 +882,16 @@ async fn run_frame_processor(
                         break;
                     }
                     None => {
-                        // Channel closed, exit
+                        // Every command sender is gone, which only happens
+                        // once the owning `RdpSession` has been dropped -
+                        // i.e. someone deliberately tore this session down.
+                        // Treating that as a *drop* raced with `disconnect()`,
+                        // which sends Shutdown and returns without waiting:
+                        // if the channel closed before this loop dequeued the
+                        // Shutdown, a perfectly ordinary disconnect emitted a
+                        // spurious "connection dropped" notification.
+                        info!("Session command channel closed; shutting down frame processor");
+                        graceful_shutdown = true;
                         break;
                     }
                 }
@@ -898,8 +967,8 @@ async fn run_frame_processor(
                         }
                         if should_terminate {
                             // Server-initiated termination - notify daemon
-                            if let Some(notify) = disconnect_notify {
-                                let _ = notify.send(()).await;
+                            if let Some((notify, generation)) = disconnect_notify {
+                                let _ = notify.send(generation).await;
                             }
                             return;
                         }
@@ -983,11 +1052,13 @@ async fn run_frame_processor(
 
     info!("Frame processor stopped (graceful={})", graceful_shutdown);
 
-    // Notify daemon of connection drop (unless this was a graceful shutdown)
+    // Notify daemon of connection drop (unless this was a graceful shutdown).
+    // The generation goes with it so the daemon can tell a drop for the
+    // session it currently holds from one for a session already replaced.
     if !graceful_shutdown {
-        if let Some(notify) = disconnect_notify {
-            info!("Notifying daemon of connection drop");
-            let _ = notify.send(()).await;
+        if let Some((notify, generation)) = disconnect_notify {
+            info!("Notifying daemon of connection drop (generation {})", generation);
+            let _ = notify.send(generation).await;
         }
     }
 }
