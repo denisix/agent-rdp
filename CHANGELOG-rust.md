@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.10](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.9...agent-rdp-rust-v0.7.10) (2026-09-01)
+
+
+### Features
+
+* fix session-killing disconnect race, unblock long commands, add file push/pull ([f61c4e2](https://github.com/denisix/agent-rdp/commit/f61c4e2375654045c45abb4821c9de23eaef1125))
+
 ## [0.7.9](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.8...agent-rdp-rust-v0.7.9) (2026-09-01)
 
 
