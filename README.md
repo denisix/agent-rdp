@@ -192,6 +192,14 @@ retransmission timeout — previously `screenshot` could keep returning a
 stale, byte-identical frame under a fresh filename for the entire time the
 transport was silently dead.
 
+`--json` output (and the Node SDK's `frameSeq`/`frameHash`) also carries a
+`frame_seq` (framebuffer generation counter) and `frame_hash` (FNV-1a hash of
+the captured pixels). Two screenshots with the same seq or hash are
+guaranteed pixel-identical — proving that directly, instead of hashing the
+saved file yourself or reading a clock rendered on screen, is the reliable
+way to confirm a frame actually changed after an action that should have
+repainted it.
+
 ### Getting Coordinates Right
 
 **Never estimate a coordinate by looking at a screenshot.** Screenshot pixels,
@@ -347,6 +355,12 @@ Clicking is deliberately strict: no match, or several matches without
 over picking an index. When two buttons share a prefix ("Провести" /
 "Провести и закрыть"), use `--exact` so the ambiguity never arises.
 
+**Numbers with thousands separators can lose their leading digit group** —
+OCR has been observed reading `1 250,00` as `2250,00`, dropping the `1` and
+the separating space. For monetary values, crop tight with `--region` before
+reading, and verify with `automate get` (when UI Automation can reach the
+field) or a second independent read before acting on the amount.
+
 ### Click-at (safe clicking of externally-computed coordinates)
 
 When the click point comes from outside agent-rdp — a vision model reading a
@@ -474,6 +488,17 @@ a retried click/fill can apply twice. For read-only commands (`snapshot`,
 `get`, `status`, `wait-for`, `window list`) the error text now says so
 explicitly ("This command is read-only - retrying is safe"), since those can
 always be retried safely.
+
+Snapshots include `disabled` on interactive elements — a free pre-action
+state check. A disabled "Отменить проведение" menu item, for example, tells
+you the document isn't posted before you ever click anything.
+
+**Keyboard navigation inside a panel (arrow keys + Enter) can land on the
+wrong item.** Observed in 1C side panels ("Функции" etc.): Up/Down selection
+followed by Enter is not reliably deterministic. Prefer `automate` refs when
+the panel is exposed to UI Automation; when it isn't, use two independent
+coordinate measurements and [`click-at --confirm`](#click-at-safe-clicking-of-externally-computed-coordinates)
+rather than arrow-key navigation.
 
 **Selector Types:**
 - `@e5` or `@5` - Reference number from snapshot (e prefix recommended)

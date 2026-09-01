@@ -7,7 +7,7 @@ use base64::Engine;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::handlers::imaging::encode_image;
+use crate::handlers::imaging::{encode_image, hash_pixels};
 use crate::rdp_session::RdpSession;
 
 /// Handle a screenshot request.
@@ -19,7 +19,7 @@ pub async fn handle(
     // everything past this point (encode, base64) used to run with the lock
     // still held, blocking every mouse/keyboard/frame-decode operation on the
     // daemon for the length of a PNG deflate.
-    let (img_width, img_height, data, offset_x, offset_y, frame_age_ms) = {
+    let (img_width, img_height, data, offset_x, offset_y, frame_age_ms, frame_seq) = {
         let session = rdp_session.lock().await;
         let rdp = match session.as_ref() {
             Some(rdp) => rdp,
@@ -29,6 +29,11 @@ pub async fn handle(
         };
 
         let frame_age_ms = rdp.last_frame_age().as_millis() as u64;
+        // Read together with the pixels below, under the same lock, so the
+        // seq reported can never race ahead of or behind the actual frame
+        // returned - a seq/pixel mismatch would defeat the whole point of
+        // reporting it.
+        let frame_seq = rdp.frame_generation();
 
         let (w, h, data, off_x, off_y) = match params.region {
             None => {
@@ -60,7 +65,7 @@ pub async fn handle(
                 (clamped.width, clamped.height, data, Some(clamped.x), Some(clamped.y))
             }
         };
-        (w, h, data, off_x, off_y, frame_age_ms)
+        (w, h, data, off_x, off_y, frame_age_ms, frame_seq)
     };
 
     let rgba_image = match image::RgbaImage::from_raw(img_width, img_height, data) {
@@ -79,12 +84,16 @@ pub async fn handle(
         ImageFormat::Jpeg => "jpeg",
     };
 
-    // PNG deflate/JPEG encode of a full desktop can run to hundreds of
-    // milliseconds; run it off the async runtime so it cannot stall other
-    // requests being polled on the same worker thread.
-    let encoded = match tokio::task::spawn_blocking(move || encode_image(&rgba_image, format)).await
+    // PNG deflate/JPEG encode (and the pixel hash below) can run to hundreds
+    // of milliseconds on a full desktop; run both off the async runtime so
+    // neither stalls other requests being polled on the same worker thread.
+    let (encoded, frame_hash) = match tokio::task::spawn_blocking(move || {
+        let hash = hash_pixels(rgba_image.as_raw());
+        encode_image(&rgba_image, format).map(|bytes| (bytes, hash))
+    })
+    .await
     {
-        Ok(Ok(bytes)) => bytes,
+        Ok(Ok(result)) => result,
         Ok(Err(message)) => return Response::error(ErrorCode::InternalError, message),
         Err(e) => {
             return Response::error(ErrorCode::InternalError, format!("Encoding task failed: {}", e))
@@ -110,5 +119,7 @@ pub async fn handle(
         offset_x,
         offset_y,
         frame_age_ms,
+        frame_seq,
+        frame_hash,
     })
 }

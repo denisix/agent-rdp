@@ -126,6 +126,17 @@ export interface ScreenshotFileResult {
   offsetX: number;
   /** Y offset of the image within the full desktop (0 unless `region` was used). */
   offsetY: number;
+  /** Milliseconds since the RDP server last sent any data. */
+  frameAgeMs: number;
+  /**
+   * Framebuffer generation counter at capture time. Two screenshots with the
+   * same `frameSeq` are guaranteed pixel-identical - a sequence that never
+   * advances across an action that must have changed the screen means the
+   * frame is stale, not that the desktop is merely idle.
+   */
+  frameSeq: number;
+  /** FNV-1a 64-bit hash (16 hex digits) of the captured pixels. */
+  frameHash: string;
 }
 
 /** Result of a screenshot operation returned as base64. */
@@ -138,6 +149,12 @@ export interface ScreenshotResult {
   offsetX: number;
   /** Y offset of the image within the full desktop (0 unless `region` was used). */
   offsetY: number;
+  /** Milliseconds since the RDP server last sent any data. */
+  frameAgeMs: number;
+  /** See `ScreenshotFileResult.frameSeq`. */
+  frameSeq: number;
+  /** FNV-1a 64-bit hash (16 hex digits) of the captured pixels. */
+  frameHash: string;
 }
 
 /** A point representing x,y coordinates. */

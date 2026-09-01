@@ -55,6 +55,8 @@ pub async fn run(
         offset_x,
         offset_y,
         frame_age_ms,
+        frame_seq,
+        frame_hash,
         ..
     }) = response.data
     {
@@ -67,13 +69,26 @@ pub async fn run(
         let (offset_x, offset_y) = (offset_x.unwrap_or(0), offset_y.unwrap_or(0));
 
         if output.is_json() {
+            // `frame_seq`/`frame_hash` let a caller prove two screenshots are
+            // (or aren't) pixel-identical without hashing the file itself -
+            // previously the only way to detect a stale/stuck frame was an
+            // external md5 of the saved file plus reading an on-screen clock.
             println!(
-                r#"{{"success":true,"data":{{"type":"screenshot","path":"{}","width":{},"height":{},"offset_x":{},"offset_y":{}}}}}"#,
-                path.display(),
-                width,
-                height,
-                offset_x,
-                offset_y
+                "{}",
+                serde_json::json!({
+                    "success": true,
+                    "data": {
+                        "type": "screenshot",
+                        "path": path,
+                        "width": width,
+                        "height": height,
+                        "offset_x": offset_x,
+                        "offset_y": offset_y,
+                        "frame_age_ms": frame_age_ms,
+                        "frame_seq": frame_seq,
+                        "frame_hash": frame_hash,
+                    }
+                })
             );
         } else if args.region.is_some() {
             // Spell out the offset: a coordinate read off this crop is only

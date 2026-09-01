@@ -79,7 +79,22 @@ genuinely idle" — check `agent-rdp session info`'s `last_frame_age_ms` too;
 if it keeps climbing indefinitely rather than resetting on real UI changes,
 distrust the frame and reconnect. Every CLI command also has a hard watchdog
 now (defaults to its own timeout plus a grace window) so a stuck command
-exits with `watchdog_timeout` instead of hanging indefinitely.
+exits with `watchdog_timeout` instead of hanging indefinitely. `--json`
+screenshots also carry `frame_seq`/`frame_hash` - two screenshots with the
+same value are guaranteed pixel-identical, the reliable way to confirm a
+frame actually changed after an action, instead of hashing the saved file
+yourself.
+
+**Numbers with thousands separators can lose their leading digit group in
+OCR** - `1 250,00` has been read as `2250,00`. For monetary values, crop
+tight with `--region` and verify via `automate get` or a second independent
+read before acting on the amount.
+
+**Arrow-key navigation inside a panel can land on the wrong item.** Observed
+in 1C side panels ("Функции" etc.): Up/Down + Enter selection is not
+reliably deterministic. Prefer `automate` refs when the panel is exposed to
+UI Automation; otherwise use two independent coordinate measurements with
+`click-at --confirm` rather than arrow keys.
 
 **Enter in a 1C list can mean "Create", not "Open".** With no row explicitly
 selected, pressing Enter in a 1C list view often opens a new-document form
@@ -258,6 +273,10 @@ agent-rdp automate wait-for <selector> --timeout 5000 --state visible
 agent-rdp automate status                    # includes uptime, last RTT, consecutive-failure count
 agent-rdp automate restart                   # relaunch the agent without a full RDP reconnect
 ```
+
+Snapshots include `disabled` on interactive elements - a free pre-action
+state check. A disabled "Отменить проведение" menu item tells you the
+document isn't posted before you click anything.
 
 Run commands/apps (preferred way to open apps):
 

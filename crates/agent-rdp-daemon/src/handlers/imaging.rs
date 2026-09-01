@@ -74,6 +74,26 @@ pub fn encode_image(image: &RgbaImage, format: ImageFormat) -> Result<Vec<u8>, S
     Ok(buffer.into_inner())
 }
 
+/// FNV-1a 64-bit hash of raw pixel bytes, as a 16-hex-digit string.
+///
+/// Not for security - it's the cheap, dependency-free way to give a
+/// screenshot a content fingerprint. Two screenshots that hash the same are
+/// pixel-identical; a caller that expected a UI change but sees the same hash
+/// (and the same `frame_seq`) knows the frame is stale rather than having to
+/// infer it from wall-clock time or an external md5 of the saved file, which
+/// is what QA was doing by hand before this existed.
+pub fn hash_pixels(data: &[u8]) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{:016x}", hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +295,33 @@ mod tests {
 
         assert_eq!((decoded.width(), decoded.height()), (600, 30));
         assert_crop_matches_source(&source, &decoded, used);
+    }
+
+    #[test]
+    fn test_hash_pixels_is_deterministic() {
+        let data = vec![1u8, 2, 3, 4, 5];
+        assert_eq!(hash_pixels(&data), hash_pixels(&data));
+    }
+
+    #[test]
+    fn test_hash_pixels_known_vector() {
+        // FNV-1a 64-bit of an empty input is the fixed offset basis.
+        assert_eq!(hash_pixels(&[]), "cbf29ce484222325");
+    }
+
+    #[test]
+    fn test_hash_pixels_differs_on_one_byte_change() {
+        let a = vec![10u8, 20, 30, 40];
+        let mut b = a.clone();
+        b[2] = 31;
+        assert_ne!(hash_pixels(&a), hash_pixels(&b));
+    }
+
+    #[test]
+    fn test_hash_pixels_is_16_hex_digits() {
+        let hash = hash_pixels(&[0u8; 100]);
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
 

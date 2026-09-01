@@ -333,6 +333,9 @@ export class RdpSession {
       base64: string;
       offset_x?: number;
       offset_y?: number;
+      frame_age_ms: number;
+      frame_seq: number;
+      frame_hash: string;
     };
 
     // A full-desktop capture has no offset; report 0 rather than undefined so
@@ -349,6 +352,9 @@ export class RdpSession {
         format: data.format,
         offsetX,
         offsetY,
+        frameAgeMs: data.frame_age_ms,
+        frameSeq: data.frame_seq,
+        frameHash: data.frame_hash,
       };
     }
 
@@ -359,6 +365,9 @@ export class RdpSession {
       format: data.format,
       offsetX,
       offsetY,
+      frameAgeMs: data.frame_age_ms,
+      frameSeq: data.frame_seq,
+      frameHash: data.frame_hash,
     };
   }
 

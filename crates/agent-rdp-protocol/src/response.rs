@@ -122,6 +122,17 @@ pub enum ResponseData {
         /// rather than the desktop just being idle.
         #[ts(type = "number")]
         frame_age_ms: u64,
+        /// Generation counter of the framebuffer at capture time. Two
+        /// screenshots with the same `frame_seq` are guaranteed
+        /// pixel-identical; a sequence that never advances across an action
+        /// that must have changed the screen is the stale-frame signal.
+        #[ts(type = "number")]
+        frame_seq: u64,
+        /// FNV-1a 64-bit hash (16 hex digits) of the captured pixels. Same
+        /// role as `frame_seq` but survives daemon restarts / independent of
+        /// process state - a byte-for-byte fingerprint of what was actually
+        /// captured.
+        frame_hash: String,
     },
 
     /// Clipboard text content.
@@ -447,6 +458,8 @@ mod tests {
             offset_x: None,
             offset_y: None,
             frame_age_ms: 0,
+            frame_seq: 0,
+            frame_hash: "0000000000000000".to_string(),
         });
 
         let json = serde_json::to_string(&resp).unwrap();

@@ -80,7 +80,21 @@ offset_y?: number,
  * unchanged image) is the signal that the transport may be dead
  * rather than the desktop just being idle.
  */
-frame_age_ms: number, } | { "type": "clipboard", 
+frame_age_ms: number, 
+/**
+ * Generation counter of the framebuffer at capture time. Two
+ * screenshots with the same `frame_seq` are guaranteed
+ * pixel-identical; a sequence that never advances across an action
+ * that must have changed the screen is the stale-frame signal.
+ */
+frame_seq: number, 
+/**
+ * FNV-1a 64-bit hash (16 hex digits) of the captured pixels. Same
+ * role as `frame_seq` but survives daemon restarts / independent of
+ * process state - a byte-for-byte fingerprint of what was actually
+ * captured.
+ */
+frame_hash: string, } | { "type": "clipboard", 
 /**
  * Text content.
  */
