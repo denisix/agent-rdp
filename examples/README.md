@@ -60,10 +60,6 @@ Browser-based viewer for debugging and interactive control.
 
 3. Connect to `ws://localhost:9224`
 
-**Features:**
-- Live desktop frame streaming (JPEG)
-- Mouse input (click, move, drag, scroll)
-- Keyboard input (typing, special keys)
-- Fullscreen mode
-
-**Enable streaming:** Use `--stream-port` flag when connecting (e.g., `agent-rdp --stream-port 9224 connect ...`).
+Supports live JPEG frame streaming, mouse input (click, move, drag, scroll),
+keyboard input, and fullscreen mode. See [WEBSOCKET.md](../docs/WEBSOCKET.md)
+for the protocol.

@@ -87,11 +87,14 @@ Messages are raw JSON (DVC handles message framing automatically).
 ```json
 {
   "type": "handshake",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "agent_pid": 12345,
   "capabilities": ["snapshot", "click", "select", "toggle", ...]
 }
 ```
+
+The daemon feature-detects from `capabilities` — `query_result` and the
+`file_*` commands are only used when the connected agent advertises them.
 
 **Request** (Rust → PowerShell):
 ```json
@@ -244,6 +247,21 @@ Commands use native Windows UI Automation patterns for reliable interaction:
 | `context_menu` | Focus + Shift+F10 (keyboard) | Opening context menus |
 | `fill` | ValuePattern.SetValue() | Text fields |
 
+### Non-UI Commands
+
+| Command | Purpose |
+|---------|---------|
+| `run` / `run_poll` | Launch a process; wait, or stream its output incrementally |
+| `file_write_chunk` | Append one base64 chunk to a remote file; verifies SHA-256 on the last chunk |
+| `file_read_chunk` | Read a byte range of a remote file as base64 |
+| `file_stat` | Existence, size and SHA-256 of a remote path |
+| `query_result` | Look up the recorded outcome of an earlier request by id |
+| `status` | Agent pid, version, capabilities |
+
+File transfer is byte-oriented on both sides (`[IO.File]` plus base64 on the
+wire): text-mode I/O would re-encode the payload through the console codepage
+and corrupt anything that isn't ASCII.
+
 **Why patterns instead of mouse clicks?**
 - **Reliability**: Patterns interact directly with the control, not via coordinates
 - **Speed**: No need to calculate positions or simulate mouse movement
@@ -253,9 +271,24 @@ Commands use native Windows UI Automation patterns for reliable interaction:
 
 ### Response Timeout
 
-Default timeout: 10 seconds
+Default: 10 seconds, awaited on a oneshot channel. Commands that carry their
+own budget get that budget plus the default instead — `run --wait` and
+`wait-for` would otherwise be cut off while the agent was still working. After
+3 consecutive failures the channel is treated as dead and the error suggests
+reconnecting.
 
-The daemon awaits response via oneshot channel with timeout. After 3 consecutive failures, the channel is considered dead and an error is returned suggesting reconnection.
+### Indeterminate Results
+
+A lost reply is not a failed action: the agent may have applied it and only the
+acknowledgement went missing. The agent journals its last 64 responses by
+request id, so on a timeout the daemon issues `query_result` and resolves the
+outcome — returning the real result if the request completed, or reporting that
+it never ran (and is therefore safe to retry) if the agent has no record. Only
+when the agent is still busy does an indeterminate result survive.
+
+Because the agent's loop is strictly serial, a `query_result` sent while the
+original command is still executing queues behind it and is answered once the
+agent frees up.
 
 ### Error Codes
 
@@ -291,12 +324,20 @@ When the DVC channel closes or errors, the PS agent:
 | `automation/dvc_ipc.rs` | IPC client (request/response handling) |
 | `automation/scripts/agent.ps1` | Embedded PowerShell agent |
 | `automation/scripts/lib/dvc.ps1` | WTS API P/Invoke for DVC |
-| `handlers/automate.rs` | CLI command dispatch |
+| `automation/scripts/lib/actions.ps1` | Command implementations, file transfer, result journal |
+| `handlers/automate.rs` | CLI command dispatch, per-request timeouts, indeterminate resolution |
+| `handlers/file_transfer.rs` | Chunked file push/pull with SHA-256 verification |
 | `rdp_session.rs` | DrdynvcClient setup and DVC command handling |
 
 ## Limitations
 
 1. **Single Session**: One automation agent per RDP connection
-2. **UAC**: Cannot automate elevated (admin) windows from non-elevated context
-3. **WebViews**: Cannot access content inside WebView controls (Edge, Electron apps)
-4. **Bootstrap via RDPDR**: Initial agent launch still uses drive mapping
+2. **Serial execution**: One command at a time; a long `run --wait` blocks every
+   other automate command until it returns
+3. **UAC**: Cannot automate elevated (admin) windows from non-elevated context
+4. **WebViews**: Cannot access content inside WebView controls (Edge, Electron apps)
+5. **Bootstrap via RDPDR**: Initial agent launch still uses drive mapping — but
+   the agent must never *itself* read `\\TSCLIENT\...`. Drive I/O is serviced
+   by the same frame-processor task that carries this DVC channel, so the agent
+   would be waiting on a reply that cannot be produced until it stops waiting.
+   Use the `file_*` commands instead.
