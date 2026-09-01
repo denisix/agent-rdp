@@ -1,6 +1,6 @@
 {
   "name": "@denisixnpm/agent-rdp-linux-arm64",
-  "version": "0.7.9",
+  "version": "0.7.10",
   "description": "agent-rdp native binary for Linux ARM64",
   "repository": {
     "type": "git",
