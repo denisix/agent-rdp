@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.9](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.8...agent-rdp-v0.7.9) (2026-09-01)
+
+
+### Features
+
+* add frame_seq/frame_hash to screenshots, document remaining OCR/1C risks ([bb5fc98](https://github.com/denisix/agent-rdp/commit/bb5fc988e0b296ef1f0bb1085240b8264ffa9e0d))
+
 ## [0.7.8](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.7...agent-rdp-v0.7.8) (2026-08-31)
 
 
