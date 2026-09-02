@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.12](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.11...agent-rdp-rust-v0.7.12) (2026-09-02)
+
+
+### Features
+
+* detect stale daemons, idempotent run retries, honest exit codes, diagnostics bundle ([07470e8](https://github.com/denisix/agent-rdp/commit/07470e8271c0c7e163ad4ff07eb4de4d7d6736c2))
+
 ## [0.7.11](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.10...agent-rdp-rust-v0.7.11) (2026-09-02)
 
 
