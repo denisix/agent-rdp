@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.11](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.10...agent-rdp-rust-v0.7.11) (2026-09-02)
+
+
+### Features
+
+* fix file push framing, run prelude, stream polling, clipboard CRLF, and daemon health verdicts ([1e470fd](https://github.com/denisix/agent-rdp/commit/1e470fdff55839237e5f8684b594520201039d8a))
+
 ## [0.7.10](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.9...agent-rdp-rust-v0.7.10) (2026-09-01)
 
 

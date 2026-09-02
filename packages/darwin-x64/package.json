@@ -1,6 +1,6 @@
 {
   "name": "@denisixnpm/agent-rdp-darwin-x64",
-  "version": "0.7.10",
+  "version": "0.7.11",
   "description": "agent-rdp native binary for macOS x64 (Intel)",
   "repository": {
     "type": "git",
