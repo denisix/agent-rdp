@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.13](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.12...agent-rdp-v0.7.13) (2026-09-02)
+
+
+### Bug Fixes
+
+* stop the daemon dying 90s after spawn, plus run/file-pull fixes from the 0.7.11 field report ([c98b42f](https://github.com/denisix/agent-rdp/commit/c98b42fad3807d6c431884783cd849a036512ddb))
+
 ## [0.7.12](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.11...agent-rdp-v0.7.12) (2026-09-02)
 
 
