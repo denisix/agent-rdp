@@ -550,6 +550,12 @@ pub struct FilePullRequest {
     pub remote_path: String,
     /// Destination path on this machine.
     pub local_path: String,
+    /// Refuse (with `stale_file`) if the remote file was last written more
+    /// than this many seconds ago, by the remote machine's clock. Nothing is
+    /// transferred in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub max_age_secs: Option<u64>,
 }
 
 #[cfg(test)]

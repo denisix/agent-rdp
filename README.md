@@ -212,11 +212,18 @@ corrupted transfer fails loudly instead of leaving a plausible-looking file.
 ```bash
 agent-rdp file push ./report.xlsx "C:\\Users\\Admin\\report.xlsx"
 agent-rdp file pull "C:\\Users\\Admin\\export.csv" ./export.csv
+agent-rdp file pull "C:\\out\\result.json" ./result.json --max-age 120   # stale_file if older
 ```
 
 Transfers are byte-exact, which also makes this the reliable way to place a
 script with non-ASCII content on the remote — writing one through the clipboard
 or `Add-Content` re-encodes it and mangles anything outside ASCII. Limit: 128MB.
+
+`pull` reports the remote file's last-write time (`Modified: … (Ns ago by the
+remote clock)`; `modified`/`modified_unix`/`age_secs` in JSON), so a result
+file can be told from yesterday's without reading it; `--max-age <secs>`
+refuses a stale one outright. The age is computed from the remote machine's
+own clock, so it is right even when the two hosts disagree on the time.
 
 ### Locate (OCR)
 
@@ -344,25 +351,48 @@ retry that reuses the key — after `indeterminate`, an IPC timeout or
 per agent process (last 64 results) and empty after a reconnect, so after
 `connect` verify the side effect instead of retrying blindly.
 
-**`run` exit codes mean something.** The child runs with
-`$ErrorActionPreference='Stop'`, so a cmdlet that fails non-terminatingly —
-`Add-Content` to a locked file, `Set-Content` to a bad path — exits 1 with the
-error on stderr instead of reporting success for a write that never happened.
-A script that wants continue-on-error sets `$ErrorActionPreference='Continue'`
-on its first line. Do not redirect `*>` into a file the script itself writes:
-the child holds it open and the script's own writes fail with "being used by
-another process" — `run --wait` captures output without a file, and
-`run --stream` + `run-poll` covers long jobs.
+**`run` exit codes mean something, and errors arrive as text.** The child
+runs with `$ErrorActionPreference='Stop'` inside a `try/catch` the agent adds:
+a cmdlet that fails non-terminatingly — `Add-Content` to a locked file,
+`Set-Content` to a bad path — exits 1, and stderr carries the whole exception
+chain as plain text (`ERROR: <type>: <message>`, then `caused by …` for each
+inner exception, the failing line, and the script stack trace). The inner
+exceptions are where a COM error's real message lives — a 1C failure that
+used to surface as a bare `NullReferenceException` now shows the COM text
+under it. Native commands keep their own exit code. Scripts that start with
+`param(...)` or `using` get the prelude but no wrapper (those must be a
+script's first statements). A script that wants continue-on-error sets
+`$ErrorActionPreference='Continue'` on its first line; note that with `Stop`,
+a native command's stderr merged via `2>&1` is an error. Do not redirect `*>`
+into a file the script itself writes: the child holds it open and the script's
+own writes fail with "being used by another process" — `run --wait` captures
+output without a file.
+
+**Detached launches report an immediate death.** `run` without `--wait`
+returns the pid; if the process has already exited ~250ms later the reply
+also carries `early_exit: true` and its `exit_code` — the "it said it started
+but nothing happened" case made visible at launch time.
+
+**Do not `Stop-Process -Name powershell` from a script.** The automation agent
+is a `powershell.exe` process, and so are `run --stream` children; that kills
+them all (`automate restart` brings the agent back, streamed pids are gone).
+Children see the agent's pid as `$env:AGENT_RDP_AGENT_PID`:
+`Get-Process powershell | Where-Object { $_.Id -notin $PID, [int]$env:AGENT_RDP_AGENT_PID } | Stop-Process`.
 
 **Long-running commands** get the time they ask for: the transport deadline,
 the CLI socket timeout and the watchdog all extend to cover
 `--process-timeout`/`--timeout`. But the agent handles one command at a time,
 so a long `run --wait` blocks every other `automate` call — past about a
-minute, prefer `run --stream` plus `run-poll`. Streamed output is captured to
-files on the remote side, so nothing is lost if the process exits between
-polls; a finished process stays pollable for 10 minutes and repeat polls return
-`exited: true` with empty chunks. (If you redirect inside the command instead,
-note that Windows PowerShell 5.1's `>` writes UTF-16LE.)
+minute, prefer `run --stream` plus `run-poll` — that is the detached mode:
+`run-poll <pid> --follow [--follow-timeout <ms>]` keeps polling until the
+process exits, printing output as it arrives and the exit code at the end, so
+one command collects everything (a single plain poll before the child has
+flushed prints nothing, which looks like lost output). Streamed output is
+captured to files on the remote side, so nothing is lost if the process exits
+between polls; a finished process stays pollable for 10 minutes and repeat
+polls return `exited: true` with empty chunks. `--wait --stream` waits (the
+stream flag is ignored, with a note). (If you redirect inside the command
+instead, note that Windows PowerShell 5.1's `>` writes UTF-16LE.)
 
 **`daemon_not_running` vs `daemon_unresponsive`.** The first means no daemon
 process exists — reconnect, and `<session>/daemon.log` says why it exited. The

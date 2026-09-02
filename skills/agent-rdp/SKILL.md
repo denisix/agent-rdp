@@ -6,7 +6,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.12. Check with `agent-rdp session info` (shows
+Tested against agent-rdp 0.7.13. Check with `agent-rdp session info` (shows
 both CLI and daemon versions) — a `daemon_version_mismatch` error means an
 older daemon survived an upgrade; run `connect` again to replace it.
 
@@ -56,14 +56,30 @@ entries) and empty after `connect`, so after a reconnect verify the side effect
 (`Test-Path`, file length) rather than retrying.
 
 **`run` exit codes are trustworthy; still verify side effects.** The child
-runs with `$ErrorActionPreference='Stop'`, so a failed cmdlet (locked file, bad
-path, access denied) exits non-zero with the error on stderr — "exit 0 but the
-file was never created" is no longer possible for cmdlet errors. Native
-executables keep their own exit codes. For anything that matters, confirm the
-effect (`automate run "Test-Path ..." --wait`) before building on it. Never
-redirect `*>` into a file the script itself writes — the child holds it open
-and the script fails with "being used by another process"; `run --wait`
-captures output without any file.
+runs with `$ErrorActionPreference='Stop'` inside an agent-added `try/catch`,
+so a failed cmdlet (locked file, bad path, access denied) exits non-zero and
+stderr carries the full exception chain as plain text: `ERROR: <type>:
+<message>`, `caused by <inner type>: <message>` for each inner exception (this
+is where a 1C COM error's real text is), the failing line, the stack trace.
+Native executables keep their own exit codes. A detached `run` (no `--wait`)
+that dies within ~250ms comes back with `early_exit: true` + `exit_code` —
+treat that as "never ran". For anything that matters, confirm the effect
+(`automate run "Test-Path ..." --wait`, or `file pull --max-age`) before
+building on it. Never redirect `*>` into a file the script itself writes — the
+child holds it open and the script fails with "being used by another
+process"; `run --wait` captures output without any file. Scripts starting
+with `param(`/`using` are run unwrapped.
+
+**Never `Stop-Process -Name powershell` in a script.** The agent is a
+`powershell.exe`, and so are streamed children: that kills them all. Exclude
+the agent: `Get-Process powershell | Where-Object { $_.Id -notin $PID, [int]$env:AGENT_RDP_AGENT_PID } | Stop-Process`.
+If it happens, `automate restart` relaunches the agent (streamed pids are lost).
+
+**1C COM from PowerShell: a `NullReferenceException` with source
+`System.Management.Automation` is PowerShell's COM binder, not 1C.** Seen with
+`ПОДОБНО`/`LIKE` in a query text (`=` works). Call through reflection instead:
+`[System.__ComObject].InvokeMember('Execute', 'InvokeMethod', $null, $query, $null)`
+— the same trick that also recovers the real 1C error text inside `catch`.
 
 **Never touch `\\TSCLIENT\...` from `automate run`.** Drive redirection is
 serviced by the same task that carries the automation channel, so reading the
@@ -77,16 +93,24 @@ command at a time, so a long `run --wait` stalls every other `automate` call.
 Past ~1 minute prefer streaming:
 
 ```bash
-agent-rdp automate run "long-build.cmd" --stream   # returns a pid immediately
-agent-rdp automate run-poll <pid>                  # drain output; repeat until exited
+agent-rdp automate run "long-build.cmd" --stream                     # returns a pid immediately
+agent-rdp automate run-poll <pid> --follow --follow-timeout 600000   # collect until exit (or 10 min)
+agent-rdp automate run-poll <pid>                                    # single poll; repeat until exited
 ```
 
-Output is captured to files on the remote side, so nothing is lost if the
-process exits between polls; the final poll returns the tail plus
+This is the detached mode — use it instead of hand-rolled WMI
+`Win32_Process.Create` + out-file polling. `--follow` prints output as it
+arrives and the exit code at the end; a single plain poll issued before the
+child has flushed prints nothing (not lost, just not yet written — poll
+again). Output is captured to files on the remote side, so nothing is lost if
+the process exits between polls; the final poll returns the tail plus
 `exited: true`, and a repeat poll within 10 minutes returns `exited: true`
-again with empty chunks rather than an error. If you redirect inside the
-command instead (`*> out.txt`), remember Windows PowerShell 5.1 writes UTF-16LE
-— use `| Out-File -Encoding utf8` before `file pull`.
+again with empty chunks rather than an error. `--wait --stream` waits. Put
+agent-rdp options *before* the command: anything after it (or after `--`)
+goes to the remote shell, and a `--wait` there is refused rather than
+silently launching detached. If you redirect inside the command instead
+(`*> out.txt`), remember Windows PowerShell 5.1 writes UTF-16LE — use
+`| Out-File -Encoding utf8` before `file pull`.
 
 **"Channel unresponsive" is usually transient.** Re-probe with `automate
 status` — it reports agent uptime, last DVC round-trip and consecutive-failure
@@ -233,6 +257,7 @@ agent-rdp drive list                       # remote path: \\tsclient\Share
 # non-ASCII content. Use instead of clipboard payloads or \\TSCLIENT access.
 agent-rdp file push ./local.txt "C:\Users\Admin\remote.txt"
 agent-rdp file pull "C:\Users\Admin\out.csv" ./out.csv
+agent-rdp file pull "C:\out\result.json" ./r.json --max-age 120  # stale_file if older; prints Modified/age
 
 # OCR / locate
 agent-rdp locate "Cancel"                  # substring match, returns coords

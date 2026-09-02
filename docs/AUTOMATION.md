@@ -96,7 +96,7 @@ Messages are JSON documents, one per DVC message (framing as above).
 ```json
 {
   "type": "handshake",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "agent_pid": 12345,
   "capabilities": ["snapshot", "click", "select", "toggle", ...]
 }
@@ -260,10 +260,10 @@ Commands use native Windows UI Automation patterns for reliable interaction:
 
 | Command | Purpose |
 |---------|---------|
-| `run` / `run_poll` | Launch a process; wait, or stream its output incrementally. The child's prelude sets `$ErrorActionPreference='Stop'`, `$ProgressPreference='SilentlyContinue'` and UTF-8 console output, so non-terminating cmdlet errors exit 1 instead of 0. Streamed output is captured to files under `%TEMP%\agent-rdp-run` and read back by offset, so nothing is lost if the process exits between polls; finished entries stay pollable for 10 minutes. Child stderr arrives CLIXML-serialized (PowerShell's behavior on a redirected stderr); the daemon reduces it to the text of error/warning records and drops progress noise. A `run` carrying `idempotency_key` uses it as the request id (see Indeterminate Results) |
+| `run` / `run_poll` | Launch a process; wait, or stream its output incrementally. The child script is assembled by `New-ChildScript`: a prelude (UTF-8 console output without BOM, guarded so a console-less child cannot die on it; `$ProgressPreference='SilentlyContinue'`; `$ErrorActionPreference='Stop'`; `$env:AGENT_RDP_AGENT_PID`), then the user script inside `try { … } catch { … }` whose catch prints the exception chain as plain text to stderr and exits 1, with `$LASTEXITCODE` preserved for native commands. Scripts with a `param` block or `using` statements (detected with the PowerShell parser) get the prelude only. `wait` takes precedence over `stream`. A detached launch reports `early_exit`/`exit_code` if the child is gone ~250ms after start. Streamed output is captured to files under `%TEMP%\agent-rdp-run` and read back by offset (a read failure is reported in-band and retried next poll); finished entries stay pollable for 10 minutes. Remaining CLIXML on stderr (parse errors, unwrapped scripts) is reduced by the daemon to the text of error/warning records, including `<Obj>` records' `ToString`. A `run` carrying `idempotency_key` uses it as the request id (see Indeterminate Results) |
 | `file_write_chunk` | Append one base64 chunk to a remote file; verifies SHA-256 on the last chunk |
 | `file_read_chunk` | Read a byte range of a remote file as base64 |
-| `file_stat` | Existence, size and SHA-256 of a remote path |
+| `file_stat` | Existence, size, SHA-256, `modified_unix` (last write, UTC) and `now_unix` (the remote clock) of a remote path — the daemon derives the file's age from the two without assuming the hosts' clocks agree |
 | `query_result` | Look up the recorded outcome of an earlier request by id |
 | `status` | Agent pid, version, capabilities, `log_path` (the agent's own log, pulled by `agent-rdp diagnose`) |
 

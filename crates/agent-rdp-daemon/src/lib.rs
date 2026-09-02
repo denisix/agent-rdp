@@ -144,6 +144,16 @@ pub async fn run_server(session: &str) -> anyhow::Result<()> {
     writeln!(pid_file, "{}", std::process::id())?;
     drop(pid_file);
 
+    // The one line that makes a daemon.log self-describing: which build,
+    // which pid, and that nothing in this process is going to time it out.
+    tracing::info!(
+        "agent-rdp daemon {} (pid {}) starting for session '{}'; this process runs \
+         without a watchdog and lives until `disconnect`/Shutdown",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        session
+    );
+
     // Create and run daemon
     let mut daemon = Daemon::new(session.to_string()).await?;
     let result = daemon.run().await;

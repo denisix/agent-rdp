@@ -572,32 +572,13 @@ function Invoke-Run {
     # and even backtick-escaping spaces still failed on literal parentheses like
     # `(x86)`. -EncodedCommand removes the command-line quoting layer entirely.
     $userScript = if ($commandArgs) { "$command $commandArgs" } else { $command }
-
-    # Progress records render into redirected stdout, so module autoloading
-    # ("Preparing modules for first use...") lands in the middle of the
-    # output a caller is trying to parse. Forcing UTF-8 on the child's own
-    # console output keeps non-ASCII text intact: the default is the OEM
-    # codepage, which turns Cyrillic into mojibake on its way back to us.
-    #
-    # `$ErrorActionPreference='Stop'` is what makes the exit code mean
-    # something. Without it a cmdlet that fails non-terminatingly - Add-Content
-    # to a locked file, Set-Content to a bad path, access denied - writes to
-    # the error stream and the process still exits 0, so the caller sees
-    # "success" with no side effect. A script that wants continue-on-error
-    # semantics can set the preference back on its first line.
-    #
-    # SINGLE-quoted on purpose. This text is source code for the *child*
-    # process; in a double-quoted string `$ProgressPreference` is expanded
-    # right here, in the agent, to its current value, and the child received
-    # `Continue='SilentlyContinue';...` - a CommandNotFoundException on every
-    # single `run`, plus the progress noise it was meant to silence.
-    $prelude = '$ErrorActionPreference=''Stop'';' +
-               '$ProgressPreference=''SilentlyContinue'';' +
-               '[Console]::OutputEncoding=[Text.Encoding]::UTF8;'
-    $script = $prelude + $userScript
+    $script = New-ChildScript -UserScript $userScript
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
 
-    if ($stream) {
+    # `--wait` wins over `--stream`, as documented. The reverse order returned
+    # only a pid for `--wait --stream`, and every byte of output went to files
+    # the caller was never told to poll.
+    if ($stream -and -not $wait) {
         return Start-StreamedRun -Shell $shell -EncodedCommand $encodedCommand -Hidden $hidden
     }
 
@@ -641,10 +622,131 @@ function Invoke-Run {
             stderr = $stderrTask.Result
         }
     } else {
+        return Get-LaunchResult -Process $process
+    }
+}
+
+# ---- child script assembly ----
+#
+# Everything below is source code for the *child* powershell.exe, shipped via
+# -EncodedCommand. Single-quoted here-strings on purpose: nothing in them may
+# be expanded in the agent's own scope (a double-quoted prelude once expanded
+# `$ProgressPreference` here and handed the child `Continue='SilentlyContinue'`,
+# a CommandNotFoundException on every single `run`).
+
+# Console encoding first and guarded: forcing UTF-8 keeps non-ASCII output
+# intact (the default OEM codepage turns Cyrillic into mojibake), but a child
+# without a console can throw on the setter - with `Stop` already in effect
+# that killed the child before the user's script ran. No BOM: the old
+# `[Text.Encoding]::UTF8` wrote one into the first streamed chunk.
+#
+# `$ErrorActionPreference='Stop'` is what makes the exit code mean something:
+# without it a cmdlet that fails non-terminatingly (Add-Content to a locked
+# file, Set-Content to a bad path) writes to the error stream and the process
+# still exits 0. A script that wants continue-on-error semantics sets the
+# preference back on its first line.
+$script:ChildPrelude = @'
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
+$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+'@
+
+$script:ChildWrapperHead = @'
+try {
+'@
+
+# The catch writes the whole exception chain as plain text to stderr. Plain
+# text never becomes CLIXML, and the inner-exception walk is where a COM
+# error's real message lives (a 1C COM failure surfaces as a bare
+# NullReferenceException at the top level). `exit N` in the user's script is
+# flow control, not an exception, and passes through untouched; the
+# `$LASTEXITCODE` line keeps a native command's exit code, which PowerShell
+# would otherwise collapse to 1.
+$script:ChildWrapperTail = @'
+
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+} catch {
+    $agentRdpErr = $_
+    $agentRdpLines = New-Object System.Collections.Generic.List[string]
+    $agentRdpEx = $agentRdpErr.Exception
+    if ($null -ne $agentRdpEx) {
+        $agentRdpLines.Add('ERROR: ' + $agentRdpEx.GetType().FullName + ': ' + $agentRdpEx.Message)
+        $agentRdpInner = $agentRdpEx.InnerException
+        while ($null -ne $agentRdpInner) {
+            $agentRdpLines.Add('  caused by ' + $agentRdpInner.GetType().FullName + ': ' + $agentRdpInner.Message)
+            $agentRdpInner = $agentRdpInner.InnerException
+        }
+    } else {
+        $agentRdpLines.Add('ERROR: ' + [string]$agentRdpErr)
+    }
+    if ($agentRdpErr.ErrorDetails -and $agentRdpErr.ErrorDetails.Message) {
+        $agentRdpLines.Add('  details: ' + $agentRdpErr.ErrorDetails.Message)
+    }
+    if ($agentRdpErr.InvocationInfo -and $agentRdpErr.InvocationInfo.PositionMessage) {
+        $agentRdpLines.Add($agentRdpErr.InvocationInfo.PositionMessage)
+    }
+    if ($agentRdpErr.ScriptStackTrace) {
+        $agentRdpLines.Add($agentRdpErr.ScriptStackTrace)
+    }
+    try { [Console]::Error.WriteLine(($agentRdpLines -join [Environment]::NewLine)) } catch {}
+    exit 1
+}
+'@
+
+# A script with a param() block or `using` statements cannot live inside
+# `try { }` - those must be the first statements of a script - and a script
+# that does not parse gets no wrapper either, so PowerShell reports the parse
+# error itself (that path still arrives as CLIXML; the daemon cleans it).
+function Test-ChildScriptWrappable {
+    param([string]$UserScript)
+
+    try {
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($UserScript, [ref]$tokens, [ref]$errors)
+        if ($errors -and $errors.Count -gt 0) { return $false }
+        if ($null -ne $ast.ParamBlock) { return $false }
+        if ($ast.UsingStatements -and $ast.UsingStatements.Count -gt 0) { return $false }
+        return $true
+    } catch {
+        return $true
+    }
+}
+
+function New-ChildScript {
+    param([string]$UserScript)
+
+    # The agent's own pid, so a script can clean up stray powershell.exe
+    # processes without killing the process that is running it.
+    $prelude = $script:ChildPrelude + "`n" +
+               '$env:AGENT_RDP_AGENT_PID = ''' + $PID + '''' + "`n"
+
+    if (Test-ChildScriptWrappable -UserScript $UserScript) {
+        return $prelude + $script:ChildWrapperHead + "`n" + $UserScript + $script:ChildWrapperTail
+    }
+    return $prelude + $UserScript
+}
+
+# The launch reply for a detached child. A child that dies within its first
+# moments - a script that fails before its first statement, a missing
+# executable behind the wrapper - used to be indistinguishable from one that
+# is running: `Process.Start` had succeeded, and that was all the caller
+# learned. Waiting a beat and reporting an early exit makes "it never ran"
+# visible at launch time instead of at the next file pull.
+$script:EarlyExitProbeMs = 250
+
+function Get-LaunchResult {
+    param([System.Diagnostics.Process]$Process)
+
+    Start-Sleep -Milliseconds $script:EarlyExitProbeMs
+    if ($Process.HasExited) {
         return @{
-            pid = $process.Id
+            pid = $Process.Id
+            exit_code = $Process.ExitCode
+            early_exit = $true
         }
     }
+    return @{ pid = $Process.Id }
 }
 
 # ---- run --stream: file-backed capture ----
@@ -749,16 +851,33 @@ function Start-StreamedRun {
     if ($null -eq $script:StreamedProcesses) {
         $script:StreamedProcesses = @{}
     }
+    # Windows reuses pids. Overwriting silently orphaned the previous entry's
+    # undrained output and leaked its files.
+    if ($script:StreamedProcesses.ContainsKey($process.Id)) {
+        $old = $script:StreamedProcesses[$process.Id]
+        foreach ($p in @($old.StdoutPath, $old.StderrPath)) {
+            try { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        $script:StreamedProcesses.Remove($process.Id)
+    }
     $script:StreamedProcesses[$process.Id] = $state
 
-    return @{
-        pid = $process.Id
+    $launch = Get-LaunchResult -Process $process
+    if ($launch.early_exit) {
+        # Record it now so the first poll already reports `exited`.
+        $state.ExitedAt = Get-Date
+        $state.ExitCode = $launch.exit_code
     }
+    return $launch
 }
 
-# Read everything appended to $Path since $Offset. Returns the decoded text
-# and the new offset. The child still has the file open for writing, so open
-# with full sharing.
+# Read everything appended to $Path since $Offset. Returns the decoded text,
+# the new offset, and an Error message instead of throwing: a poll must never
+# fail as a whole because one side's file was momentarily unreadable (the
+# child's sharing mode, an AV scanner, a race with eviction), and it must not
+# lose the other side's chunk - which is what an exception here did, after
+# the stdout offset had already advanced. The child still has the file open
+# for writing, so open with full sharing.
 function Read-StreamTail {
     param(
         [string]$Path,
@@ -766,15 +885,16 @@ function Read-StreamTail {
         [System.Text.Decoder]$Decoder
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return @{ Text = ""; Offset = $Offset }
-    }
-
-    $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
-    $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+    $fs = $null
     try {
+        if (-not (Test-Path -LiteralPath $Path)) {
+            return @{ Text = ""; Offset = $Offset; Error = $null }
+        }
+
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
         if ($fs.Length -le $Offset) {
-            return @{ Text = ""; Offset = $Offset }
+            return @{ Text = ""; Offset = $Offset; Error = $null }
         }
         [void]$fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
         $count = [int]($fs.Length - $Offset)
@@ -785,14 +905,22 @@ function Read-StreamTail {
             if ($n -le 0) { break }
             $read += $n
         }
-        $chars = New-Object char[] ($Decoder.GetCharCount($bytes, 0, $read))
-        $charCount = $Decoder.GetChars($bytes, 0, $read, $chars, 0)
+        # A UTF-8 BOM at the very start of the file is framing, not output.
+        $start = 0
+        if ($Offset -eq 0 -and $read -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            $start = 3
+        }
+        $chars = New-Object char[] ($Decoder.GetCharCount($bytes, $start, $read - $start))
+        $charCount = $Decoder.GetChars($bytes, $start, $read - $start, $chars, 0)
         return @{
             Text   = [string]::new($chars, 0, $charCount)
             Offset = $Offset + $read
+            Error  = $null
         }
+    } catch {
+        return @{ Text = ""; Offset = $Offset; Error = $_.Exception.Message }
     } finally {
-        $fs.Dispose()
+        if ($null -ne $fs) { $fs.Dispose() }
     }
 }
 
@@ -831,10 +959,16 @@ function Invoke-RunPoll {
     $err = Read-StreamTail -Path $state.StderrPath -Offset $state.StderrOffset -Decoder $state.StderrDecoder
     $state.StderrOffset = $err.Offset
 
+    # A read failure is reported in-band, on the stderr side, and the offset
+    # was not advanced, so the next poll retries the same bytes.
+    $stderrText = $err.Text
+    if ($out.Error) { $stderrText += "[run-poll: stdout not readable this poll: $($out.Error)]`n" }
+    if ($err.Error) { $stderrText += "[run-poll: stderr not readable this poll: $($err.Error)]`n" }
+
     return @{
         pid = $targetPid
         stdout_chunk = $out.Text
-        stderr_chunk = $err.Text
+        stderr_chunk = $stderrText
         exited = $exited
         exit_code = $exitCode
     }
@@ -1015,11 +1149,19 @@ function Invoke-FileStat {
         return @{ exists = $true; is_directory = $true; size = 0 }
     }
 
+    # Modification time and the current time, both from this machine's clock,
+    # so the daemon can compute the file's age without any assumption about
+    # clock agreement between the two hosts. Explicit UTC epoch: parsing
+    # '1970-01-01Z' yields a Local-kind DateTime and subtraction ignores Kind.
+    $epoch = [datetime]::new(1970, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc)
+
     return @{
         exists = $true
         is_directory = $false
         size = $item.Length
         sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower()
+        modified_unix = [int64]($item.LastWriteTimeUtc - $epoch).TotalSeconds
+        now_unix = [int64]([datetime]::UtcNow - $epoch).TotalSeconds
     }
 }
 

@@ -19,4 +19,19 @@ sha256: string,
 /**
  * Number of chunks the transfer was split into.
  */
-chunks: number, };
+chunks: number, 
+/**
+ * Pull only: the remote file's last-write time (RFC 3339, UTC).
+ */
+modified?: string, 
+/**
+ * Pull only: the same as Unix seconds.
+ */
+modified_unix?: number, 
+/**
+ * Pull only: seconds between the remote file's last write and the
+ * remote machine's clock at stat time - the freshness signal that tells
+ * a just-written result from yesterday's, without depending on the two
+ * machines' clocks agreeing.
+ */
+age_secs?: number, };

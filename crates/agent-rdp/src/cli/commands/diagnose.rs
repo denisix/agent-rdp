@@ -315,6 +315,7 @@ async fn pull_remote_log(client: &mut IpcClient, bundle: &mut Bundle, remote_pat
     let request = Request::FilePull(FilePullRequest {
         remote_path: remote_path.to_string(),
         local_path: local.display().to_string(),
+        max_age_secs: None,
     });
     match client.send(&request, REMOTE_LOG_TIMEOUT_MS).await {
         Ok(resp) if resp.success => match std::fs::read(&local) {

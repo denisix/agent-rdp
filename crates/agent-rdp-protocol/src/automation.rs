@@ -482,6 +482,12 @@ pub struct RunResult {
     /// again.
     #[serde(default)]
     pub replayed: bool,
+    /// Detached launch only (`wait: false`): the process had already exited
+    /// when the agent checked ~250ms after starting it, and `exit_code`
+    /// carries its status. A script that fails before its first real
+    /// statement is otherwise indistinguishable from one that is running.
+    #[serde(default)]
+    pub early_exit: bool,
 }
 
 /// Incremental output from a process started with `Run { stream: true, .. }`.

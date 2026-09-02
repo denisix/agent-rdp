@@ -187,6 +187,9 @@ pub async fn handle_push(
         bytes: data.len() as u64,
         sha256,
         chunks: total_chunks as u64,
+        modified: None,
+        modified_unix: None,
+        age_secs: None,
     }))
 }
 
@@ -243,6 +246,34 @@ pub async fn handle_pull(
         );
     }
     let remote_sha256 = stat["sha256"].as_str().unwrap_or_default().to_string();
+
+    // Freshness, from the remote clock alone: both timestamps come from the
+    // same machine, so the age is right even when the two hosts' clocks
+    // disagree by hours. An agent predating the fields reports nothing.
+    let freshness = file_freshness(&stat);
+    if let (Some(max_age), Some(age)) = (params.max_age_secs, freshness.as_ref().map(|f| f.age_secs)) {
+        if age > max_age {
+            return Response::error(
+                ErrorCode::StaleFile,
+                format!(
+                    "'{}' was last written {}s ago (at {}), older than --max-age {}s - the \
+                     command that was supposed to produce it did not write it. Nothing was \
+                     transferred.",
+                    params.remote_path,
+                    age,
+                    freshness.as_ref().map(|f| f.modified.clone()).unwrap_or_default(),
+                    max_age
+                ),
+            );
+        }
+    } else if params.max_age_secs.is_some() {
+        return Response::error(
+            ErrorCode::AutomationError,
+            "--max-age needs an automation agent that reports file times (1.5.0+); \
+             reconnect to redeploy the agent"
+                .to_string(),
+        );
+    }
 
     info!("Pulling {} ({} bytes)", params.remote_path, total_size);
 
@@ -337,12 +368,62 @@ pub async fn handle_pull(
         bytes: data.len() as u64,
         sha256: local_sha256,
         chunks,
+        modified: freshness.as_ref().map(|f| f.modified.clone()),
+        modified_unix: freshness.as_ref().map(|f| f.modified_unix),
+        age_secs: freshness.as_ref().map(|f| f.age_secs),
     }))
+}
+
+/// What `file_stat` says about when the file was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Freshness {
+    pub modified: String,
+    pub modified_unix: u64,
+    pub age_secs: u64,
+}
+
+/// Freshness from a `file_stat` reply, or `None` when the agent does not
+/// report times (pre-1.5.0). The age saturates: a file "modified in the
+/// future" (clock stepped back) is simply fresh, not an underflow.
+pub fn file_freshness(stat: &serde_json::Value) -> Option<Freshness> {
+    let modified_unix = stat["modified_unix"].as_u64()?;
+    let now_unix = stat["now_unix"].as_u64()?;
+    Some(Freshness {
+        modified: crate::timefmt::utc_rfc3339(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_unix),
+        ),
+        modified_unix,
+        age_secs: now_unix.saturating_sub(modified_unix),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freshness_comes_from_the_remote_clock() {
+        let stat = serde_json::json!({
+            "exists": true, "size": 10, "sha256": "x",
+            "modified_unix": 1_788_360_301u64, "now_unix": 1_788_360_401u64
+        });
+        let f = file_freshness(&stat).unwrap();
+        assert_eq!(f.age_secs, 100);
+        assert_eq!(f.modified, "2026-09-02T14:45:01Z");
+        assert_eq!(f.modified_unix, 1_788_360_301);
+    }
+
+    #[test]
+    fn future_mtime_is_fresh_not_underflow() {
+        let stat = serde_json::json!({ "modified_unix": 200u64, "now_unix": 100u64 });
+        assert_eq!(file_freshness(&stat).unwrap().age_secs, 0);
+    }
+
+    #[test]
+    fn old_agents_report_no_freshness() {
+        let stat = serde_json::json!({ "exists": true, "size": 10, "sha256": "x" });
+        assert!(file_freshness(&stat).is_none());
+    }
 
     #[test]
     fn chunking_covers_every_byte_exactly_once() {

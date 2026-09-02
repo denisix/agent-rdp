@@ -73,6 +73,22 @@ pub fn record(session: &str, request: &Request, response: &Response, elapsed: Du
     });
 }
 
+/// Record a CLI-side event - a watchdog abort, a daemon-unavailable verdict,
+/// an argument error - so the transcript explains gaps the daemon never
+/// saw. Synchronous: the CLI is usually about to exit.
+pub fn append_event(session: &str, event: Value) {
+    if !enabled() {
+        return;
+    }
+    let line = json!({
+        "ts": timefmt::utc_rfc3339(SystemTime::now()),
+        "event": event,
+    });
+    if let Err(e) = append_line(&get_session_dir(session), &line) {
+        debug!("transcript event write failed: {}", e);
+    }
+}
+
 /// The request as JSON, with secrets and bulk removed.
 pub fn summarize_request(request: &Request) -> Value {
     let mut value = serde_json::to_value(request).unwrap_or(Value::Null);

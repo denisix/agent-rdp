@@ -5,12 +5,41 @@ use agent_rdp_protocol::Response;
 /// Output formatter.
 pub struct Output {
     json: bool,
+    /// Session and command, when known: every CLI-side error is then also
+    /// appended to the session's transcript, so a run of
+    /// `daemon_not_running`/`watchdog_timeout` verdicts shows which command
+    /// hit them and when - the daemon never saw those.
+    context: Option<(String, String)>,
 }
 
 impl Output {
     /// Create a new output formatter.
     pub fn new(json: bool) -> Self {
-        Self { json }
+        Self { json, context: None }
+    }
+
+    /// A formatter that also records CLI-side errors to the session's
+    /// transcript, labelled with the command.
+    pub fn with_context(json: bool, session: &str, command: &str) -> Self {
+        Self {
+            json,
+            context: Some((session.to_string(), command.to_string())),
+        }
+    }
+
+    /// Append a CLI-side error to the transcript without printing it.
+    pub fn record_error(&self, code: &str, message: &str) {
+        let Some((session, command)) = &self.context else {
+            return;
+        };
+        // The unresponsive verdict quotes a log tail; keep the line short.
+        let brief: String = message.chars().take(512).collect();
+        agent_rdp_daemon::transcript::append_event(
+            session,
+            serde_json::json!({
+                "cli_error": { "command": command, "code": code, "message": brief }
+            }),
+        );
     }
 
     /// Whether JSON output is enabled.
@@ -237,6 +266,16 @@ impl Output {
                 if let Some(pid) = result.pid {
                     eprintln!("Process ID: {}", pid);
                 }
+                if result.early_exit {
+                    eprintln!(
+                        "Process exited immediately{} - it did not start properly; run it with \
+                         --wait to see its stderr",
+                        result
+                            .exit_code
+                            .map(|c| format!(" with code {}", c))
+                            .unwrap_or_default()
+                    );
+                }
             }
             ResponseData::RunPollResult(result) => {
                 if !result.stdout_chunk.is_empty() {
@@ -287,6 +326,9 @@ impl Output {
                     result.bytes, result.path, result.chunks
                 );
                 println!("SHA-256: {}", result.sha256);
+                if let (Some(modified), Some(age)) = (&result.modified, result.age_secs) {
+                    println!("Modified: {} ({}s ago by the remote clock)", modified, age);
+                }
             }
             ResponseData::ClickResult(result) => {
                 if result.method == "double_click" {
@@ -375,6 +417,7 @@ impl Output {
 
     /// Print an error message.
     pub fn print_error(&self, code: &str, message: &str) {
+        self.record_error(code, message);
         if self.json {
             let response = agent_rdp_protocol::Response {
                 success: false,

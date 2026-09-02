@@ -220,6 +220,21 @@ pub struct FileTransferResult {
     /// Number of chunks the transfer was split into.
     #[ts(type = "number")]
     pub chunks: u64,
+    /// Pull only: the remote file's last-write time (RFC 3339, UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub modified: Option<String>,
+    /// Pull only: the same as Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub modified_unix: Option<u64>,
+    /// Pull only: seconds between the remote file's last write and the
+    /// remote machine's clock at stat time - the freshness signal that tells
+    /// a just-written result from yesterday's, without depending on the two
+    /// machines' clocks agreeing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub age_secs: Option<u64>,
 }
 
 /// Session information.
@@ -437,6 +452,11 @@ pub enum ErrorCode {
     /// "the fix didn't change anything" reports happen.
     #[error("daemon version mismatch")]
     DaemonVersionMismatch,
+
+    /// `file pull --max-age`: the remote file is older than allowed - the
+    /// command that was supposed to produce it did not write it.
+    #[error("stale file")]
+    StaleFile,
 
     /// Clipboard operation failed.
     #[error("clipboard error")]

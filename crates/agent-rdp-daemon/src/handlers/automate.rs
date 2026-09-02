@@ -647,6 +647,7 @@ fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
     let stderr = data["stderr"].as_str().map(clean_clixml);
     let pid = data["pid"].as_u64().map(|v| v as u32);
     let replayed = data["replayed"].as_bool().unwrap_or(false);
+    let early_exit = data["early_exit"].as_bool().unwrap_or(false);
 
     Ok(RunResult {
         exit_code,
@@ -654,6 +655,7 @@ fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
         stderr,
         pid,
         replayed,
+        early_exit,
     })
 }
 
@@ -726,6 +728,27 @@ pub fn clean_clixml(stderr: &str) -> String {
         rest = &element[body_start + close + 4..];
     }
 
+    // Structured records (`<Obj>` with a `<ToString>` rendering) instead of
+    // stream strings: keep their text too, so an error serialized that way
+    // is not silently dropped. Only when no string records were found, or
+    // the same error would appear twice.
+    if !extracted_any {
+        let mut rest = xml;
+        while let Some(start) = rest.find("<ToString>") {
+            let body_start = start + "<ToString>".len();
+            let Some(close) = rest[body_start..].find("</ToString>") else { break };
+            let text = decode_clixml_text(&rest[body_start..body_start + close]);
+            if !text.trim().is_empty() {
+                out.push_str(&text);
+                if !text.ends_with('\n') {
+                    out.push('\n');
+                }
+                extracted_any = true;
+            }
+            rest = &rest[body_start + close + "</ToString>".len()..];
+        }
+    }
+
     // A chunk that carried the marker but no complete element yet (a poll
     // split the XML) - hand the raw bytes back rather than swallowing them.
     if !extracted_any && !xml.contains("</Objs>") && !xml.contains("<S ") {
@@ -767,6 +790,20 @@ fn decode_clixml_text(body: &str) -> String {
 
 #[cfg(test)]
 mod clixml_tests {
+    /// A structured `<Obj>` error record (no `<S S="Error">` strings) must
+    /// not be dropped: its `<ToString>` rendering is the message.
+    #[test]
+    fn structured_error_records_keep_their_text() {
+        let input = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">\
+<Obj S=\"Error\" RefId=\"0\"><TN RefId=\"0\"><T>System.Management.Automation.ErrorRecord</T></TN>\
+<ToString>Exception calling &quot;Execute&quot;: &quot;{Модуль: (12)}: Поле не найдено&quot;_x000D__x000A_</ToString>\
+<Props><S N=\"FullyQualifiedErrorId\">ComMethodTargetInvocation</S></Props></Obj></Objs>";
+        let cleaned = super::clean_clixml(input);
+        assert!(cleaned.contains("Exception calling \"Execute\": \"{Модуль: (12)}: Поле не найдено\""), "{cleaned}");
+        assert!(!cleaned.contains("<Obj"));
+        assert!(!cleaned.contains("CLIXML"));
+    }
+
     use super::clean_clixml;
 
     #[test]

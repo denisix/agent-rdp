@@ -11,4 +11,10 @@ remote_path: string,
 /**
  * Destination path on this machine.
  */
-local_path: string, };
+local_path: string, 
+/**
+ * Refuse (with `stale_file`) if the remote file was last written more
+ * than this many seconds ago, by the remote machine's clock. Nothing is
+ * transferred in that case.
+ */
+max_age_secs?: number, };

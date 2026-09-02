@@ -312,21 +312,50 @@ mod tests {
     /// PowerShell), so pin the literal here.
     #[test]
     fn run_prelude_is_a_single_quoted_literal() {
-        assert!(
-            LIB_ACTIONS.contains("'$ProgressPreference=''SilentlyContinue'';'"),
-            "Invoke-Run's prelude must be a single-quoted literal so $ProgressPreference \
-             is not expanded in the agent's own scope"
-        );
+        // Single-quoted here-strings: nothing may be expanded in the agent.
+        assert!(LIB_ACTIONS.contains("$script:ChildPrelude = @'"));
+        assert!(LIB_ACTIONS.contains("$script:ChildWrapperTail = @'"));
         assert!(
             !LIB_ACTIONS.contains("\"$ProgressPreference="),
-            "Invoke-Run's prelude must not interpolate $ProgressPreference"
+            "the child prelude must not interpolate $ProgressPreference"
         );
-        // Non-terminating cmdlet errors must fail the child, or `run`
-        // reports exit 0 for a write that never happened.
-        assert!(
-            LIB_ACTIONS.contains("'$ErrorActionPreference=''Stop'';'"),
-            "Invoke-Run's prelude must set $ErrorActionPreference='Stop' in the child"
-        );
+        // Encoding first and guarded, then the preferences: with `Stop`
+        // already set, a console-less child died on the encoding setter.
+        let prelude_at = LIB_ACTIONS.find("[Text.UTF8Encoding]::new($false)").unwrap();
+        let stop_at = LIB_ACTIONS.find("$ErrorActionPreference = 'Stop'").unwrap();
+        assert!(prelude_at < stop_at, "console encoding must be set before Stop");
+        assert!(LIB_ACTIONS.contains("$ProgressPreference = 'SilentlyContinue'"));
+    }
+
+    /// The child script wrapper: exception chain as plain text on stderr,
+    /// native exit codes preserved, agent pid exposed, and `--wait` winning
+    /// over `--stream`.
+    #[test]
+    fn child_script_wrapper_reports_errors_and_exit_codes() {
+        assert!(LIB_ACTIONS.contains("if ($LASTEXITCODE) { exit $LASTEXITCODE }"));
+        assert!(LIB_ACTIONS.contains("'  caused by ' + $agentRdpInner.GetType().FullName"));
+        assert!(LIB_ACTIONS.contains("$agentRdpErr.ScriptStackTrace"));
+        assert!(LIB_ACTIONS.contains("[Console]::Error.WriteLine"));
+        assert!(LIB_ACTIONS.contains("$env:AGENT_RDP_AGENT_PID = '''"));
+        assert!(LIB_ACTIONS.contains("function Test-ChildScriptWrappable"));
+        assert!(LIB_ACTIONS.contains("$ast.ParamBlock"));
+        assert!(LIB_ACTIONS.contains("if ($stream -and -not $wait)"));
+        assert!(LIB_ACTIONS.contains("early_exit = $true"));
+
+        // The wrapper travels inside -EncodedCommand toward the ~32KB
+        // command-line limit; keep it small.
+        let tail_start = LIB_ACTIONS.find("$script:ChildWrapperTail = @'").unwrap();
+        let tail_end = LIB_ACTIONS[tail_start..].find("\n'@").unwrap();
+        assert!(tail_end < 4096, "child wrapper tail is {} bytes", tail_end);
+    }
+
+    /// `file_stat` reports both timestamps from the remote clock, from an
+    /// explicit UTC epoch (a parsed '1970-01-01Z' is Local-kind).
+    #[test]
+    fn file_stat_reports_remote_times() {
+        assert!(LIB_ACTIONS.contains("modified_unix = [int64]($item.LastWriteTimeUtc - $epoch)"));
+        assert!(LIB_ACTIONS.contains("now_unix = [int64]([datetime]::UtcNow - $epoch)"));
+        assert!(LIB_ACTIONS.contains("[System.DateTimeKind]::Utc"));
     }
 
     /// A retried request id must be answered from the journal, not

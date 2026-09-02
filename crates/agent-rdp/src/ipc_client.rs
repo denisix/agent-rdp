@@ -111,6 +111,21 @@ impl IpcClient {
         let mut line = String::with_capacity(64 * 1024);
         read_line_capped(&mut self.reader, &mut line, MAX_IPC_MESSAGE_BYTES).await?;
 
+        // EOF before any reply: the daemon closed the socket while this
+        // request was in flight. Parsing the empty line produced the
+        // notorious "EOF while parsing a value at line 1 column 0", which
+        // says nothing about what happened - the daemon exited (for two
+        // releases: killed by its own watchdog 90s after spawn) or was
+        // killed, taking the request with it.
+        if line.trim().is_empty() {
+            anyhow::bail!(
+                "The daemon closed the connection before answering - it exited or was \
+                 killed while handling this request. Run `agent-rdp session info`; if that \
+                 reports daemon_not_running, <session>/daemon.log says why it exited, and \
+                 `agent-rdp diagnose` bundles the evidence."
+            );
+        }
+
         let response: Response = serde_json::from_str(line.trim())?;
         Ok(response)
     }

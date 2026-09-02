@@ -64,36 +64,48 @@ async fn async_main(is_daemon: bool) {
 
     let cli = Cli::parse();
     let json = cli.json;
-    let watchdog_ms = watchdog_budget_ms(&cli);
+    let session = cli.session.clone();
+    let command = command_label(&cli);
 
-    let run_result = match tokio::time::timeout(
-        std::time::Duration::from_millis(watchdog_ms),
-        run(cli),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            // A defense-in-depth backstop, not the primary fix: every daemon-
-            // side wait that legitimately blocks (locate --wait, automate
-            // run --process-timeout, connect) already extends its own IPC
-            // timeout past the CLI default - this only fires if something
-            // hangs *past* that extended budget, e.g. a daemon handler stuck
-            // on a dead socket read with no timeout of its own. A CLI command
-            // must never hang indefinitely regardless of which internal path
-            // misbehaves.
-            let message = format!(
-                "Command exceeded its {}s watchdog budget and was aborted. This does not mean \
-                 the daemon crashed - check `session info` and `<session>/daemon.log`.",
-                watchdog_ms / 1000
-            );
-            if json {
-                output::Output::new(true).print_error("watchdog_timeout", &message);
-            } else {
-                eprintln!("Error [watchdog_timeout]: {}", message);
+    // The daemon is the one invocation that must run forever. It used to be
+    // wrapped like everything else, so every daemon exited 90s after it was
+    // spawned - the "daemon dies between commands" and "EOF while parsing a
+    // value" reports of two releases. The decision is made from the parsed
+    // command, not the argv heuristic used for runtime sizing above, which
+    // `automate run session daemon` would also match.
+    let run_result = match watchdog_budget_ms(&cli) {
+        None => run(cli).await,
+        Some(watchdog_ms) => match tokio::time::timeout(
+            std::time::Duration::from_millis(watchdog_ms),
+            run(cli),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // A defense-in-depth backstop, not the primary fix: every
+                // daemon-side wait that legitimately blocks (locate --wait,
+                // automate run --process-timeout, connect) already extends
+                // its own IPC timeout past the CLI default - this only fires
+                // if something hangs *past* that extended budget, e.g. a
+                // daemon handler stuck on a dead socket read with no timeout
+                // of its own. A CLI command must never hang indefinitely
+                // regardless of which internal path misbehaves.
+                let message = format!(
+                    "`{}` exceeded its {}s watchdog budget and was aborted (base {}s + the \
+                     command's own budget + {}s grace; raise it with --timeout or the \
+                     command's --process-timeout/--timeout). This does not mean the daemon \
+                     crashed - check `session info` and `<session>/daemon.log`.",
+                    command,
+                    watchdog_ms / 1000,
+                    DEFAULT_TIMEOUT_MS / 1000,
+                    WATCHDOG_GRACE_MS / 1000
+                );
+                let output = output::Output::with_context(json, &session, &command);
+                output.print_error("watchdog_timeout", &message);
+                std::process::exit(1);
             }
-            std::process::exit(1);
-        }
+        },
     };
 
     if let Err(e) = run_result {
@@ -104,12 +116,55 @@ async fn async_main(is_daemon: bool) {
         // output on exactly the paths most likely to need a *specific*
         // failure reason (a caller retrying on `timeout` vs. giving up on
         // `connection_failed`, for instance).
+        let output = output::Output::with_context(json, &session, &command);
         if json {
-            output::Output::new(true).print_error("cli_error", &e.to_string());
+            output.print_error("cli_error", &e.to_string());
         } else {
+            output.record_error("cli_error", &e.to_string());
             error!("{}", e);
         }
         std::process::exit(1);
+    }
+}
+
+/// Short name of the invoked command for messages and the transcript:
+/// `automate run`, `file pull`, `session daemon`.
+fn command_label(cli: &Cli) -> String {
+    match &cli.command {
+        Commands::Connect(_) => "connect".into(),
+        Commands::Disconnect => "disconnect".into(),
+        Commands::Screenshot(_) => "screenshot".into(),
+        Commands::Mouse(_) => "mouse".into(),
+        Commands::Keyboard(_) => "keyboard".into(),
+        Commands::Scroll(_) => "scroll".into(),
+        Commands::Clipboard(_) => "clipboard".into(),
+        Commands::Drive(_) => "drive".into(),
+        Commands::File(args) => match args.action {
+            cli::FileAction::Push { .. } => "file push".into(),
+            cli::FileAction::Pull { .. } => "file pull".into(),
+        },
+        Commands::Automate(args) => {
+            let action = match &args.action {
+                cli::AutomateAction::Run { .. } => "run",
+                cli::AutomateAction::RunPoll { .. } => "run-poll",
+                cli::AutomateAction::WaitFor { .. } => "wait-for",
+                cli::AutomateAction::Restart => "restart",
+                cli::AutomateAction::Status => "status",
+                cli::AutomateAction::Snapshot { .. } => "snapshot",
+                _ => "action",
+            };
+            format!("automate {}", action)
+        }
+        Commands::Locate(_) => "locate".into(),
+        Commands::ClickAt(_) => "click-at".into(),
+        Commands::Session(args) => match args.action {
+            cli::SessionAction::List => "session list".into(),
+            cli::SessionAction::Info => "session info".into(),
+            cli::SessionAction::Daemon => "session daemon".into(),
+        },
+        Commands::Wait { .. } => "wait".into(),
+        Commands::View(_) => "view".into(),
+        Commands::Diagnose(_) => "diagnose".into(),
     }
 }
 
@@ -124,12 +179,21 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const WATCHDOG_GRACE_MS: u64 = 60_000;
 
 /// Total time the watchdog allows a single CLI invocation to run before
-/// aborting it. Mirrors the same per-command extensions the IPC timeout
-/// itself applies (see `cli/commands/locate.rs`, `cli/commands/automate.rs`,
+/// aborting it, or `None` for the one invocation that must never be
+/// bounded: the daemon itself (`session daemon`). Mirrors the same
+/// per-command extensions the IPC timeout itself applies (see
+/// `cli/commands/locate.rs`, `cli/commands/automate.rs`,
 /// `cli/commands/wait.rs`), plus `WATCHDOG_GRACE_MS` slack, so a command that
 /// is legitimately still waiting on its own documented timeout is never
 /// mistaken for a hang.
-fn watchdog_budget_ms(cli: &Cli) -> u64 {
+fn watchdog_budget_ms(cli: &Cli) -> Option<u64> {
+    if matches!(
+        cli.command,
+        Commands::Session(cli::SessionArgs { action: cli::SessionAction::Daemon })
+    ) {
+        return None;
+    }
+
     let base = cli.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
     let extension = match &cli.command {
         Commands::Connect(_) => cli.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS),
@@ -137,6 +201,11 @@ fn watchdog_budget_ms(cli: &Cli) -> u64 {
         Commands::Automate(args) => match &args.action {
             cli::AutomateAction::Run { wait: true, process_timeout, .. } => {
                 process_timeout.unwrap_or(10_000)
+            }
+            // `--follow` is a CLI-side loop of ordinary polls; only the
+            // wall-clock budget grows, each poll keeps its own IPC timeout.
+            cli::AutomateAction::RunPoll { follow: true, follow_timeout, .. } => {
+                follow_timeout.unwrap_or(cli::commands::automate::DEFAULT_FOLLOW_TIMEOUT_MS)
             }
             cli::AutomateAction::WaitFor { timeout, .. } => timeout.unwrap_or(0),
             // Relaunching the agent retries the Win+R/handshake sequence up
@@ -155,7 +224,51 @@ fn watchdog_budget_ms(cli: &Cli) -> u64 {
         Commands::Diagnose(_) => cli::commands::diagnose::TOTAL_DAEMON_BUDGET_MS,
         _ => 0,
     };
-    base + extension + WATCHDOG_GRACE_MS
+    Some(base + extension + WATCHDOG_GRACE_MS)
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("agent-rdp").chain(args.iter().copied()))
+    }
+
+    /// The daemon ran under the watchdog for two releases and every daemon
+    /// died 90s after spawn. This is the regression test for that.
+    #[test]
+    fn daemon_is_never_bounded() {
+        assert_eq!(watchdog_budget_ms(&parse(&["session", "daemon"])), None);
+        assert_eq!(
+            watchdog_budget_ms(&parse(&["--session", "work", "session", "daemon"])),
+            None
+        );
+    }
+
+    #[test]
+    fn ordinary_commands_get_base_plus_grace() {
+        assert_eq!(
+            watchdog_budget_ms(&parse(&["session", "info"])),
+            Some(DEFAULT_TIMEOUT_MS + WATCHDOG_GRACE_MS)
+        );
+        // A command whose args merely mention "session daemon" is still bounded.
+        assert!(watchdog_budget_ms(&parse(&["automate", "run", "session", "daemon"])).is_some());
+    }
+
+    #[test]
+    fn follow_extends_the_watchdog_only() {
+        let budget = watchdog_budget_ms(&parse(&[
+            "automate", "run-poll", "42", "--follow", "--follow-timeout", "5000",
+        ]))
+        .unwrap();
+        assert_eq!(budget, DEFAULT_TIMEOUT_MS + 5000 + WATCHDOG_GRACE_MS);
+        // Without --follow, a poll is an ordinary single round trip.
+        assert_eq!(
+            watchdog_budget_ms(&parse(&["automate", "run-poll", "42"])),
+            Some(DEFAULT_TIMEOUT_MS + WATCHDOG_GRACE_MS)
+        );
+    }
 }
 
 /// Default timeout for `connect`. Connecting is not one round-trip: it covers
@@ -171,7 +284,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 150_000;
 async fn run(cli: Cli) -> anyhow::Result<()> {
     use output::Output;
 
-    let output = Output::new(cli.json);
+    let output = Output::with_context(cli.json, &cli.session, &command_label(&cli));
     let timeout = cli.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
 
     match cli.command {

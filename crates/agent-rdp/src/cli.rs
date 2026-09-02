@@ -580,6 +580,21 @@ pub enum AutomateAction {
     RunPoll {
         /// Process ID returned by the initial `run --stream` call
         pid: u32,
+
+        /// Keep polling (every 500ms) until the process exits or
+        /// --follow-timeout elapses, printing output as it arrives and the
+        /// exit code at the end. One command instead of a poll loop; a single
+        /// poll before the child has flushed prints nothing, which looked
+        /// like lost output.
+        #[arg(long)]
+        follow: bool,
+
+        /// With --follow: how long to keep polling, in milliseconds
+        /// (default: 60000). On expiry the process keeps running and can be
+        /// polled again. Distinct from the global --timeout, which bounds
+        /// each individual poll.
+        #[arg(long = "follow-timeout", value_name = "MS", requires = "follow")]
+        follow_timeout: Option<u64>,
     },
 
     /// Wait for an element to reach a state
@@ -716,6 +731,12 @@ pub enum FileAction {
         remote: String,
         /// Local destination path
         local: String,
+        /// Refuse (error `stale_file`) if the remote file was last written
+        /// more than this many seconds ago, by the remote clock. The way to
+        /// tell "the command wrote its result" from "this is yesterday's
+        /// file" without reading the content.
+        #[arg(long = "max-age")]
+        max_age: Option<u64>,
     },
 }
 

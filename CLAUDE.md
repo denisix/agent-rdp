@@ -111,6 +111,12 @@ TCP ports, temp directory locations.
 
 ### Timeouts
 
+**The daemon runs without any timeout.** `session daemon` is dispatched
+outside the CLI watchdog in `main.rs` (`watchdog_budget_ms` returns `None`
+for it, decided from the *parsed* command). For two releases it was not, and
+every daemon exited 90s after spawn — that was the entire "daemon dies between
+commands" / "EOF while parsing a value" saga. `watchdog_tests` guards it.
+
 Long commands are governed by four layers that must stay consistent, or the
 shortest silently decides the real limit:
 
@@ -119,6 +125,9 @@ shortest silently decides the real limit:
 2. the CLI's IPC socket timeout (`cli/commands/*.rs`)
 3. the CLI watchdog (`main.rs`, `watchdog_budget_ms`)
 4. the remote command's own budget (`--process-timeout`, `wait-for --timeout`)
+
+A CLI-side loop (`run-poll --follow`) extends only layer 3 by its own budget;
+each iteration keeps the ordinary per-request layers.
 
 Adding a command that can legitimately run long means extending 1–3 to cover 4.
 

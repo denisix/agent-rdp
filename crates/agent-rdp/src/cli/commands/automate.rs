@@ -48,6 +48,18 @@ pub async fn run(
     // rendering instead of the full tree dump.
     let focused_shorthand = matches!(args.action, AutomateAction::Focused);
 
+    // `--follow` is a CLI-side loop over ordinary polls; remember the budget
+    // before the action is consumed by the mapping.
+    let follow_budget = match &args.action {
+        AutomateAction::RunPoll { follow: true, follow_timeout, .. } => Some(
+            std::time::Duration::from_millis(follow_timeout.unwrap_or(DEFAULT_FOLLOW_TIMEOUT_MS)),
+        ),
+        _ => None,
+    };
+    if let AutomateAction::Run { wait: true, stream: true, .. } = &args.action {
+        eprintln!("Note: --stream is ignored when --wait is set; output is returned directly.");
+    }
+
     let automate_request = match build_request(args.action) {
         Ok(request) => request,
         Err(message) => {
@@ -62,6 +74,10 @@ pub async fn run(
     // CLI gives up on a request the daemon and agent are still working on,
     // and the caller is left not knowing whether it applied.
     let response = client.send(&request, automate_timeout_ms(&request, timeout_ms)).await?;
+
+    if let Some(budget) = follow_budget {
+        return follow_poll(&mut client, &request, response, budget, output, timeout_ms).await;
+    }
 
     match (focused_shorthand, output.is_json(), response.success, &response.data) {
         (true, false, true, Some(ResponseData::Snapshot(snapshot))) => {
@@ -86,6 +102,144 @@ pub async fn run(
 
 /// Minimum IPC timeout for `automate restart`.
 const RESTART_MIN_TIMEOUT_MS: u64 = 120_000;
+
+/// Default wall-clock budget for `run-poll --follow`.
+pub const DEFAULT_FOLLOW_TIMEOUT_MS: u64 = 60_000;
+
+/// Interval between polls in `run-poll --follow`.
+const FOLLOW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Poll until the process exits or the budget runs out.
+///
+/// Human output streams chunks as they arrive; `--json` aggregates them into
+/// one final `run_poll_result` so the consumer still gets a single document.
+/// Any poll error aborts the loop (it propagates as `cli_error`): retrying
+/// would race the wall-clock budget against the watchdog.
+async fn follow_poll(
+    client: &mut crate::ipc_client::IpcClient,
+    request: &Request,
+    first: agent_rdp_protocol::Response,
+    budget: std::time::Duration,
+    output: &Output,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let started = std::time::Instant::now();
+    let mut current = first;
+    let mut all_stdout = String::new();
+    let mut all_stderr = String::new();
+
+    loop {
+        if !current.success {
+            output.print_response(&current);
+            std::process::exit(1);
+        }
+        let Some(ResponseData::RunPollResult(result)) = &current.data else {
+            output.print_response(&current);
+            return Ok(());
+        };
+
+        if output.is_json() {
+            all_stdout.push_str(&result.stdout_chunk);
+            all_stderr.push_str(&result.stderr_chunk);
+        } else {
+            if !result.stdout_chunk.is_empty() {
+                print!("{}", result.stdout_chunk);
+                let _ = std::io::stdout().flush();
+            }
+            if !result.stderr_chunk.is_empty() {
+                eprint!("{}", result.stderr_chunk);
+                let _ = std::io::stderr().flush();
+            }
+        }
+
+        if result.exited {
+            if output.is_json() {
+                let merged = agent_rdp_protocol::RunPollResult {
+                    pid: result.pid,
+                    stdout_chunk: std::mem::take(&mut all_stdout),
+                    stderr_chunk: std::mem::take(&mut all_stderr),
+                    exited: true,
+                    exit_code: result.exit_code,
+                };
+                output.print_response(&agent_rdp_protocol::Response::success(
+                    ResponseData::RunPollResult(merged),
+                ));
+            } else {
+                eprintln!(
+                    "Process {} exited{}",
+                    result.pid,
+                    result.exit_code.map(|c| format!(" (code {})", c)).unwrap_or_default()
+                );
+            }
+            return Ok(());
+        }
+
+        if started.elapsed() >= budget {
+            if output.is_json() {
+                let merged = agent_rdp_protocol::RunPollResult {
+                    pid: result.pid,
+                    stdout_chunk: std::mem::take(&mut all_stdout),
+                    stderr_chunk: std::mem::take(&mut all_stderr),
+                    exited: false,
+                    exit_code: None,
+                };
+                output.print_response(&agent_rdp_protocol::Response::success(
+                    ResponseData::RunPollResult(merged),
+                ));
+            } else {
+                eprintln!(
+                    "Process {} still running after {}s; run `automate run-poll {} --follow` again to keep collecting",
+                    result.pid,
+                    budget.as_secs(),
+                    result.pid
+                );
+            }
+            return Ok(());
+        }
+
+        tokio::time::sleep(FOLLOW_INTERVAL).await;
+        current = client.send(request, timeout_ms).await?;
+    }
+}
+
+/// agent-rdp's own `run` options. If one of these shows up among the
+/// arguments handed to the remote shell, the caller almost certainly put it
+/// after the command (or after `--`), where clap stops parsing options: the
+/// process would be launched detached with a bare "Process ID" line, and a
+/// background launch is easy to mistake for a hang. Refuse instead.
+const RUN_OPTIONS: &[&str] = &[
+    "--wait",
+    "--hidden",
+    "--stream",
+    "--process-timeout",
+    "--shell",
+    "--idempotency-key",
+    "--json",
+    "--timeout",
+    "--session",
+    "--stream-port",
+];
+
+fn reject_misplaced_run_options(args: &[String]) -> Result<(), String> {
+    let misplaced: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| RUN_OPTIONS.contains(a))
+        .collect();
+    if misplaced.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} appeared after the command, so it would be passed to the remote shell as an \
+         argument instead of being applied by agent-rdp. Put agent-rdp options before the \
+         command (`automate run --wait --hidden \"<command>\"`); everything after the command \
+         or after `--` goes to the remote shell verbatim. If the remote command genuinely \
+         needs that literal token, embed it in the command string.",
+        misplaced.join(", ")
+    ))
+}
 
 /// IPC timeout for an automate request: the base timeout, extended by the
 /// command's own budget when it carries one.
@@ -236,6 +390,7 @@ fn build_request(action: AutomateAction) -> Result<AutomateRequest, String> {
             if let Some(ref key) = idempotency_key {
                 validate_idempotency_key(key)?;
             }
+            reject_misplaced_run_options(&cmd_args)?;
             AutomateRequest::Run {
                 command,
                 args: cmd_args,
@@ -248,7 +403,7 @@ fn build_request(action: AutomateAction) -> Result<AutomateRequest, String> {
             }
         }
 
-        AutomateAction::RunPoll { pid } => AutomateRequest::RunPoll { pid },
+        AutomateAction::RunPoll { pid, .. } => AutomateRequest::RunPoll { pid },
 
         AutomateAction::WaitFor {
             selector,
@@ -317,6 +472,31 @@ fn describe_focused(element: &AccessibilityElement) -> String {
     }
 
     line
+}
+
+#[cfg(test)]
+mod misplaced_option_tests {
+    use super::reject_misplaced_run_options;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn options_after_the_command_are_refused() {
+        let err = reject_misplaced_run_options(&args(&[
+            "-Command", "Get-Date", "--wait", "--hidden",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--wait, --hidden"), "{err}");
+        assert!(err.contains("before the command"));
+    }
+
+    #[test]
+    fn ordinary_child_arguments_pass() {
+        assert!(reject_misplaced_run_options(&args(&["-NoProfile", "-File", "x.ps1", "--verbose"])).is_ok());
+        assert!(reject_misplaced_run_options(&[]).is_ok());
+    }
 }
 
 #[cfg(test)]

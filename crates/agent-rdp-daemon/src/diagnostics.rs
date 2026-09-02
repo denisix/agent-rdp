@@ -55,6 +55,8 @@ fn is_infrastructure_error(code: &ErrorCode) -> bool {
             | ErrorCode::DaemonUnresponsive
             | ErrorCode::DaemonVersionMismatch
             | ErrorCode::IpcError
+            // A stale file is a fact about the file, not the screen.
+            | ErrorCode::StaleFile
     )
 }
 
@@ -301,6 +303,7 @@ mod tests {
             stderr: None,
             pid: None,
             replayed: false,
+            early_exit: false,
         }));
         (Request::Automate(request), response)
     }

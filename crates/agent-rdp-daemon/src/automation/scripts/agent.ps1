@@ -21,7 +21,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # Global state
 $script:RefMap = @{}  # ref number -> AutomationElement mapping
 $script:SnapshotId = $null
-$script:Version = "1.4.0"  # idempotent replay by request id, $ErrorActionPreference=Stop in run, log_path in status
+$script:Version = "1.5.0"  # run: wrapped child script with plain-text error chain, early_exit, wait beats stream; file_stat: mtime
 # Local log path on Windows machine (RDPDR not used for logging anymore)
 $script:LocalLogPath = "$env:TEMP\agent-rdp-automation.log"
 $script:DvcHandle = [IntPtr]::Zero

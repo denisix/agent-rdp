@@ -35,9 +35,10 @@ pub async fn run(
             local_path: local,
             remote_path: remote,
         }),
-        FileAction::Pull { remote, local } => Request::FilePull(FilePullRequest {
+        FileAction::Pull { remote, local, max_age } => Request::FilePull(FilePullRequest {
             remote_path: remote,
             local_path: local,
+            max_age_secs: max_age,
         }),
     };
 
