@@ -11,8 +11,36 @@ use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Commands};
 
-#[tokio::main]
-async fn main() {
+/// Fewest tokio worker threads the daemon runs with.
+///
+/// The frame processor holds a synchronous `parking_lot` write lock across
+/// RDP frame processing (including synchronous RDPDR disk I/O), and handlers
+/// block a worker on the matching read lock. With `worker_threads` defaulting
+/// to the CPU count, a 2-vCPU host had both workers parked on that lock at
+/// once and nothing left to answer the CLI's health-check `Ping` - which the
+/// CLI then reported as the daemon having died.
+const DAEMON_MIN_WORKER_THREADS: usize = 4;
+
+fn main() {
+    let is_daemon = {
+        let args: Vec<String> = std::env::args().collect();
+        args.windows(2)
+            .any(|w| w[0] == "session" && w[1] == "daemon")
+    };
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if is_daemon {
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        builder.worker_threads(available.max(DAEMON_MIN_WORKER_THREADS));
+    }
+    let runtime = builder.build().expect("failed to build tokio runtime");
+    runtime.block_on(async_main(is_daemon));
+}
+
+async fn async_main(is_daemon: bool) {
     // Initialize logging.
     //
     // EnvFilter defaults to ERROR-only when RUST_LOG is unset, which is right
@@ -21,12 +49,6 @@ async fn main() {
     // and that log is the only record of why a session ended. Default the
     // daemon to info so an unexpected teardown is explained; RUST_LOG still
     // overrides either way.
-    let is_daemon = {
-        let args: Vec<String> = std::env::args().collect();
-        args.windows(2)
-            .any(|w| w[0] == "session" && w[1] == "daemon")
-    };
-
     let filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
     } else if is_daemon {
@@ -135,10 +157,13 @@ fn watchdog_budget_ms(cli: &Cli) -> u64 {
 
 /// Default timeout for `connect`. Connecting is not one round-trip: it covers
 /// the TCP/TLS/CredSSP handshake, RDP capability exchange and - with
-/// --enable-win-automation - bootstrapping the agent on the remote desktop,
-/// which alone spends several seconds in fixed waits plus a backing-off retry
-/// loop. 30s is not enough on a real host.
-const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 90_000;
+/// --enable-win-automation - bootstrapping the agent on the remote desktop.
+/// That bootstrap retries the launch up to three times, each ~5s of fixed
+/// waits plus a backing-off handshake wait of up to ~25s, so its worst case
+/// is ~91s before any network latency. The previous 90s default sat exactly
+/// on that line and cold starts timed out with the daemon still legitimately
+/// working. 150s clears it with room for the RDP handshake itself.
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 150_000;
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     use output::Output;

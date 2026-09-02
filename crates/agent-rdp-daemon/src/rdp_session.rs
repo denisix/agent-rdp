@@ -1027,22 +1027,31 @@ async fn run_frame_processor(
             } => {
                 if let Some(cmd) = dvc_cmd {
                     debug!("Sending {} bytes on DVC channel {}", cmd.data.len(), cmd.channel_id);
-                    use ironrdp_dvc::pdu::DataPdu;
-                    use ironrdp_svc::SvcMessage;
 
-                    let data_pdu = ironrdp_dvc::pdu::DrdynvcDataPdu::Data(
-                        DataPdu::new(cmd.channel_id, cmd.data)
-                    );
-                    let svc_msg = SvcMessage::from(data_pdu);
-
-                    match active_stage.encode_dvc_messages(vec![svc_msg]) {
-                        Ok(frame) => {
-                            if let Err(e) = framed.write_all(&frame).await {
-                                error!("Failed to send DVC data: {}", e);
+                    // `encode_dvc_data` splits into DataFirst+Data PDUs at
+                    // MAX_DATA_SIZE (1590 bytes) the same way `DrdynvcClient`
+                    // does for its own traffic. A single hand-built `Data`
+                    // PDU used to be sent regardless of size: anything over
+                    // that boundary was still fragmented by the static
+                    // channel layer beneath DVC (CHANNEL_CHUNK_LENGTH =
+                    // 1600), but the agent's `Read-DvcMessage` did not
+                    // reassemble those fragments, so every oversized request
+                    // (any `file push` chunk above ~1.6KB of JSON) arrived as
+                    // unparseable pieces and silently got no reply. See
+                    // `automation::dvc_encode` for the encoder itself.
+                    match crate::automation::encode_dvc_data(cmd.channel_id, cmd.data) {
+                        Ok(svc_messages) => match active_stage.encode_dvc_messages(svc_messages) {
+                            Ok(frame) => {
+                                if let Err(e) = framed.write_all(&frame).await {
+                                    error!("Failed to send DVC data: {}", e);
+                                }
                             }
-                        }
+                            Err(e) => {
+                                error!("Failed to encode DVC data: {:?}", e);
+                            }
+                        },
                         Err(e) => {
-                            error!("Failed to encode DVC data: {:?}", e);
+                            error!("Failed to split DVC data into PDUs: {:?}", e);
                         }
                     }
                 }

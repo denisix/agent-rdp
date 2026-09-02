@@ -159,10 +159,18 @@ pub async fn handle_push(
 
         let timeout = if last { VERIFY_TIMEOUT } else { CHUNK_TIMEOUT };
         if let Err(e) = ipc.send_request_with_timeout(&request, timeout).await {
+            // A push is safe to repeat: chunk 0 carries `first: true`, which
+            // truncates the remote file, so re-running starts from scratch
+            // rather than appending. Say so instead of the generic
+            // "retrying may apply it twice" the DVC layer attaches to every
+            // indeterminate outcome - for this command that warning is wrong
+            // and sent callers off to build gzip+clipboard workarounds.
             return Response::error(
                 ErrorCode::AutomationError,
                 format!(
-                    "Transfer failed on chunk {}/{} of '{}': {}",
+                    "Transfer failed on chunk {}/{} of '{}': {}. The remote file is \
+                     incomplete; re-run `file push` - it restarts from the beginning \
+                     and overwrites, so a retry cannot apply the data twice.",
                     index + 1,
                     total_chunks,
                     params.remote_path,

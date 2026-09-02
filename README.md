@@ -184,6 +184,7 @@ agent-rdp scroll left            # also: right
 
 ```bash
 agent-rdp clipboard set "Hello from CLI"
+agent-rdp clipboard set --file ./script.ps1   # or `--file -` to read stdin
 agent-rdp clipboard get
 
 # Drives must be mapped at connect time; multiple --drive flags are allowed
@@ -192,7 +193,10 @@ agent-rdp connect --host 192.168.1.100 -u Administrator -p secret \
 agent-rdp drive list
 ```
 
-Mapped drives appear on the remote as network locations.
+Mapped drives appear on the remote as network locations. Clipboard text is
+sent with CRLF line endings, so multi-line content survives
+`Get-Clipboard | Set-Content`; `clipboard get` returns Windows text with its
+CRLF intact.
 
 > **Do not access `\\TSCLIENT\...` from `automate run`.** Drive redirection is
 > serviced by the same task that carries the automation channel, so reading the
@@ -334,7 +338,19 @@ so explicitly, since those are always safe to retry.
 the CLI socket timeout and the watchdog all extend to cover
 `--process-timeout`/`--timeout`. But the agent handles one command at a time,
 so a long `run --wait` blocks every other `automate` call — past about a
-minute, prefer `run --stream` plus `run-poll`.
+minute, prefer `run --stream` plus `run-poll`. Streamed output is captured to
+files on the remote side, so nothing is lost if the process exits between
+polls; a finished process stays pollable for 10 minutes and repeat polls return
+`exited: true` with empty chunks. (If you redirect inside the command instead,
+note that Windows PowerShell 5.1's `>` writes UTF-16LE.)
+
+**`daemon_not_running` vs `daemon_unresponsive`.** The first means no daemon
+process exists — reconnect, and `<session>/daemon.log` says why it exited. The
+second means the process is alive but did not answer a health check within
+10s: it is busy (a long `run --wait`, a file transfer). Wait and retry; do not
+reconnect, that discards a working session. The message includes the tail of
+daemon.log. `connect` replaces a daemon that stays unresponsive, killing the
+stuck one first.
 
 **Arrow-key navigation inside a panel can land on the wrong item.** Observed in
 1C side panels: Up/Down then Enter is not reliably deterministic. Prefer

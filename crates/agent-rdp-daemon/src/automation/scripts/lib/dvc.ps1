@@ -179,51 +179,116 @@ $script:MaxMessageSize = 1024 * 1024
 # File handle reads on DVC include this header before the actual data
 $script:ChannelPduHeaderSize = 8
 
-# Read a JSON message from DVC using file handle
-# Note: ReadFile on DVC file handle includes CHANNEL_PDU_HEADER (8 bytes) before data
-# Returns $null on no data, throws on error
+# CHANNEL_PDU_HEADER flags (MS-RDPBCGR 2.2.6.1.1). FIRST is 0x1; only LAST
+# is needed to know when a message is complete.
+$script:ChannelFlagLast = 0x00000002
+
+# One reusable read buffer. Each ReadFile returns at most one fragment
+# (CHANNEL_CHUNK_LENGTH = 1600 bytes of data plus the header), so a modest
+# buffer is enough; a message larger than one fragment is reassembled below.
+# Allocating a fresh 1MB array per read, as this used to, was pure churn.
+$script:ReadBufferSize = 64 * 1024
+$script:ReadBuffer = New-Object byte[] $script:ReadBufferSize
+
+# Read a JSON message from DVC using file handle.
+#
+# Each ReadFile on the channel file handle returns ONE fragment: an 8-byte
+# CHANNEL_PDU_HEADER (length = total bytes of the whole message, the same on
+# every fragment; flags = CHANNEL_FLAG_FIRST / CHANNEL_FLAG_LAST) followed by
+# up to CHANNEL_CHUNK_LENGTH bytes of data. A message under ~1.6KB arrives as
+# a single fragment flagged FIRST|LAST. Anything larger - every `file push`
+# chunk, for instance - arrives as several fragments, and only the
+# concatenation of their data parts is the JSON document. This function used
+# to hand each fragment to ConvertFrom-Json on its own, so every large request
+# failed to parse and silently got no reply.
+#
+# Returns $null on no data, throws on error.
 # Note: ReadFile is blocking - timeout not implemented (would require overlapped I/O)
 function Read-DvcMessage {
     param(
         [IntPtr]$Handle
     )
 
-    # Read into a buffer
-    $buffer = New-Object byte[] $script:MaxMessageSize
-    $bytesRead = 0
+    $buffer = $script:ReadBuffer
+    $accumulated = $null
+    $expectedLength = 0
+    $fragments = 0
 
-    # ReadFile is blocking, so we'll read synchronously
-    $success = [Kernel32]::ReadFile($Handle, $buffer, $buffer.Length, [ref]$bytesRead, [IntPtr]::Zero)
+    while ($true) {
+        $bytesRead = 0
 
-    if (-not $success) {
-        $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        # Error 109 (ERROR_BROKEN_PIPE) means the channel was closed
-        if ($errorCode -eq 109) {
-            throw "DVC channel closed (ERROR_BROKEN_PIPE)"
+        # ReadFile is blocking, so we'll read synchronously
+        $success = [Kernel32]::ReadFile($Handle, $buffer, $buffer.Length, [ref]$bytesRead, [IntPtr]::Zero)
+
+        if (-not $success) {
+            $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            # Error 109 (ERROR_BROKEN_PIPE) means the channel was closed
+            if ($errorCode -eq 109) {
+                throw "DVC channel closed (ERROR_BROKEN_PIPE)"
+            }
+            throw "ReadFile failed: Win32 error $errorCode"
         }
-        throw "ReadFile failed: Win32 error $errorCode"
+
+        if ($bytesRead -eq 0) {
+            if ($fragments -eq 0) {
+                return $null
+            }
+            throw "DVC channel closed in the middle of a $expectedLength-byte message"
+        }
+
+        if ($bytesRead -lt $script:ChannelPduHeaderSize) {
+            throw "Fragment too short: $bytesRead bytes (need at least $($script:ChannelPduHeaderSize))"
+        }
+
+        $length = [System.BitConverter]::ToUInt32($buffer, 0)
+        $flags = [System.BitConverter]::ToUInt32($buffer, 4)
+        $dataLength = $bytesRead - $script:ChannelPduHeaderSize
+        $fragments++
+
+        if ($null -eq $accumulated) {
+            if ($length -gt $script:MaxMessageSize) {
+                throw "Message too large: $length bytes (limit $($script:MaxMessageSize))"
+            }
+            $expectedLength = $length
+            $capacity = if ($length -gt 0) { [int]$length } else { $dataLength }
+            $accumulated = [System.IO.MemoryStream]::new($capacity)
+        }
+
+        if ($dataLength -gt 0) {
+            $accumulated.Write($buffer, $script:ChannelPduHeaderSize, $dataLength)
+        }
+
+        if ($accumulated.Length -gt $script:MaxMessageSize) {
+            throw "Message too large: exceeded $($script:MaxMessageSize) bytes after $fragments fragments"
+        }
+
+        $isLast = ($flags -band $script:ChannelFlagLast) -ne 0
+        if ($isLast -or ($expectedLength -gt 0 -and $accumulated.Length -ge $expectedLength)) {
+            break
+        }
     }
 
-    if ($bytesRead -eq 0) {
-        return $null
+    $bytes = $accumulated.ToArray()
+    if ($bytes.Length -eq 0) {
+        throw "Empty message after $fragments fragment(s)"
     }
 
-    # Skip CHANNEL_PDU_HEADER (8 bytes: 4-byte length + 4-byte flags)
-    if ($bytesRead -le $script:ChannelPduHeaderSize) {
-        throw "Message too short: $bytesRead bytes (need more than $($script:ChannelPduHeaderSize))"
-    }
-
-    $dataLength = $bytesRead - $script:ChannelPduHeaderSize
-
-    # Parse JSON from after the header
-    $json = [System.Text.Encoding]::UTF8.GetString($buffer, $script:ChannelPduHeaderSize, $dataLength)
+    # Parse JSON from the reassembled data
+    $json = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $bytes.Length)
 
     # Strip BOM if present
     if ($json.Length -gt 0 -and $json[0] -eq [char]0xFEFF) {
         $json = $json.Substring(1)
     }
 
-    return $json | ConvertFrom-Json
+    try {
+        return $json | ConvertFrom-Json
+    } catch {
+        # Keep the words "channel"/"Win32 error" out of this message: the
+        # agent's main loop treats those as a dead transport and exits.
+        $preview = if ($json.Length -gt 120) { $json.Substring(0, 120) + "..." } else { $json }
+        throw "JSON parse failed for a $($bytes.Length)-byte message in $fragments fragment(s) (starts: $preview): $($_.Exception.Message)"
+    }
 }
 
 # Write a JSON message to DVC using file handle

@@ -6,6 +6,7 @@
 
 mod bootstrap;
 pub mod dvc_channel;
+pub mod dvc_encode;
 mod dvc_ipc;
 
 pub use bootstrap::AutomationBootstrap;
@@ -13,6 +14,7 @@ pub use dvc_channel::{
     new_shared_dvc_state, AutomationDvc, DvcCommandReceiver, DvcCommandSender, DvcHandshake,
     DvcSendCommand, SharedDvcState, CHANNEL_NAME,
 };
+pub use dvc_encode::encode_dvc_data;
 pub use dvc_ipc::{DvcIndeterminate, DvcIpc};
 
 use std::path::PathBuf;

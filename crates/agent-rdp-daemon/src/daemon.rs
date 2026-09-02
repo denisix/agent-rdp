@@ -214,26 +214,61 @@ impl Daemon {
 
                     warn!("RDP connection dropped; session is now disconnected (daemon staying up)");
 
-                    *self.rdp_session.lock().await = None;
+                    // Tear the dead session down on a separate task. This arm
+                    // runs inside the accept loop's `select!`, so every lock it
+                    // awaits here is time during which no new CLI connection
+                    // is accepted - and `rdp_session` can be held for a long
+                    // time by a handler mid-operation. The CLI's health check
+                    // then timed out and reported the daemon as not running.
+                    //
+                    // Because the teardown is deferred, a `connect` can slip
+                    // in before it runs. `connect` bumps the generation first
+                    // thing, so re-checking it under each lock tells this task
+                    // the state now belongs to a newer session and must be
+                    // left alone.
+                    let rdp_session = Arc::clone(&self.rdp_session);
+                    let ws_handle = Arc::clone(&self.ws_handle);
+                    let clipboard_changed_rx = Arc::clone(&self.clipboard_changed_rx);
+                    let automation_state = Arc::clone(&self.automation_state);
+                    let session_generation = Arc::clone(&self.session_generation);
+                    tokio::spawn(async move {
+                        let superseded = || {
+                            session_generation.load(std::sync::atomic::Ordering::SeqCst)
+                                != dropped_generation
+                        };
 
-                    // The stream belongs to the dead session - stop it too.
-                    *self.ws_handle.lock().await = None;
-                    *self.clipboard_changed_rx.lock().await = None;
+                        {
+                            let mut session = rdp_session.lock().await;
+                            if superseded() {
+                                info!("Dropped session already replaced by a newer connect; leaving it alone");
+                                return;
+                            }
+                            *session = None;
+                        }
 
-                    // Automation belongs to the dead session too. Without this,
-                    // a mid-session transport drop left `enabled=true` and
-                    // `dvc_ipc=Some(<dead ipc>)` stale - `automate` calls would
-                    // hang or fail against a channel that no longer has a
-                    // remote end, and the state only got cleared by the next
-                    // `connect`'s own pre-cleanup, not by the drop itself.
-                    // `cleanup()` is a no-op when automation was never
-                    // enabled, so this is safe to call unconditionally.
-                    {
-                        let mut auto_state = self.automation_state.lock().await;
+                        // The stream belongs to the dead session - stop it too.
+                        *ws_handle.lock().await = None;
+                        *clipboard_changed_rx.lock().await = None;
+
+                        // Automation belongs to the dead session too. Without
+                        // this, a mid-session transport drop left
+                        // `enabled=true` and `dvc_ipc=Some(<dead ipc>)` stale -
+                        // `automate` calls would hang or fail against a channel
+                        // that no longer has a remote end, and the state only
+                        // got cleared by the next `connect`'s own pre-cleanup,
+                        // not by the drop itself. `cleanup()` is a no-op when
+                        // automation was never enabled, so this is safe to
+                        // call unconditionally.
+                        let mut auto_state = automation_state.lock().await;
+                        if superseded() {
+                            info!("Newer connect owns the automation state; skipping cleanup");
+                            return;
+                        }
                         let session_dir = crate::get_session_dir("");
                         let bootstrap = AutomationBootstrap::new(session_dir);
                         let _ = bootstrap.cleanup(&mut auto_state).await;
-                    }
+                        info!("Dropped session torn down");
+                    });
                 }
 
                 // Handle shutdown signal from client

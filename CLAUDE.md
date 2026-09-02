@@ -62,7 +62,18 @@ are easy to break:
   down the session that replaced it (`daemon.rs`, `is_stale_disconnect`).
 - The frame processor also services RDPDR drive I/O *synchronously*, so a slow
   or wedged file operation blocks input, clipboard, DVC and screenshots at
-  once. Anything awaiting the processor needs a timeout.
+  once. Anything awaiting the processor needs a timeout. It also holds a
+  synchronous `parking_lot` lock while doing so, and handlers block on the same
+  lock — the daemon runtime therefore runs with at least 4 worker threads
+  (`main.rs`) so a health-check `Ping` can always be answered.
+- Outbound DVC messages go through `automation::encode_dvc_data`, which splits
+  at `DrdynvcDataPdu::MAX_DATA_SIZE` (1590 bytes). The PowerShell agent's
+  `Read-DvcMessage` reassembles fragments on the `CHANNEL_PDU_HEADER`
+  first/last flags. Both halves are required: without either, any request over
+  ~1.6KB (every `file push` chunk) silently gets no reply.
+- The daemon's main `select!` loop must never await a session lock inline —
+  that blocks `accept()`, and the CLI reports a daemon it cannot reach as
+  unresponsive. Do teardown work in a spawned task.
 
 **`handlers/*.rs`** — one module per command type, each returning a `Response`.
 `file_transfer.rs` moves files in chunks over the automation DVC channel with

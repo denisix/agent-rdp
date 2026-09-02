@@ -363,7 +363,7 @@ impl Output {
                 success: false,
                 data: None,
                 error: Some(agent_rdp_protocol::ErrorInfo {
-                    code: agent_rdp_protocol::ErrorCode::InternalError,
+                    code: error_code_for(code),
                     message: message.to_string(),
                 }),
             };
@@ -371,5 +371,24 @@ impl Output {
         } else {
             eprintln!("Error [{}]: {}", code, message);
         }
+    }
+}
+
+/// Map a CLI-side error code string to the protocol enum for `--json` output.
+///
+/// This used to hard-code `InternalError`, so a JSON consumer could not tell
+/// `daemon_not_running` (reconnect) from `daemon_unresponsive` (wait) from
+/// `watchdog_timeout` (the daemon may be fine) - the human-readable path
+/// printed the right code all along, the machine-readable one lost it.
+pub fn error_code_for(code: &str) -> agent_rdp_protocol::ErrorCode {
+    use agent_rdp_protocol::ErrorCode;
+    match code {
+        "daemon_not_running" => ErrorCode::DaemonNotRunning,
+        "daemon_unresponsive" => ErrorCode::DaemonUnresponsive,
+        "watchdog_timeout" | "timeout" => ErrorCode::Timeout,
+        "not_connected" => ErrorCode::NotConnected,
+        "invalid_request" => ErrorCode::InvalidRequest,
+        "ipc_error" | "cli_error" => ErrorCode::IpcError,
+        _ => ErrorCode::InternalError,
     }
 }

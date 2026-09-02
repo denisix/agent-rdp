@@ -75,11 +75,20 @@ $wtsHandle = [WtsApi]::WTSVirtualChannelOpenEx(
 [Kernel32]::WriteFile($fileHandle, $buffer, ...)
 ```
 
-**Note**: When reading via file handle, data is prepended with an 8-byte `CHANNEL_PDU_HEADER` (4 bytes length + 4 bytes flags) which must be skipped.
+**Framing**: each `ReadFile` on the channel handle returns one fragment: an
+8-byte `CHANNEL_PDU_HEADER` (`length` = total bytes of the whole message, the
+same on every fragment; `flags` = `CHANNEL_FLAG_FIRST` 0x1 / `CHANNEL_FLAG_LAST`
+0x2) followed by up to 1600 bytes of data. A message under ~1.6KB is a single
+fragment flagged FIRST|LAST; larger ones (every `file_write_chunk`) span
+several, and `Read-DvcMessage` concatenates the data parts until LAST. On the
+daemon side, `automation::encode_dvc_data` splits outbound messages into
+`DataFirst`/`Data` PDUs at 1590 bytes, as the DVC spec requires. Both halves
+are needed: with either missing, requests over ~1.6KB reach the agent as
+unparseable pieces and get no reply.
 
 ## Message Protocol
 
-Messages are raw JSON (DVC handles message framing automatically).
+Messages are JSON documents, one per DVC message (framing as above).
 
 ### Message Types
 
@@ -87,7 +96,7 @@ Messages are raw JSON (DVC handles message framing automatically).
 ```json
 {
   "type": "handshake",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "agent_pid": 12345,
   "capabilities": ["snapshot", "click", "select", "toggle", ...]
 }
@@ -184,8 +193,8 @@ The agent script is embedded in the Rust binary via `include_str!()` and written
 2. Get file handle via `WTSVirtualChannelQuery`
 3. Send handshake message
 4. Loop:
-   - ReadFile (blocking) to receive request
-   - Skip 8-byte CHANNEL_PDU_HEADER
+   - ReadFile (blocking) until a fragment flagged CHANNEL_FLAG_LAST arrives,
+     concatenating the data after each 8-byte CHANNEL_PDU_HEADER
    - Parse JSON request
    - Dispatch to command handler
    - Build response
@@ -251,7 +260,7 @@ Commands use native Windows UI Automation patterns for reliable interaction:
 
 | Command | Purpose |
 |---------|---------|
-| `run` / `run_poll` | Launch a process; wait, or stream its output incrementally |
+| `run` / `run_poll` | Launch a process; wait, or stream its output incrementally. Streamed output is captured to files under `%TEMP%\agent-rdp-run` and read back by offset, so nothing is lost if the process exits between polls; finished entries stay pollable for 10 minutes. Child stderr arrives CLIXML-serialized (PowerShell's behavior on a redirected stderr); the daemon reduces it to the text of error/warning records and drops progress noise |
 | `file_write_chunk` | Append one base64 chunk to a remote file; verifies SHA-256 on the last chunk |
 | `file_read_chunk` | Read a byte range of a remote file as base64 |
 | `file_stat` | Existence, size and SHA-256 of a remote path |

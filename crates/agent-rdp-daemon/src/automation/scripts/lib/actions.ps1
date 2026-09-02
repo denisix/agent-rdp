@@ -578,23 +578,33 @@ function Invoke-Run {
     # output a caller is trying to parse. Forcing UTF-8 on the child's own
     # console output keeps non-ASCII text intact: the default is the OEM
     # codepage, which turns Cyrillic into mojibake on its way back to us.
-    $prelude = "$ProgressPreference='SilentlyContinue';" +
-               "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+    #
+    # SINGLE-quoted on purpose. This text is source code for the *child*
+    # process; in a double-quoted string `$ProgressPreference` is expanded
+    # right here, in the agent, to its current value, and the child received
+    # `Continue='SilentlyContinue';...` - a CommandNotFoundException on every
+    # single `run`, plus the progress noise it was meant to silence.
+    $prelude = '$ProgressPreference=''SilentlyContinue'';' +
+               '[Console]::OutputEncoding=[Text.Encoding]::UTF8;'
     $script = $prelude + $userScript
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+
+    if ($stream) {
+        return Start-StreamedRun -Shell $shell -EncodedCommand $encodedCommand -Hidden $hidden
+    }
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $shell
     $startInfo.Arguments = "-NoProfile -EncodedCommand $encodedCommand"
     $startInfo.WorkingDirectory = $env:USERPROFILE
     $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardOutput = $wait -or $stream
-    $startInfo.RedirectStandardError = $wait -or $stream
+    $startInfo.RedirectStandardOutput = $wait
+    $startInfo.RedirectStandardError = $wait
     $startInfo.CreateNoWindow = $hidden
     # Decode the child's output as UTF-8. Left unset, .NET decodes using the
     # console's OEM codepage (cp866 on a Russian-locale host), which is where
     # Cyrillic output came back as mojibake regardless of what the child sent.
-    if ($wait -or $stream) {
+    if ($wait) {
         $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
         $startInfo.StandardErrorEncoding = [Text.Encoding]::UTF8
     }
@@ -622,50 +632,159 @@ function Invoke-Run {
             stdout = $stdoutTask.Result
             stderr = $stderrTask.Result
         }
-    } elseif ($stream) {
-        # Buffer output as it arrives via events so Invoke-RunPoll can hand back
-        # incremental chunks without blocking on the process exiting.
-        $state = [PSCustomObject]@{
-            Process    = $process
-            StdoutBuf  = [System.Text.StringBuilder]::new()
-            StderrBuf  = [System.Text.StringBuilder]::new()
-            Lock       = [System.Object]::new()
-        }
-
-        $stdoutAction = {
-            if ($null -ne $Event.SourceEventArgs.Data) {
-                $s = $Event.MessageData
-                [System.Threading.Monitor]::Enter($s.Lock)
-                try { [void]$s.StdoutBuf.AppendLine($Event.SourceEventArgs.Data) }
-                finally { [System.Threading.Monitor]::Exit($s.Lock) }
-            }
-        }
-        $stderrAction = {
-            if ($null -ne $Event.SourceEventArgs.Data) {
-                $s = $Event.MessageData
-                [System.Threading.Monitor]::Enter($s.Lock)
-                try { [void]$s.StderrBuf.AppendLine($Event.SourceEventArgs.Data) }
-                finally { [System.Threading.Monitor]::Exit($s.Lock) }
-            }
-        }
-
-        Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -MessageData $state -Action $stdoutAction | Out-Null
-        Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -MessageData $state -Action $stderrAction | Out-Null
-        $process.BeginOutputReadLine()
-        $process.BeginErrorReadLine()
-
-        if ($null -eq $script:StreamedProcesses) {
-            $script:StreamedProcesses = @{}
-        }
-        $script:StreamedProcesses[$process.Id] = $state
-
-        return @{
-            pid = $process.Id
-        }
     } else {
         return @{
             pid = $process.Id
         }
+    }
+}
+
+# ---- run --stream: file-backed capture ----
+#
+# The child's stdout/stderr go straight to files (Start-Process hands the
+# file handles to CreateProcess), and Invoke-RunPoll reads whatever has been
+# appended since the last poll. The previous design buffered output through
+# OutputDataReceived events, which only fire when this runspace is idle -
+# and it spends its life blocked in a native ReadFile on the DVC handle.
+# Combined with HasExited being checked without WaitForExit(), the tail of
+# every command's output (all of it, for `echo hello`) was stranded in a
+# buffer nobody would ever read again, and the entry was already gone.
+
+# How long a finished process stays pollable. A repeat poll after exit gets
+# `exited: true` with empty chunks rather than an error, so a caller that
+# lost the first "exited" reply can still learn the exit code.
+$script:StreamRetentionSeconds = 600
+$script:StreamMaxFinished = 32
+
+function Get-StreamDir {
+    $dir = Join-Path -Path $env:TEMP -ChildPath "agent-rdp-run"
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    return $dir
+}
+
+function Remove-ExpiredStreams {
+    if ($null -eq $script:StreamedProcesses) { return }
+
+    $now = Get-Date
+    $finished = @()
+    foreach ($entry in @($script:StreamedProcesses.GetEnumerator())) {
+        $s = $entry.Value
+        if ($null -ne $s.ExitedAt) {
+            $finished += [PSCustomObject]@{ Key = $entry.Key; ExitedAt = $s.ExitedAt }
+        }
+    }
+
+    $toRemove = @()
+    foreach ($f in $finished) {
+        if (($now - $f.ExitedAt).TotalSeconds -gt $script:StreamRetentionSeconds) {
+            $toRemove += $f.Key
+        }
+    }
+    if ($finished.Count -gt $script:StreamMaxFinished) {
+        $excess = $finished | Sort-Object ExitedAt | Select-Object -First ($finished.Count - $script:StreamMaxFinished)
+        foreach ($e in $excess) { $toRemove += $e.Key }
+    }
+
+    foreach ($key in ($toRemove | Select-Object -Unique)) {
+        $s = $script:StreamedProcesses[$key]
+        if ($null -ne $s) {
+            foreach ($p in @($s.StdoutPath, $s.StderrPath)) {
+                try { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } catch {}
+            }
+        }
+        $script:StreamedProcesses.Remove($key)
+    }
+}
+
+function Start-StreamedRun {
+    param(
+        [string]$Shell,
+        [string]$EncodedCommand,
+        [bool]$Hidden
+    )
+
+    Remove-ExpiredStreams
+
+    $dir = Get-StreamDir
+    $token = [Guid]::NewGuid().ToString("N")
+    $stdoutPath = Join-Path -Path $dir -ChildPath "$token.out"
+    $stderrPath = Join-Path -Path $dir -ChildPath "$token.err"
+
+    $startArgs = @{
+        FilePath               = $Shell
+        ArgumentList           = "-NoProfile -EncodedCommand $EncodedCommand"
+        WorkingDirectory       = $env:USERPROFILE
+        RedirectStandardOutput = $stdoutPath
+        RedirectStandardError  = $stderrPath
+        PassThru               = $true
+    }
+    if ($Hidden) { $startArgs.WindowStyle = "Hidden" }
+
+    $process = Start-Process @startArgs
+
+    $state = [PSCustomObject]@{
+        Process       = $process
+        StdoutPath    = $stdoutPath
+        StderrPath    = $stderrPath
+        StdoutOffset  = [long]0
+        StderrOffset  = [long]0
+        # Stateful decoders: a poll can cut the file between the bytes of one
+        # UTF-8 character, and a decoder carries the partial sequence over.
+        StdoutDecoder = [System.Text.Encoding]::UTF8.GetDecoder()
+        StderrDecoder = [System.Text.Encoding]::UTF8.GetDecoder()
+        ExitedAt      = $null
+        ExitCode      = $null
+    }
+
+    if ($null -eq $script:StreamedProcesses) {
+        $script:StreamedProcesses = @{}
+    }
+    $script:StreamedProcesses[$process.Id] = $state
+
+    return @{
+        pid = $process.Id
+    }
+}
+
+# Read everything appended to $Path since $Offset. Returns the decoded text
+# and the new offset. The child still has the file open for writing, so open
+# with full sharing.
+function Read-StreamTail {
+    param(
+        [string]$Path,
+        [long]$Offset,
+        [System.Text.Decoder]$Decoder
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @{ Text = ""; Offset = $Offset }
+    }
+
+    $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+    try {
+        if ($fs.Length -le $Offset) {
+            return @{ Text = ""; Offset = $Offset }
+        }
+        [void]$fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+        $count = [int]($fs.Length - $Offset)
+        $bytes = New-Object byte[] $count
+        $read = 0
+        while ($read -lt $count) {
+            $n = $fs.Read($bytes, $read, $count - $read)
+            if ($n -le 0) { break }
+            $read += $n
+        }
+        $chars = New-Object char[] ($Decoder.GetCharCount($bytes, 0, $read))
+        $charCount = $Decoder.GetChars($bytes, 0, $read, $chars, 0)
+        return @{
+            Text   = [string]::new($chars, 0, $charCount)
+            Offset = $Offset + $read
+        }
+    } finally {
+        $fs.Dispose()
     }
 }
 
@@ -674,37 +793,40 @@ function Invoke-RunPoll {
 
     $targetPid = [int]$Params.pid
 
+    Remove-ExpiredStreams
+
     if ($null -eq $script:StreamedProcesses -or -not $script:StreamedProcesses.ContainsKey($targetPid)) {
-        throw "No streamed process with pid $targetPid (either it was never started with run --stream, or it has already been fully polled after exit)"
+        throw "No streamed process with pid $targetPid (it was never started with run --stream, or it exited more than $($script:StreamRetentionSeconds)s ago and its output has been discarded)"
     }
 
     $state = $script:StreamedProcesses[$targetPid]
     $process = $state.Process
 
-    [System.Threading.Monitor]::Enter($state.Lock)
-    try {
-        $stdoutChunk = $state.StdoutBuf.ToString()
-        $stderrChunk = $state.StderrBuf.ToString()
-        [void]$state.StdoutBuf.Clear()
-        [void]$state.StderrBuf.Clear()
-    } finally {
-        [System.Threading.Monitor]::Exit($state.Lock)
+    $exited = $false
+    $exitCode = $null
+    if ($null -ne $state.ExitedAt) {
+        $exited = $true
+        $exitCode = $state.ExitCode
+    } elseif ($process.HasExited) {
+        # Parameterless WaitForExit: the process handle is signalled before
+        # its stdio handles are closed, and this is what makes the files
+        # complete before we read the final chunk.
+        $process.WaitForExit()
+        $exited = $true
+        $exitCode = $process.ExitCode
+        $state.ExitedAt = Get-Date
+        $state.ExitCode = $exitCode
     }
 
-    $exited = $process.HasExited
-    $exitCode = $null
-    if ($exited) {
-        $exitCode = $process.ExitCode
-        # Process has exited and this poll drained the final buffered output;
-        # forget it so future polls with the same (recycled) pid don't return
-        # stale state.
-        $script:StreamedProcesses.Remove($targetPid)
-    }
+    $out = Read-StreamTail -Path $state.StdoutPath -Offset $state.StdoutOffset -Decoder $state.StdoutDecoder
+    $state.StdoutOffset = $out.Offset
+    $err = Read-StreamTail -Path $state.StderrPath -Offset $state.StderrOffset -Decoder $state.StderrDecoder
+    $state.StderrOffset = $err.Offset
 
     return @{
         pid = $targetPid
-        stdout_chunk = $stdoutChunk
-        stderr_chunk = $stderrChunk
+        stdout_chunk = $out.Text
+        stderr_chunk = $err.Text
         exited = $exited
         exit_code = $exitCode
     }

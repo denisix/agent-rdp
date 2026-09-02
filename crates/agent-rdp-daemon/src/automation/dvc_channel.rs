@@ -196,7 +196,24 @@ impl DvcProcessor for AutomationDvc {
         let msg = match Self::decode_message(payload) {
             Ok(msg) => msg,
             Err(e) => {
-                error!("Failed to decode DVC message: {}", e);
+                // Include what actually arrived: a bare serde error ("EOF
+                // while parsing a value at line 1 column 0") says nothing
+                // about whether the agent sent an empty frame, a BOM-only
+                // frame, or binary garbage, and this is the only trace a
+                // dropped message leaves.
+                let preview_len = payload.len().min(32);
+                let hex: String = payload[..preview_len]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                error!(
+                    "Failed to decode DVC message ({} bytes, first {} as hex: [{}]): {}",
+                    payload.len(),
+                    preview_len,
+                    hex,
+                    e
+                );
                 return Ok(Vec::new());
             }
         };

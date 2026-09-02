@@ -6,7 +6,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.10.
+Tested against agent-rdp 0.7.11.
 
 If `agent-rdp` is not on PATH, install it first — expected on a fresh machine,
 needs no confirmation:
@@ -61,6 +61,13 @@ agent-rdp automate run "long-build.cmd" --stream   # returns a pid immediately
 agent-rdp automate run-poll <pid>                  # drain output; repeat until exited
 ```
 
+Output is captured to files on the remote side, so nothing is lost if the
+process exits between polls; the final poll returns the tail plus
+`exited: true`, and a repeat poll within 10 minutes returns `exited: true`
+again with empty chunks rather than an error. If you redirect inside the
+command instead (`*> out.txt`), remember Windows PowerShell 5.1 writes UTF-16LE
+— use `| Out-File -Encoding utf8` before `file pull`.
+
 **"Channel unresponsive" is usually transient.** Re-probe with `automate
 status` — it reports agent uptime, last DVC round-trip and consecutive-failure
 count, so you can tell "degraded but working" from "dead". If the agent really
@@ -105,8 +112,23 @@ agent-rdp automate snapshot -s "Untitled - Notepad"
 
 **Concurrency:** parallelise only read-only commands (`session info`, `status`,
 `screenshot`, `snapshot`), ~4 at most. Never run input events concurrently —
-they race and reorder in the remote UI. Always handle `daemon_not_running`:
-`<session>/daemon.log` says why the daemon exited.
+they race and reorder in the remote UI.
+
+**`daemon_not_running` and `daemon_unresponsive` want opposite reactions.**
+`daemon_not_running` means there is no process — reconnect, and read
+`<session>/daemon.log` for why it exited. `daemon_unresponsive` means the
+process is alive but did not answer a health check within 10s — it is busy
+(a long `run --wait`, a file transfer). Wait a few seconds and retry the same
+command; do **not** reconnect, that throws away a working session. The message
+quotes the last lines of daemon.log so you can see what it is doing. Only if it
+stays unresponsive for over a minute does `connect` replace it (killing the
+stuck one first). Cold `connect` with automation can take up to ~2.5 minutes;
+its timeout now covers that.
+
+**OCR coordinates are top-left pixels.** `locate` returns `x/y/width/height`
+with the origin at the top-left of the desktop and `center_x/center_y` as the
+click point; no conversion is needed (the bottom-left-origin issue exists in
+Apple Vision, which agent-rdp does not use).
 
 ## Speed
 
@@ -161,8 +183,11 @@ agent-rdp keyboard up shift
 agent-rdp scroll up 3
 agent-rdp scroll down 5 --at 600 400
 
-# Clipboard (first use can block during remote channel init; wrap in a timeout)
+# Clipboard (first use can block during remote channel init; wrap in a timeout).
+# Line endings become CRLF on the Windows side, so a multi-line script survives
+# `Get-Clipboard | Set-Content`; `get` returns Windows text with CRLF as-is.
 agent-rdp clipboard set "text"
+agent-rdp clipboard set --file ./script.ps1   # no shell quoting; `-` reads stdin
 agent-rdp clipboard get
 
 # Drive mapping

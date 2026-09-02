@@ -304,6 +304,33 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The `run` prelude is PowerShell source for the *child* process and
+    /// must reach it verbatim. Written in a double-quoted string it was
+    /// expanded inside the agent instead, and every `automate run` began
+    /// with `Continue='SilentlyContinue';` - a CommandNotFoundException.
+    /// PSScriptAnalyzer cannot catch this (both spellings are valid
+    /// PowerShell), so pin the literal here.
+    #[test]
+    fn run_prelude_is_a_single_quoted_literal() {
+        assert!(
+            LIB_ACTIONS.contains("'$ProgressPreference=''SilentlyContinue'';'"),
+            "Invoke-Run's prelude must be a single-quoted literal so $ProgressPreference \
+             is not expanded in the agent's own scope"
+        );
+        assert!(
+            !LIB_ACTIONS.contains("\"$ProgressPreference="),
+            "Invoke-Run's prelude must not interpolate $ProgressPreference"
+        );
+    }
+
+    /// `Read-DvcMessage` has to reassemble CHANNEL_PDU_HEADER fragments; the
+    /// single-read version silently dropped every request over ~1.6KB.
+    #[test]
+    fn dvc_reader_reassembles_fragments() {
+        assert!(LIB_DVC.contains("ChannelFlagLast"));
+        assert!(LIB_DVC.contains("MemoryStream"));
+    }
+
     #[tokio::test]
     async fn test_initialize_creates_structure() {
         let temp_dir = TempDir::new().unwrap();

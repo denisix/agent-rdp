@@ -28,6 +28,15 @@ pub async fn handle(
     let stream_quality = params.stream_quality;
     let serve_viewer = params.serve_viewer;
 
+    // Claim a fresh generation for the session about to be created, before
+    // touching any shared state. Anything the *previous* session's frame
+    // processor reports from here on is stale by definition, and the daemon
+    // discards it rather than tearing down what this connect is building.
+    // This has to happen first: the drop-teardown task in `daemon.rs`
+    // re-checks the generation under each lock it takes, and only an early
+    // bump guarantees it cannot wipe the automation state initialized below.
+    let generation = session_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
     // Auto-disconnect if already connected (handles stale/dropped connections)
     {
         let mut session = rdp_session.lock().await;
@@ -127,12 +136,6 @@ pub async fn handle(
         drives,
         automation_dvc_state,
     };
-
-    // Claim a fresh generation for the session about to be created. Anything
-    // the *previous* session's frame processor reports from here on is
-    // stale by definition, and the daemon will discard it rather than tear
-    // down the session we are establishing right now.
-    let generation = session_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
     // Attempt connection
     let rdp = match RdpSession::connect(config, Some((disconnect_tx, generation))).await {

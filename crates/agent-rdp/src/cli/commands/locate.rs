@@ -97,8 +97,8 @@ pub async fn run(
 
     let mut client = match manager.connect_existing().await {
         Ok(client) => client,
-        Err(message) => {
-            output.print_error("daemon_not_running", &message);
+        Err(unavailable) => {
+            output.print_error(unavailable.code(), unavailable.message());
             std::process::exit(1);
         }
     };
@@ -239,8 +239,8 @@ pub async fn run_click_at(
 
     let mut client = match manager.connect_existing().await {
         Ok(client) => client,
-        Err(message) => {
-            output.print_error("daemon_not_running", &message);
+        Err(unavailable) => {
+            output.print_error(unavailable.code(), unavailable.message());
             std::process::exit(1);
         }
     };

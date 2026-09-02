@@ -18,7 +18,7 @@ pub struct Cli {
     pub json: bool,
 
     /// Command timeout in milliseconds. Defaults to 30000 for ordinary
-    /// commands and 90000 for `connect`, which additionally has to cover the
+    /// commands and 150000 for `connect`, which additionally has to cover the
     /// TLS/CredSSP handshake and the automation agent bootstrap
     #[arg(long, global = true)]
     pub timeout: Option<u64>,
@@ -333,10 +333,17 @@ pub enum ClipboardAction {
     /// Get clipboard text
     Get,
 
-    /// Set clipboard text
+    /// Set clipboard text. Line endings are normalized to CRLF on the Windows
+    /// side, so a multi-line script survives `Get-Clipboard | Set-Content`.
     Set {
-        /// Text to set
-        text: String,
+        /// Text to set (omit when using --file)
+        #[arg(required_unless_present = "file", conflicts_with = "file")]
+        text: Option<String>,
+
+        /// Read the text from a file instead of the command line (`-` for
+        /// stdin). Avoids shell quoting for multi-line or large content.
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
     },
 }
 

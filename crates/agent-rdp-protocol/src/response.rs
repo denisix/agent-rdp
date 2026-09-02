@@ -404,6 +404,14 @@ pub enum ErrorCode {
     #[error("daemon not running")]
     DaemonNotRunning,
 
+    /// The daemon process is alive and accepted the connection, but did not
+    /// answer a ping in time. Distinct from `DaemonNotRunning` because the
+    /// right reaction is the opposite: wait and retry, do not reconnect - a
+    /// daemon busy with a long operation is not a dead one, and tearing it
+    /// down costs a full reconnect.
+    #[error("daemon unresponsive")]
+    DaemonUnresponsive,
+
     /// Clipboard operation failed.
     #[error("clipboard error")]
     ClipboardError,

@@ -21,7 +21,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # Global state
 $script:RefMap = @{}  # ref number -> AutomationElement mapping
 $script:SnapshotId = $null
-$script:Version = "1.2.0"  # File transfer + result journal
+$script:Version = "1.3.0"  # DVC fragment reassembly, file-backed run --stream
 # Local log path on Windows machine (RDPDR not used for logging anymore)
 $script:LocalLogPath = "$env:TEMP\agent-rdp-automation.log"
 $script:DvcHandle = [IntPtr]::Zero

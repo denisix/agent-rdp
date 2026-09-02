@@ -25,6 +25,82 @@ pub fn cf_unicodetext() -> ClipboardFormatId {
     ClipboardFormatId::new(13)
 }
 
+/// Encode text as `CF_UNICODETEXT`: UTF-16LE, CRLF line endings, NUL-terminated.
+///
+/// Windows text is CRLF. Sending a bare `\n` is off-spec, and it is exactly
+/// what made a multi-line script pasted via `clipboard set` come out of
+/// `Get-Clipboard | Set-Content` as one line - `Get-Clipboard` splits on CRLF.
+/// Normalizing here is idempotent: already-CRLF input is not turned into CRCRLF.
+pub fn encode_cf_unicodetext(text: &str) -> Vec<u8> {
+    let normalized = normalize_to_crlf(text);
+    let utf16: Vec<u16> = normalized
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    utf16.iter().flat_map(|&c| c.to_le_bytes()).collect()
+}
+
+/// `\n` and lone `\r` become `\r\n`; existing `\r\n` is left alone.
+pub fn normalize_to_crlf(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 16);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push_str("\r\n");
+            }
+            '\n' => out.push_str("\r\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod line_ending_tests {
+    use super::*;
+
+    fn decode(bytes: &[u8]) -> String {
+        let utf16: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16(&utf16).unwrap()
+    }
+
+    #[test]
+    fn lf_becomes_crlf() {
+        assert_eq!(normalize_to_crlf("a\nb\n"), "a\r\nb\r\n");
+    }
+
+    #[test]
+    fn crlf_is_unchanged() {
+        assert_eq!(normalize_to_crlf("a\r\nb\r\n"), "a\r\nb\r\n");
+    }
+
+    #[test]
+    fn normalization_is_idempotent() {
+        let once = normalize_to_crlf("x\ny\r\nz\r");
+        assert_eq!(normalize_to_crlf(&once), once);
+        assert_eq!(once, "x\r\ny\r\nz\r\n");
+    }
+
+    #[test]
+    fn encoded_text_is_nul_terminated_utf16le_with_crlf() {
+        let bytes = encode_cf_unicodetext("Привет\nmir");
+        assert_eq!(&bytes[bytes.len() - 2..], &[0, 0]);
+        assert_eq!(decode(&bytes), "Привет\r\nmir\0");
+    }
+
+    #[test]
+    fn empty_text_is_just_the_terminator() {
+        assert_eq!(encode_cf_unicodetext(""), vec![0, 0]);
+    }
+}
+
 /// Messages from backend to frame processor.
 #[derive(Debug)]
 pub enum BackendMessage {
@@ -164,10 +240,7 @@ impl CliprdrBackend for AgentClipboardBackend {
 
         let response = if request.format == cf_unicodetext() {
             if let Some(ref text) = state.local_text {
-                // Convert to UTF-16LE with null terminator.
-                let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-                let bytes: Vec<u8> = utf16.iter().flat_map(|&c| c.to_le_bytes()).collect();
-                OwnedFormatDataResponse::new_data(bytes)
+                OwnedFormatDataResponse::new_data(encode_cf_unicodetext(text))
             } else {
                 OwnedFormatDataResponse::new_error()
             }

@@ -642,7 +642,7 @@ fn parse_window_list_response(data: serde_json::Value) -> anyhow::Result<Vec<Win
 fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
     let exit_code = data["exit_code"].as_i64().map(|v| v as i32);
     let stdout = data["stdout"].as_str().map(|s| s.to_string());
-    let stderr = data["stderr"].as_str().map(|s| s.to_string());
+    let stderr = data["stderr"].as_str().map(clean_clixml);
     let pid = data["pid"].as_u64().map(|v| v as u32);
 
     Ok(RunResult {
@@ -659,7 +659,7 @@ fn parse_run_poll_response(data: serde_json::Value) -> anyhow::Result<RunPollRes
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("run_poll response missing pid"))? as u32;
     let stdout_chunk = data["stdout_chunk"].as_str().unwrap_or("").to_string();
-    let stderr_chunk = data["stderr_chunk"].as_str().unwrap_or("").to_string();
+    let stderr_chunk = clean_clixml(data["stderr_chunk"].as_str().unwrap_or(""));
     let exited = data["exited"].as_bool().unwrap_or(false);
     let exit_code = data["exit_code"].as_i64().map(|v| v as i32);
 
@@ -670,6 +670,153 @@ fn parse_run_poll_response(data: serde_json::Value) -> anyhow::Result<RunPollRes
         exited,
         exit_code,
     })
+}
+
+/// Turn PowerShell's CLIXML-serialized stderr back into plain text.
+///
+/// When `powershell.exe` runs with its stderr redirected to a pipe (as the
+/// agent's `Invoke-Run` does) it serializes error, warning, progress and
+/// verbose records as `#< CLIXML` followed by an `<Objs>` document instead of
+/// writing text. A caller reading stderr for a reason then had to dig the
+/// actual message out of `<S S="Error">...</S>` elements padded with
+/// `_x000D__x000A_`. This keeps the text of error and warning records, drops
+/// progress/verbose/debug records (module autoload chatter), and leaves any
+/// non-CLIXML text untouched. Best effort: a `run-poll` chunk can split the
+/// XML mid-element, and whatever cannot be parsed is passed through as-is.
+pub fn clean_clixml(stderr: &str) -> String {
+    const MARKER: &str = "#< CLIXML";
+
+    let Some(marker_at) = stderr.find(MARKER) else {
+        return stderr.to_string();
+    };
+
+    let mut out = String::with_capacity(stderr.len());
+    out.push_str(&stderr[..marker_at]);
+
+    let xml = &stderr[marker_at + MARKER.len()..];
+    let mut rest = xml;
+    let mut extracted_any = false;
+    while let Some(start) = rest.find("<S ") {
+        let element = &rest[start..];
+        let Some(tag_end) = element.find('>') else { break };
+        let tag = &element[..tag_end];
+        let body_start = tag_end + 1;
+        let Some(close) = element[body_start..].find("</S>") else { break };
+        let body = &element[body_start..body_start + close];
+
+        let stream = tag
+            .split_once("S=\"")
+            .and_then(|(_, after)| after.split_once('"'))
+            .map(|(name, _)| name)
+            .unwrap_or("");
+        if matches!(stream, "Error" | "error" | "Warning" | "warning") {
+            let text = decode_clixml_text(body);
+            if !text.trim().is_empty() {
+                out.push_str(&text);
+                if !text.ends_with('\n') {
+                    out.push('\n');
+                }
+                extracted_any = true;
+            }
+        }
+        rest = &element[body_start + close + 4..];
+    }
+
+    // A chunk that carried the marker but no complete element yet (a poll
+    // split the XML) - hand the raw bytes back rather than swallowing them.
+    if !extracted_any && !xml.contains("</Objs>") && !xml.contains("<S ") {
+        out.push_str(MARKER);
+        out.push_str(xml);
+    }
+
+    out
+}
+
+/// Decode CLIXML string escapes: `_x000D_`-style code points and XML entities.
+fn decode_clixml_text(body: &str) -> String {
+    let mut text = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.find("_x") {
+        text.push_str(&rest[..at]);
+        let candidate = &rest[at..];
+        // `_xHHHH_` is exactly 7 bytes.
+        if candidate.len() >= 7 && candidate.as_bytes()[6] == b'_' {
+            if let Ok(code) = u32::from_str_radix(&candidate[2..6], 16) {
+                if let Some(c) = char::from_u32(code) {
+                    text.push(c);
+                    rest = &candidate[7..];
+                    continue;
+                }
+            }
+        }
+        text.push_str("_x");
+        rest = &candidate[2..];
+    }
+    text.push_str(rest);
+
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+#[cfg(test)]
+mod clixml_tests {
+    use super::clean_clixml;
+
+    #[test]
+    fn plain_text_is_unchanged() {
+        assert_eq!(clean_clixml("just an error\n"), "just an error\n");
+        assert_eq!(clean_clixml(""), "");
+    }
+
+    #[test]
+    fn progress_records_are_dropped_and_errors_kept() {
+        let input = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\">\
+            <Obj S=\"progress\" RefId=\"0\"><TN RefId=\"0\"><T>System.Management.Automation.PSCustomObject</T>\
+            <T>System.Object</T></TN><MS><I64 N=\"SourceId\">1</I64><PR N=\"Record\"><AV>Preparing modules for first use.</AV>\
+            <AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj>\
+            <S S=\"Error\">Get-Item : Cannot find path 'C:\\nope'._x000D__x000A_</S>\
+            <S S=\"Error\">At line:1 char:1_x000D__x000A_</S></Objs>";
+        let cleaned = clean_clixml(input);
+        assert_eq!(
+            cleaned,
+            "Get-Item : Cannot find path 'C:\\nope'.\r\nAt line:1 char:1\r\n"
+        );
+        assert!(!cleaned.contains("Preparing modules"));
+        assert!(!cleaned.contains("<Objs"));
+    }
+
+    #[test]
+    fn text_before_marker_is_preserved() {
+        let input = "warning: plain\n#< CLIXML\n<Objs><S S=\"Error\">boom</S></Objs>";
+        assert_eq!(clean_clixml(input), "warning: plain\nboom\n");
+    }
+
+    #[test]
+    fn xml_entities_are_decoded() {
+        let input = "#< CLIXML\n<Objs><S S=\"Error\">a &lt; b &amp;&amp; c &gt; d &quot;q&quot;</S></Objs>";
+        assert_eq!(clean_clixml(input), "a < b && c > d \"q\"\n");
+    }
+
+    #[test]
+    fn cyrillic_survives() {
+        let input = "#< CLIXML\n<Objs><S S=\"Error\">Не удается найти путь_x000D__x000A_</S></Objs>";
+        assert_eq!(clean_clixml(input), "Не удается найти путь\r\n");
+    }
+
+    #[test]
+    fn progress_only_block_becomes_empty() {
+        let input = "#< CLIXML\n<Objs><Obj S=\"progress\"><PR><AV>Preparing modules for first use.</AV></PR></Obj></Objs>";
+        assert_eq!(clean_clixml(input), "");
+    }
+
+    #[test]
+    fn split_chunk_without_elements_is_passed_through() {
+        let input = "#< CLIXML\n<Objs Version=\"1.1.0.1\"";
+        assert_eq!(clean_clixml(input), input);
+    }
 }
 
 /// Parse status response from PowerShell agent.
