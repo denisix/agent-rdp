@@ -48,8 +48,19 @@ CLI → session_manager.ensure_daemon()   # spawns the daemon if needed
 
 The daemon starts on the first command and persists until closed. IPC is Unix
 sockets on macOS/Linux, TCP on Windows. Session state lives in
-`/tmp/agent-rdp/<session>/` (Unix) or `%TEMP%\agent-rdp\` (Windows), including
-`daemon.log` — the first place to look when a session misbehaves.
+`/tmp/agent-rdp/<session>/` (Unix) or `%TEMP%\agent-rdp\` (Windows):
+`daemon.log` (first place to look), `transcript.jsonl` (one redacted line per
+IPC request, `transcript.rs`), and `diagnostics/` (screenshot + context pairs
+saved on failures, `diagnostics.rs`). `agent-rdp diagnose` zips all of it;
+`cleanup_session` must never delete these (`EVIDENCE_ENTRIES`).
+
+**Version contract.** The daemon reports `CARGO_PKG_VERSION` in `Pong` and
+`SessionInfo`; the CLI (`session_manager.rs`) and the TS SDK (`daemon.ts`)
+compare it with their own. Socket/pid paths depend only on the session name,
+so without this check an upgraded CLI silently keeps driving the old daemon —
+and the old daemon redeploys *its* embedded PS scripts on every `connect`.
+`connect` replaces a mismatched daemon; every other command refuses with
+`daemon_version_mismatch`, except `disconnect`, which must always work.
 
 ### Key components
 
@@ -73,7 +84,14 @@ are easy to break:
   ~1.6KB (every `file push` chunk) silently gets no reply.
 - The daemon's main `select!` loop must never await a session lock inline —
   that blocks `accept()`, and the CLI reports a daemon it cannot reach as
-  unresponsive. Do teardown work in a spawned task.
+  unresponsive. Do teardown work in a spawned task. (The WS arm still awaits
+  the lock inline — a known remaining violation.) The transcript and failure
+  captures run from the per-connection task and spawn their own work for the
+  same reason.
+- `RdpSession::disconnect` joins the frame processor (bounded, then abort) and
+  `Drop` aborts it. Before that, a replaced session's processor could outlive
+  its replacement for the TCP-keepalive window with its framebuffer and socket,
+  and rapid reconnects stacked them up.
 
 **`handlers/*.rs`** — one module per command type, each returning a `Response`.
 `file_transfer.rs` moves files in chunks over the automation DVC channel with

@@ -147,7 +147,14 @@ impl DvcIpc {
         request: &AutomateRequest,
         response_timeout: Duration,
     ) -> anyhow::Result<serde_json::Value> {
-        let request_id = Uuid::new_v4().to_string()[..8].to_string();
+        // A caller-supplied idempotency key becomes the request id itself:
+        // the agent journals results by id and replays a known one, so a
+        // retry carrying the same key gets the first execution's result
+        // rather than a second execution. Everything else gets a random id.
+        let request_id = match request {
+            AutomateRequest::Run { idempotency_key: Some(key), .. } => key.clone(),
+            _ => Uuid::new_v4().to_string()[..8].to_string(),
+        };
 
         // Convert AutomateRequest to command name and params
         let (command, params) = self.serialize_request(request)?;
@@ -184,6 +191,17 @@ impl DvcIpc {
                 .command_tx
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("DVC command sender not configured"))?;
+
+            // Two in-flight requests with one id would share a journal slot
+            // and clobber each other's reply channel; only an idempotency
+            // key can produce that, and the right answer is to wait.
+            if state.pending.contains_key(&request_id) {
+                anyhow::bail!(
+                    "a request with idempotency key '{}' is still in flight; wait for it to \
+                     finish (or time out) before retrying with the same key",
+                    request_id
+                );
+            }
 
             // Send the data through the RDP session
             command_tx

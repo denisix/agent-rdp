@@ -307,6 +307,8 @@ agent-rdp automate run "Get-Process" --wait --process-timeout 5000
 agent-rdp automate run "$PSVersionTable" --wait --shell pwsh.exe
 agent-rdp automate run "ping -t 127.0.0.1" --stream   # returns a pid immediately
 agent-rdp automate run-poll <pid>                     # drain output; repeat until exited
+agent-rdp automate run "Add-Content C:\log.txt x" --wait --idempotency-key step-07
+                                            # a retry with the same key replays, never re-runs
 
 agent-rdp automate status                   # uptime, last DVC round-trip, failure count
 agent-rdp automate restart                  # relaunch the agent, keeping the RDP session
@@ -334,6 +336,24 @@ still busy: check state before retrying, or a click/fill can apply twice.
 Read-only commands (`snapshot`, `get`, `status`, `wait-for`, `window list`) say
 so explicitly, since those are always safe to retry.
 
+**Retrying `run` safely.** Give a mutating `run` an `--idempotency-key`. A
+retry that reuses the key — after `indeterminate`, an IPC timeout or
+`daemon_unresponsive` — gets the recorded result of the first execution back
+(`replayed: true`) instead of running the command again; reusing a key for a
+*different* command is refused (`idempotency_key_reused`). The journal is
+per agent process (last 64 results) and empty after a reconnect, so after
+`connect` verify the side effect instead of retrying blindly.
+
+**`run` exit codes mean something.** The child runs with
+`$ErrorActionPreference='Stop'`, so a cmdlet that fails non-terminatingly —
+`Add-Content` to a locked file, `Set-Content` to a bad path — exits 1 with the
+error on stderr instead of reporting success for a write that never happened.
+A script that wants continue-on-error sets `$ErrorActionPreference='Continue'`
+on its first line. Do not redirect `*>` into a file the script itself writes:
+the child holds it open and the script's own writes fail with "being used by
+another process" — `run --wait` captures output without a file, and
+`run --stream` + `run-poll` covers long jobs.
+
 **Long-running commands** get the time they ask for: the transport deadline,
 the CLI socket timeout and the watchdog all extend to cover
 `--process-timeout`/`--timeout`. But the agent handles one command at a time,
@@ -351,6 +371,13 @@ second means the process is alive but did not answer a health check within
 reconnect, that discards a working session. The message includes the tail of
 daemon.log. `connect` replaces a daemon that stays unresponsive, killing the
 stuck one first.
+
+**`daemon_version_mismatch`** means the daemon was started by a different
+agent-rdp version than the CLI — it kept running across an upgrade, and is
+still serving the old code, including the automation agent it embeds. Run
+`agent-rdp connect ...` again: it replaces the daemon (and the SDK does the
+same on its own). `session info` shows both versions. This is worth knowing
+about because it is how "upgraded, but the old bug still reproduces" happens.
 
 **Arrow-key navigation inside a panel can land on the wrong item.** Observed in
 1C side panels: Up/Down then Enter is not reliably deterministic. Prefer
@@ -374,6 +401,28 @@ agent-rdp view --port 9224
 
 There is no `session close` — use `disconnect`.
 
+### Diagnostics and bug reports
+
+```bash
+agent-rdp diagnose                       # -> ./agent-rdp-diagnostics-<session>-<ts>.zip
+agent-rdp diagnose --output report.zip
+```
+
+The zip holds `daemon.log` (+ `.prev`), `transcript.jsonl` (one redacted line
+per request: what was asked, outcome, duration), `diagnostics/` (failure
+captures), a current screenshot, the remote automation agent's own log, and
+`info.json` (versions, OS, daemon state, which `AGENT_RDP_*` variables are
+set). It is built from disk first and the daemon second, so it works when the
+daemon is dead or unresponsive — those parts are listed as skipped. The RDP
+password is never logged, and is blanked if it appears anyway.
+
+Failure captures are automatic: when `locate` finds nothing, `click-at` refuses,
+an `automate` command errors, or a waited `run` exits non-zero, the daemon saves
+`diagnostics/<ts>-<kind>-<code>.png` plus a `.json` with the request, the error
+and — for OCR misses — every line OCR *did* read. At most one capture per 5s,
+the newest 20 kept. Set `AGENT_RDP_DIAGNOSTICS=0` to turn the transcript and
+captures off.
+
 ## JSON output
 
 Add `--json` to any command:
@@ -394,6 +443,7 @@ Add `--json` to any command:
 | `AGENT_RDP_SESSION` | Session name (default: "default") |
 | `AGENT_RDP_STREAM_PORT` | WebSocket streaming port (0 = disabled) |
 | `AGENT_RDP_MODELS_DIR` | OCR models directory (set automatically by the npm wrapper; needed for standalone binary installs) |
+| `AGENT_RDP_DIAGNOSTICS` | Set to `0` to disable the request transcript and failure captures |
 
 ## Node.js API
 

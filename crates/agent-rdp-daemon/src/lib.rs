@@ -13,6 +13,9 @@ pub mod rdp_session;
 pub mod rdpdr;
 pub mod ws_input;
 pub mod ws_server;
+pub mod diagnostics;
+pub mod timefmt;
+pub mod transcript;
 
 pub use daemon::{Daemon, SharedWsHandle};
 pub use ipc_server::IpcServer;
@@ -67,6 +70,24 @@ pub fn get_session_port(session: &str) -> u16 {
     49152 + (hash % 16384) as u16
 }
 
+/// Session-directory entries that `cleanup_session` must never delete: the
+/// daemon log, the request transcript and the failure captures. Everything
+/// `agent-rdp diagnose` bundles lives in this list.
+pub const EVIDENCE_ENTRIES: &[&str] = &[
+    "daemon.log",
+    "daemon.log.prev",
+    TRANSCRIPT_FILE,
+    TRANSCRIPT_PREV_FILE,
+    DIAGNOSTICS_DIR,
+];
+
+/// Request/response transcript written by the daemon (JSON lines).
+pub const TRANSCRIPT_FILE: &str = "transcript.jsonl";
+/// Rotated predecessor of `TRANSCRIPT_FILE`.
+pub const TRANSCRIPT_PREV_FILE: &str = "transcript.jsonl.prev";
+/// Directory of failure captures (screenshot + context pairs).
+pub const DIAGNOSTICS_DIR: &str = "diagnostics";
+
 /// Clean up a session's transient state.
 ///
 /// Deliberately removes individual entries rather than the whole directory:
@@ -82,12 +103,13 @@ pub fn cleanup_session(session: &str) {
     }
 
     // Anything else transient (automation scratch dirs and the like) can go, but
-    // keep the logs.
+    // keep the logs - and the diagnostics the daemon collected, which exist
+    // precisely for the "what went wrong" question this path is on.
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name == "daemon.log" || name == "daemon.log.prev" {
+            if EVIDENCE_ENTRIES.contains(&name.as_ref()) {
                 continue;
             }
             let path = entry.path();

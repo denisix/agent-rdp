@@ -30,6 +30,11 @@ height?: number,
  */
 pid: number, 
 /**
+ * Version of the daemon binary (`CARGO_PKG_VERSION`). Empty when the
+ * daemon predates this field. See `ResponseData::Pong`.
+ */
+daemon_version: string, 
+/**
  * Time since daemon started (seconds).
  */
 uptime_secs: number, 

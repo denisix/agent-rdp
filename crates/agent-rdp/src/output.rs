@@ -105,6 +105,20 @@ impl Output {
                     println!("Resolution: {}x{}", w, h);
                 }
                 println!("PID: {}", info.pid);
+                let cli_version = env!("CARGO_PKG_VERSION");
+                if info.daemon_version.is_empty() {
+                    println!(
+                        "Daemon version: unknown (predates {}; run `agent-rdp connect` to replace it)",
+                        cli_version
+                    );
+                } else if info.daemon_version != cli_version {
+                    println!(
+                        "Daemon version: {} (CLI is {} - run `agent-rdp connect` to replace it)",
+                        info.daemon_version, cli_version
+                    );
+                } else {
+                    println!("Daemon version: {}", info.daemon_version);
+                }
                 println!("Uptime: {}s", info.uptime_secs);
                 if let Some(age_ms) = info.last_frame_age_ms {
                     println!("Last frame from server: {}s ago", age_ms / 1000);
@@ -129,8 +143,8 @@ impl Output {
                     }
                 }
             }
-            ResponseData::Pong => {
-                println!("Pong");
+            ResponseData::Pong { version } => {
+                println!("Pong (daemon {})", if version.is_empty() { "unversioned" } else { version });
             }
             ResponseData::Snapshot(snapshot) => {
                 // Print full accessibility tree like agent-browser
@@ -204,6 +218,9 @@ impl Output {
                 // remote command actually printed - otherwise every parser
                 // has to strip an "Exit code: 0" line the program never
                 // produced.
+                if result.replayed {
+                    eprintln!("(replayed from the agent's journal - the command was not run again)");
+                }
                 if let Some(code) = result.exit_code {
                     eprintln!("Exit code: {}", code);
                 }
@@ -385,6 +402,7 @@ pub fn error_code_for(code: &str) -> agent_rdp_protocol::ErrorCode {
     match code {
         "daemon_not_running" => ErrorCode::DaemonNotRunning,
         "daemon_unresponsive" => ErrorCode::DaemonUnresponsive,
+        "daemon_version_mismatch" => ErrorCode::DaemonVersionMismatch,
         "watchdog_timeout" | "timeout" => ErrorCode::Timeout,
         "not_connected" => ErrorCode::NotConnected,
         "invalid_request" => ErrorCode::InvalidRequest,

@@ -38,6 +38,7 @@ anyhow = { workspace = true }
 
 # Platform utilities
 glob = { workspace = true }
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

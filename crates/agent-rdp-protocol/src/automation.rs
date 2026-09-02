@@ -160,6 +160,15 @@ pub enum AutomateRequest {
         /// output. Ignored if `wait` is also true.
         #[serde(default)]
         stream: bool,
+        /// Caller-chosen request id. A retry that reuses the key gets the
+        /// journaled result of the first execution back (`RunResult.replayed`)
+        /// instead of running the command a second time - the difference
+        /// between "retry after a lost reply" and "Add-Content applied
+        /// twice". 1-64 chars of `[A-Za-z0-9._:-]`. The journal lives in the
+        /// agent process (last 64 results) and is empty after a reconnect.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        idempotency_key: Option<String>,
     },
 
     /// Poll a process previously started with `Run { stream: true, .. }` for
@@ -421,6 +430,11 @@ pub struct AutomationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub version: Option<String>,
+    /// Path of the agent's own log file on the remote machine, when the
+    /// agent reports one. `agent-rdp diagnose` pulls it into the bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub log_path: Option<String>,
     /// Seconds since the current agent's DVC handshake completed. Distinct
     /// from `agent_running`: an agent can be "running" per the PS-reported
     /// fields yet the daemon-side DVC channel could have gone stale without
@@ -463,6 +477,11 @@ pub struct RunResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub pid: Option<u32>,
+    /// True when this result was replayed from the agent's journal because
+    /// the request reused an `idempotency_key` - the command did not run
+    /// again.
+    #[serde(default)]
+    pub replayed: bool,
 }
 
 /// Incremental output from a process started with `Run { stream: true, .. }`.

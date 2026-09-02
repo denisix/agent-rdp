@@ -19,4 +19,10 @@ stderr?: string,
 /**
  * Process ID (if not waited).
  */
-pid?: number, };
+pid?: number, 
+/**
+ * True when this result was replayed from the agent's journal because
+ * the request reused an `idempotency_key` - the command did not run
+ * again.
+ */
+replayed: boolean, };

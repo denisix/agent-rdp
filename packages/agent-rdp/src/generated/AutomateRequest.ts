@@ -140,7 +140,16 @@ shell?: string,
  * retrieval via `RunPoll`, instead of waiting for exit or discarding
  * output. Ignored if `wait` is also true.
  */
-stream: boolean, } | { "op": "run_poll", 
+stream: boolean, 
+/**
+ * Caller-chosen request id. A retry that reuses the key gets the
+ * journaled result of the first execution back (`RunResult.replayed`)
+ * instead of running the command a second time - the difference
+ * between "retry after a lost reply" and "Add-Content applied
+ * twice". 1-64 chars of `[A-Za-z0-9._:-]`. The journal lives in the
+ * agent process (last 64 results) and is empty after a reconnect.
+ */
+idempotency_key?: string, } | { "op": "run_poll", 
 /**
  * Process ID returned by the initial `Run` call.
  */

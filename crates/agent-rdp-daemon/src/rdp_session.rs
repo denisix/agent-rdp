@@ -133,8 +133,26 @@ pub struct RdpSession {
     shared: Arc<RwLock<SharedState>>,
     /// Channel to send commands to the background task
     command_tx: mpsc::Sender<SessionCommand>,
-    /// Handle to the background task
-    _task_handle: tokio::task::JoinHandle<()>,
+    /// Handle to the background frame-processor task. Joined (with a bound)
+    /// by `disconnect`, aborted on drop - never just detached, see
+    /// `disconnect_with_join`.
+    task_handle: tokio::task::JoinHandle<()>,
+}
+
+/// How long `disconnect` waits for the frame processor to exit on its own
+/// before aborting it.
+pub const DISCONNECT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl Drop for RdpSession {
+    fn drop(&mut self) {
+        // No-op for a task that already finished (the normal case after
+        // `disconnect`). For a session dropped any other way - a replaced
+        // `Option<RdpSession>`, an early return - this is what stops the old
+        // processor from living on with its framebuffer, TLS socket and
+        // channels. Tasks are `Send`, so an abort never lands while a
+        // `parking_lot` guard is held.
+        self.task_handle.abort();
+    }
 }
 
 /// How long to wait for the frame processor to accept a queued command.
@@ -446,7 +464,7 @@ impl RdpSession {
         Ok(Self {
             shared,
             command_tx,
-            _task_handle: task_handle,
+            task_handle,
         })
     }
 
@@ -724,10 +742,44 @@ impl RdpSession {
         }
     }
 
-    /// Disconnect from the RDP server.
+    /// Disconnect from the RDP server and wait (bounded) for the frame
+    /// processor to stop.
     pub async fn disconnect(self) -> Result<(), RdpError> {
+        self.disconnect_with_join(DISCONNECT_JOIN_TIMEOUT).await
+    }
+
+    /// Disconnect, waiting at most `join_timeout` for the frame processor to
+    /// exit before aborting it.
+    ///
+    /// The previous version queued `Shutdown` and returned. That let
+    /// `connect` build the replacement session while the old processor was
+    /// still alive - and if it was stuck in a `write_all` to a half-dead
+    /// peer, it stayed alive for up to the TCP keepalive window (~30s) with
+    /// its multi-MB framebuffer, TLS socket and DVC/clipboard channels. Rapid
+    /// reconnects stacked those up, which is what "the daemon gets worse the
+    /// longer it runs" looked like from the outside.
+    ///
+    /// `try_send` rather than `send().await`: the command channel is bounded,
+    /// and a processor that is not draining it has a full queue - awaiting
+    /// would then hang the caller, holding the session mutex, indefinitely.
+    /// A queue that full means the processor is not going to act on
+    /// `Shutdown` anyway; the join timeout and abort below cover it.
+    pub async fn disconnect_with_join(mut self, join_timeout: std::time::Duration) -> Result<(), RdpError> {
         info!("Disconnecting from RDP session");
-        let _ = self.command_tx.send(SessionCommand::Shutdown).await;
+        if let Err(e) = self.command_tx.try_send(SessionCommand::Shutdown) {
+            warn!("Frame processor is not accepting commands ({}); will abort it", e);
+        }
+
+        match tokio::time::timeout(join_timeout, &mut self.task_handle).await {
+            Ok(_) => debug!("Frame processor joined"),
+            Err(_) => {
+                warn!(
+                    "Frame processor did not stop within {}s; aborting it",
+                    join_timeout.as_secs()
+                );
+                self.task_handle.abort();
+            }
+        }
         Ok(())
     }
 

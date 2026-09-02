@@ -150,6 +150,9 @@ fn watchdog_budget_ms(cli: &Cli) -> u64 {
         // match, so the watchdog has to clear that too.
         Commands::File(_) => 10 * 60 * 1000,
         Commands::Wait { ms } => *ms,
+        // Several best-effort daemon round trips (ping, info, status,
+        // screenshot, remote log pull), each with its own budget.
+        Commands::Diagnose(_) => cli::commands::diagnose::TOTAL_DAEMON_BUDGET_MS,
         _ => 0,
     };
     base + extension + WATCHDOG_GRACE_MS
@@ -224,6 +227,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::View(args) => {
             cli::commands::view::run(args, &output).await
+        }
+        Commands::Diagnose(args) => {
+            cli::commands::diagnose::run(&cli.session, args, &output).await
         }
     }
 }

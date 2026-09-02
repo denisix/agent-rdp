@@ -21,6 +21,11 @@ capabilities: Array<string>,
  */
 version?: string, 
 /**
+ * Path of the agent's own log file on the remote machine, when the
+ * agent reports one. `agent-rdp diagnose` pulls it into the bundle.
+ */
+log_path?: string, 
+/**
  * Seconds since the current agent's DVC handshake completed. Distinct
  * from `agent_running`: an agent can be "running" per the PS-reported
  * fields yet the daemon-side DVC channel could have gone stale without

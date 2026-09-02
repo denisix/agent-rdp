@@ -98,6 +98,11 @@ pub enum Commands {
 
     /// Open the web viewer in a browser
     View(ViewArgs),
+
+    /// Bundle logs, the request transcript, failure captures and a current
+    /// screenshot into a zip for a bug report. Works even when the daemon is
+    /// dead or unresponsive (those parts are simply skipped).
+    Diagnose(DiagnoseArgs),
 }
 
 /// View command arguments.
@@ -106,6 +111,14 @@ pub struct ViewArgs {
     /// WebSocket streaming port to connect to
     #[arg(long, default_value = "9224")]
     pub port: u16,
+}
+
+/// Diagnose command arguments.
+#[derive(Parser)]
+pub struct DiagnoseArgs {
+    /// Where to write the zip (default: ./agent-rdp-diagnostics-<session>-<timestamp>.zip)
+    #[arg(long, short)]
+    pub output: Option<String>,
 }
 
 /// Connect command arguments.
@@ -553,6 +566,14 @@ pub enum AutomateAction {
         /// exit or discarding output. Ignored if --wait is also set.
         #[arg(long)]
         stream: bool,
+
+        /// Idempotency key. Reuse the same key when retrying this exact
+        /// command after a timeout or automation_indeterminate: the agent
+        /// returns the recorded result instead of running it again.
+        /// 1-64 chars of [A-Za-z0-9._:-]; kept in the agent's 64-entry
+        /// journal, which is empty after a reconnect.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
     },
 
     /// Poll a process started with `run --stream` for output produced since the last poll

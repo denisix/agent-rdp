@@ -74,6 +74,7 @@ pub fn parse_point(s: &str) -> Result<(u16, u16), String> {
 pub mod automate;
 pub mod clipboard;
 pub mod connect;
+pub mod diagnose;
 pub mod disconnect;
 pub mod drive;
 pub mod file;

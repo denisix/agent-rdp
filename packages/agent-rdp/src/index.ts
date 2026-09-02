@@ -432,6 +432,7 @@ export class RdpSession {
       width?: number;
       height?: number;
       pid: number;
+      daemon_version?: string;
       uptime_secs: number;
     };
 
@@ -442,6 +443,7 @@ export class RdpSession {
       width: data.width,
       height: data.height,
       pid: data.pid,
+      daemon_version: data.daemon_version ?? '',
       uptime_secs: data.uptime_secs,
     };
   }

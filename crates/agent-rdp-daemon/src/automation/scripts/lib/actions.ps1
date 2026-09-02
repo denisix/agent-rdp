@@ -579,12 +579,20 @@ function Invoke-Run {
     # console output keeps non-ASCII text intact: the default is the OEM
     # codepage, which turns Cyrillic into mojibake on its way back to us.
     #
+    # `$ErrorActionPreference='Stop'` is what makes the exit code mean
+    # something. Without it a cmdlet that fails non-terminatingly - Add-Content
+    # to a locked file, Set-Content to a bad path, access denied - writes to
+    # the error stream and the process still exits 0, so the caller sees
+    # "success" with no side effect. A script that wants continue-on-error
+    # semantics can set the preference back on its first line.
+    #
     # SINGLE-quoted on purpose. This text is source code for the *child*
     # process; in a double-quoted string `$ProgressPreference` is expanded
     # right here, in the agent, to its current value, and the child received
     # `Continue='SilentlyContinue';...` - a CommandNotFoundException on every
     # single `run`, plus the progress noise it was meant to silence.
-    $prelude = '$ProgressPreference=''SilentlyContinue'';' +
+    $prelude = '$ErrorActionPreference=''Stop'';' +
+               '$ProgressPreference=''SilentlyContinue'';' +
                '[Console]::OutputEncoding=[Text.Encoding]::UTF8;'
     $script = $prelude + $userScript
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
@@ -880,6 +888,9 @@ function Get-AgentStatus {
         agent_running = $true
         agent_pid = $PID
         version = $script:Version
+        # Where this agent writes its own log, so `agent-rdp diagnose` can
+        # pull it into the bug-report bundle.
+        log_path = $script:LocalLogPath
         capabilities = @(
             "snapshot", "invoke", "select", "toggle", "expand", "collapse",
             "context_menu", "focus", "get", "fill", "clear",
@@ -1028,7 +1039,8 @@ function Add-JournaledResult {
         [string]$Id,
         [bool]$Success,
         $Data,
-        $ErrorInfo
+        $ErrorInfo,
+        [string]$Fingerprint
     )
 
     if (-not $Id) { return }
@@ -1037,6 +1049,7 @@ function Add-JournaledResult {
         success = $Success
         data = $Data
         error = $ErrorInfo
+        fingerprint = $Fingerprint
         at = (Get-Date).ToString("o")
     }
     [void]$script:ResultJournalOrder.Add($Id)
@@ -1047,6 +1060,35 @@ function Add-JournaledResult {
         $script:ResultJournalOrder.RemoveAt(0)
         $script:ResultJournal.Remove($oldest)
     }
+}
+
+# SHA-256 over the command name and its parameters, so a replay can tell "the
+# same request again" from "a new request that happens to reuse the id".
+function Get-RequestFingerprint {
+    param(
+        [string]$Command,
+        $Params
+    )
+
+    $json = if ($null -eq $Params) { "" } else { $Params | ConvertTo-Json -Compress -Depth 10 }
+    $bytes = [Text.Encoding]::UTF8.GetBytes("$Command|$json")
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace "-", "")
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+# The raw journal entry for an id (with its fingerprint), or $null. Used by
+# the dispatch loop for replay; `Get-JournaledResult` below is the
+# `query_result` command's view of the same data.
+function Get-JournalEntry {
+    param([string]$Id)
+
+    if (-not $Id) { return $null }
+    if (-not $script:ResultJournal.ContainsKey($Id)) { return $null }
+    return $script:ResultJournal[$Id]
 }
 
 function Get-JournaledResult {

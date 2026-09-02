@@ -12,7 +12,9 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let manager = SessionManager::new(session.to_string());
 
-    let mut client = match manager.connect_existing().await {
+    // Any version: stopping a daemon left over from a previous install must
+    // never require the user to first `connect` (and hand over credentials).
+    let mut client = match manager.connect_existing_any_version().await {
         Ok(client) => client,
         Err(unavailable) => {
             output.print_error(unavailable.code(), unavailable.message());

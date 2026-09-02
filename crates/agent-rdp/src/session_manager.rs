@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use agent_rdp_daemon::{cleanup_session, get_pid_path, get_session_dir, get_socket_path};
-use agent_rdp_protocol::Request;
+use agent_rdp_protocol::{Request, ResponseData};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -70,6 +70,39 @@ pub fn daemon_unresponsive_message(session: &str, pid: Option<u32>) -> String {
     )
 }
 
+/// This CLI's version, compared against what the daemon reports in `Pong`.
+pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long a version-mismatched daemon gets to shut down gracefully before
+/// it is killed. The daemon joins its frame processor on shutdown (bounded
+/// at 2s there), so this comfortably covers the graceful path.
+const SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
+
+/// How long to wait for a shut-down daemon's pid to disappear.
+const EXIT_WAIT: Duration = Duration::from_secs(5);
+
+/// Message for a daemon started by a different agent-rdp version.
+///
+/// This is the mechanism behind "upgraded, but the old bug still reproduces":
+/// the daemon outlives the upgrade, and every command - including `connect`,
+/// which redeploys the automation scripts *the daemon* embeds - keeps running
+/// the old code. Say so explicitly, and name the two ways out.
+pub fn daemon_version_mismatch_message(session: &str, pid: u32, daemon_version: &str) -> String {
+    let daemon_text = if daemon_version.is_empty() {
+        "an older agent-rdp (it predates version reporting)".to_string()
+    } else {
+        format!("agent-rdp {}", daemon_version)
+    };
+    format!(
+        "The daemon for session '{}' (pid {}) is {} but this CLI is {}: the daemon kept \
+         running across an upgrade and is still serving the old code, including the \
+         automation agent it embeds. Run `agent-rdp connect ...` again - it replaces the \
+         daemon and redeploys the automation agent. `agent-rdp disconnect` stops the old \
+         daemon without reconnecting.",
+        session, pid, daemon_text, CLI_VERSION
+    )
+}
+
 /// Last `lines` lines of a log file, or an empty string if it cannot be read.
 fn read_log_tail(path: &std::path::Path, lines: usize) -> String {
     let Ok(content) = std::fs::read_to_string(path) else {
@@ -89,6 +122,9 @@ pub enum DaemonUnavailable {
     /// The process is alive and accepted the socket, but a ping went
     /// unanswered. Waiting and retrying is the fix; reconnecting is not.
     Unresponsive(String),
+    /// The process answered, but was built from a different agent-rdp
+    /// version than this CLI. `connect` replaces it; everything else refuses.
+    VersionMismatch(String),
 }
 
 impl DaemonUnavailable {
@@ -97,12 +133,42 @@ impl DaemonUnavailable {
         match self {
             DaemonUnavailable::NotRunning(_) => "daemon_not_running",
             DaemonUnavailable::Unresponsive(_) => "daemon_unresponsive",
+            DaemonUnavailable::VersionMismatch(_) => "daemon_version_mismatch",
         }
     }
 
     pub fn message(&self) -> &str {
         match self {
-            DaemonUnavailable::NotRunning(m) | DaemonUnavailable::Unresponsive(m) => m,
+            DaemonUnavailable::NotRunning(m)
+            | DaemonUnavailable::Unresponsive(m)
+            | DaemonUnavailable::VersionMismatch(m) => m,
+        }
+    }
+}
+
+/// Verdict of a health-check ping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonHealth {
+    /// Answered, and built from this CLI's version.
+    Healthy,
+    /// Answered, but from a different build. `daemon_version` is empty for a
+    /// daemon that predates version reporting.
+    VersionMismatch { daemon_version: String },
+    /// No usable answer within the ping budget.
+    Unresponsive,
+}
+
+/// Classify a daemon's reported version against this CLI's.
+///
+/// Exact string equality on purpose: there is no compatibility window to
+/// reason about, because the daemon *is* the same binary as the CLI - any
+/// difference means the user is not running what they just installed.
+pub fn classify_daemon_version(daemon_version: &str, cli_version: &str) -> DaemonHealth {
+    if daemon_version == cli_version {
+        DaemonHealth::Healthy
+    } else {
+        DaemonHealth::VersionMismatch {
+            daemon_version: daemon_version.to_string(),
         }
     }
 }
@@ -145,6 +211,14 @@ impl SessionManager {
     /// Check if the daemon is running.
     pub fn is_daemon_alive(&self) -> bool {
         self.alive_pid().is_some()
+    }
+
+    /// Read-only view of the pid file: `(pid, process exists)`. Unlike
+    /// `alive_pid`, never cleans anything up - for `diagnose`, which must
+    /// leave the session directory exactly as it found it.
+    pub fn daemon_status(&self) -> Option<(u32, bool)> {
+        let pid: u32 = std::fs::read_to_string(self.pid_path()).ok()?.trim().parse().ok()?;
+        Some((pid, Self::process_exists(pid)))
     }
 
     /// The daemon's pid if its pid file is valid and the process exists.
@@ -241,27 +315,40 @@ impl SessionManager {
         if let Some(pid) = self.alive_pid() {
             debug!("Daemon already running, connecting...");
             match self.connect_to_daemon().await {
-                Ok(mut client) => {
-                    // Verify daemon is responsive with a ping
-                    if Self::verify_daemon_health(&mut client).await {
-                        return Ok(client);
+                Ok(mut client) => match Self::check_daemon_health(&mut client).await {
+                    DaemonHealth::Healthy => return Ok(client),
+                    DaemonHealth::VersionMismatch { daemon_version } => {
+                        // `connect` is about to build a new RDP session
+                        // anyway, so this is the one place replacing the
+                        // daemon costs nothing extra. Ask it to stop first:
+                        // a graceful shutdown joins its frame processor and
+                        // removes its own files.
+                        warn!(
+                            "Daemon (pid {}) is agent-rdp {}, this CLI is {} - replacing it",
+                            pid,
+                            if daemon_version.is_empty() { "<unversioned>" } else { &daemon_version },
+                            CLI_VERSION
+                        );
+                        self.stop_daemon(client, pid).await;
                     }
-                    warn!(
-                        "Daemon (pid {}) not responsive, killing it and starting a fresh one...",
-                        pid
-                    );
-                    drop(client);
-                    // Deleting its pid/socket files alone left the stuck
-                    // process running - with its RDP session - beside the
-                    // replacement, and the two fought over the remote desktop.
-                    Self::kill_process(pid);
-                    sleep(Duration::from_millis(200)).await;
-                }
+                    DaemonHealth::Unresponsive => {
+                        warn!(
+                            "Daemon (pid {}) not responsive, killing it and starting a fresh one...",
+                            pid
+                        );
+                        drop(client);
+                        // Deleting its pid/socket files alone left the stuck
+                        // process running - with its RDP session - beside the
+                        // replacement, and the two fought over the remote desktop.
+                        Self::kill_process(pid);
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                },
                 Err(e) => {
                     warn!("Failed to connect to daemon: {}", e);
                 }
             }
-            // Daemon exists but not responsive, clean up
+            // Daemon exists but is unusable, clean up
             self.cleanup_stale_session();
         }
 
@@ -281,12 +368,26 @@ impl SessionManager {
     /// daemon, and the command then failed with a misleading `NotConnected`
     /// instead of the daemon_not_running message that points at daemon.log.
     ///
-    /// Three verdicts, because they call for different reactions: no process
+    /// Four verdicts, because they call for different reactions: no process
     /// or a refused socket is `NotRunning` (reconnect); a process that
     /// accepted the socket but did not answer a ping is `Unresponsive` (wait
-    /// and retry). Collapsing the second into the first - as this did - sent
-    /// callers into a reconnect loop every time the daemon was merely busy.
+    /// and retry); one that answered from a different build is
+    /// `VersionMismatch` (run `connect`, which replaces it). Collapsing the
+    /// second into the first - as this once did - sent callers into a
+    /// reconnect loop every time the daemon was merely busy; not checking the
+    /// third let an upgraded CLI keep driving the old daemon indefinitely.
     pub async fn connect_existing(&self) -> Result<IpcClient, DaemonUnavailable> {
+        self.connect_existing_impl(true).await
+    }
+
+    /// Like `connect_existing`, but accepts a daemon from any version. Only
+    /// for commands that stop the daemon (`disconnect`): the user must always
+    /// be able to get rid of a mismatched daemon without host credentials.
+    pub async fn connect_existing_any_version(&self) -> Result<IpcClient, DaemonUnavailable> {
+        self.connect_existing_impl(false).await
+    }
+
+    async fn connect_existing_impl(&self, require_version: bool) -> Result<IpcClient, DaemonUnavailable> {
         let Some(pid) = self.alive_pid() else {
             return Err(DaemonUnavailable::NotRunning(daemon_not_running_message(&self.session)));
         };
@@ -296,25 +397,63 @@ impl SessionManager {
             .await
             .map_err(|_| DaemonUnavailable::NotRunning(daemon_not_running_message(&self.session)))?;
 
-        if !Self::verify_daemon_health(&mut client).await {
-            return Err(DaemonUnavailable::Unresponsive(daemon_unresponsive_message(
-                &self.session,
-                Some(pid),
-            )));
+        match Self::check_daemon_health(&mut client).await {
+            DaemonHealth::Healthy => Ok(client),
+            DaemonHealth::VersionMismatch { daemon_version } => {
+                if require_version {
+                    Err(DaemonUnavailable::VersionMismatch(daemon_version_mismatch_message(
+                        &self.session,
+                        pid,
+                        &daemon_version,
+                    )))
+                } else {
+                    Ok(client)
+                }
+            }
+            DaemonHealth::Unresponsive => Err(DaemonUnavailable::Unresponsive(
+                daemon_unresponsive_message(&self.session, Some(pid)),
+            )),
         }
-
-        Ok(client)
     }
 
-    /// Verify daemon is responsive by sending a ping over the connection that
-    /// will actually be used - not a throwaway second connection, which both
-    /// doubled the per-command connect cost and proved nothing about the
-    /// client being handed back.
-    async fn verify_daemon_health(client: &mut IpcClient) -> bool {
+    /// Ping the daemon over the connection that will actually be used - not
+    /// a throwaway second connection, which both doubled the per-command
+    /// connect cost and proved nothing about the client being handed back -
+    /// and compare the version it reports with this CLI's.
+    async fn check_daemon_health(client: &mut IpcClient) -> DaemonHealth {
         match client.send(&Request::Ping, PING_TIMEOUT_MS).await {
-            Ok(response) => response.success,
-            Err(_) => false,
+            Ok(response) if response.success => {
+                let daemon_version = match response.data {
+                    Some(ResponseData::Pong { version }) => version,
+                    _ => String::new(),
+                };
+                classify_daemon_version(&daemon_version, CLI_VERSION)
+            }
+            _ => DaemonHealth::Unresponsive,
         }
+    }
+
+    /// Stop a daemon we can talk to, then make sure it is gone.
+    ///
+    /// Graceful first (`Shutdown` lets it join its frame processor and remove
+    /// its own files), then wait for the pid to disappear, then kill. The
+    /// kill fallback matters: a daemon wedged mid-shutdown would otherwise
+    /// keep its RDP session open next to the replacement.
+    async fn stop_daemon(&self, mut client: IpcClient, pid: u32) {
+        let _ = client.send(&Request::Shutdown, SHUTDOWN_TIMEOUT_MS).await;
+        drop(client);
+
+        let deadline = std::time::Instant::now() + EXIT_WAIT;
+        while std::time::Instant::now() < deadline {
+            if !Self::process_exists(pid) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        warn!("Daemon (pid {}) did not exit after Shutdown, killing it", pid);
+        Self::kill_process(pid);
+        sleep(Duration::from_millis(200)).await;
     }
 
     /// Start the daemon process.
@@ -451,5 +590,65 @@ impl SessionManager {
         }
 
         sessions
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn same_version_is_healthy() {
+        assert_eq!(classify_daemon_version("0.8.0", "0.8.0"), DaemonHealth::Healthy);
+    }
+
+    #[test]
+    fn older_daemon_is_a_mismatch() {
+        assert_eq!(
+            classify_daemon_version("0.7.6", "0.8.0"),
+            DaemonHealth::VersionMismatch { daemon_version: "0.7.6".into() }
+        );
+    }
+
+    #[test]
+    fn newer_daemon_is_also_a_mismatch() {
+        // A downgraded CLI is just as wrong about what code is running.
+        assert!(matches!(
+            classify_daemon_version("0.9.0", "0.8.0"),
+            DaemonHealth::VersionMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn unversioned_pong_is_a_mismatch() {
+        // A daemon predating the field replies `{"type":"pong"}`, which
+        // deserializes to an empty version - and is by definition older.
+        assert_eq!(
+            classify_daemon_version("", "0.8.0"),
+            DaemonHealth::VersionMismatch { daemon_version: String::new() }
+        );
+    }
+
+    #[test]
+    fn legacy_pong_without_version_deserializes() {
+        let response: agent_rdp_protocol::Response =
+            serde_json::from_str(r#"{"success":true,"data":{"type":"pong"}}"#).unwrap();
+        assert!(matches!(
+            response.data,
+            Some(ResponseData::Pong { ref version }) if version.is_empty()
+        ));
+    }
+
+    #[test]
+    fn mismatch_message_names_both_versions_and_the_fix() {
+        let msg = daemon_version_mismatch_message("default", 42, "0.7.6");
+        assert!(msg.contains("0.7.6"));
+        assert!(msg.contains(CLI_VERSION));
+        assert!(msg.contains("pid 42"));
+        assert!(msg.contains("agent-rdp connect"));
+        assert!(msg.contains("agent-rdp disconnect"));
+
+        let legacy = daemon_version_mismatch_message("default", 42, "");
+        assert!(legacy.contains("predates version reporting"));
     }
 }

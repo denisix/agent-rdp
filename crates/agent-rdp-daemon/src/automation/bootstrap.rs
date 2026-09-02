@@ -321,6 +321,27 @@ mod tests {
             !LIB_ACTIONS.contains("\"$ProgressPreference="),
             "Invoke-Run's prelude must not interpolate $ProgressPreference"
         );
+        // Non-terminating cmdlet errors must fail the child, or `run`
+        // reports exit 0 for a write that never happened.
+        assert!(
+            LIB_ACTIONS.contains("'$ErrorActionPreference=''Stop'';'"),
+            "Invoke-Run's prelude must set $ErrorActionPreference='Stop' in the child"
+        );
+    }
+
+    /// A retried request id must be answered from the journal, not
+    /// executed again - and only when it is the same command.
+    #[test]
+    fn dispatch_replays_journaled_results_by_id() {
+        assert!(LIB_ACTIONS.contains("function Get-JournalEntry"));
+        assert!(LIB_ACTIONS.contains("function Get-RequestFingerprint"));
+        assert!(LIB_ACTIONS.contains("fingerprint = $Fingerprint"));
+        assert!(AGENT_SCRIPT.contains("Replaying journaled result for request"));
+        assert!(AGENT_SCRIPT.contains("idempotency_key_reused"));
+        assert!(
+            AGENT_SCRIPT.contains("-Fingerprint $fingerprint"),
+            "every journaled result must carry the request fingerprint"
+        );
     }
 
     /// `Read-DvcMessage` has to reassemble CHANNEL_PDU_HEADER fragments; the

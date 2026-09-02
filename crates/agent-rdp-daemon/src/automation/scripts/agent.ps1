@@ -21,7 +21,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # Global state
 $script:RefMap = @{}  # ref number -> AutomationElement mapping
 $script:SnapshotId = $null
-$script:Version = "1.3.0"  # DVC fragment reassembly, file-backed run --stream
+$script:Version = "1.4.0"  # idempotent replay by request id, $ErrorActionPreference=Stop in run, log_path in status
 # Local log path on Windows machine (RDPDR not used for logging anymore)
 $script:LocalLogPath = "$env:TEMP\agent-rdp-automation.log"
 $script:DvcHandle = [IntPtr]::Zero
@@ -111,6 +111,33 @@ function Start-Agent {
 
             Write-Log "Processing DVC request: id=$($request.id), command=$($request.command)"
 
+            # Idempotent replay. A request id we have already answered is a
+            # retry whose reply was lost (or a caller reusing its
+            # idempotency key on purpose): hand back the recorded result
+            # instead of executing again. The fingerprint guards against the
+            # other case - a key reused for a *different* command - which is
+            # refused rather than silently answered with a stale result.
+            $fingerprint = Get-RequestFingerprint -Command $request.command -Params $request.params
+            if ($request.command -ne "query_result") {
+                $replay = Get-JournalEntry -Id $request.id
+                if ($null -ne $replay) {
+                    if ($replay.fingerprint -eq $fingerprint) {
+                        Write-Log "Replaying journaled result for request $($request.id) (not re-executed)"
+                        $replayData = $replay.data
+                        if ($replayData -is [hashtable]) { $replayData["replayed"] = $true }
+                        Send-DvcResponse -Handle $script:DvcHandle -Id $request.id -Success $replay.success -Data $replayData -ErrorInfo $replay.error
+                    } else {
+                        Write-Log "Request id $($request.id) reused for a different command; refusing" "WARN"
+                        $reuseError = @{
+                            code = "idempotency_key_reused"
+                            message = "Request id '$($request.id)' was already used for a different command; pick a new idempotency key"
+                        }
+                        Send-DvcResponse -Handle $script:DvcHandle -Id $request.id -Success $false -Data $null -ErrorInfo $reuseError
+                    }
+                    continue
+                }
+            }
+
             $responseData = $null
             $responseError = $null
             $success = $true
@@ -155,7 +182,7 @@ function Start-Agent {
             # `query_result` itself is not journaled - it is a lookup, and
             # recording lookups would evict the results being looked up.
             if ($request.command -ne "query_result") {
-                Add-JournaledResult -Id $request.id -Success $success -Data $responseData -ErrorInfo $responseError
+                Add-JournaledResult -Id $request.id -Success $success -Data $responseData -ErrorInfo $responseError -Fingerprint $fingerprint
             }
 
             # Send response via DVC

@@ -60,6 +60,7 @@ pub async fn handle_restart(
                 agent_pid: state.agent_pid,
                 capabilities: dvc_ipc.map(|ipc| ipc.capabilities()).unwrap_or_default(),
                 version: dvc_ipc.and_then(|ipc| ipc.agent_version()),
+                log_path: None,
                 uptime_secs: dvc_ipc.and_then(|ipc| ipc.agent_uptime_secs()),
                 last_rtt_ms: None,
                 consecutive_failures: 0,
@@ -341,6 +342,7 @@ mod is_read_only_tests {
             timeout_ms,
             shell: None,
             stream: false,
+            idempotency_key: None,
         }
     }
 
@@ -644,12 +646,14 @@ fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
     let stdout = data["stdout"].as_str().map(|s| s.to_string());
     let stderr = data["stderr"].as_str().map(clean_clixml);
     let pid = data["pid"].as_u64().map(|v| v as u32);
+    let replayed = data["replayed"].as_bool().unwrap_or(false);
 
     Ok(RunResult {
         exit_code,
         stdout,
         stderr,
         pid,
+        replayed,
     })
 }
 
@@ -824,6 +828,7 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
     let agent_running = data["agent_running"].as_bool().unwrap_or(false);
     let agent_pid = data["agent_pid"].as_u64().map(|v| v as u32);
     let version = data["version"].as_str().map(|s| s.to_string());
+    let log_path = data["log_path"].as_str().map(|s| s.to_string());
 
     let capabilities = data["capabilities"]
         .as_array()
@@ -839,6 +844,7 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
         agent_pid,
         capabilities,
         version,
+        log_path,
         uptime_secs: None,
         last_rtt_ms: None,
         consecutive_failures: 0,

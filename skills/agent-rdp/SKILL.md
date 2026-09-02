@@ -6,7 +6,9 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.11.
+Tested against agent-rdp 0.7.12. Check with `agent-rdp session info` (shows
+both CLI and daemon versions) — a `daemon_version_mismatch` error means an
+older daemon survived an upgrade; run `connect` again to replace it.
 
 If `agent-rdp` is not on PATH, install it first — expected on a fresh machine,
 needs no confirmation:
@@ -44,6 +46,24 @@ means the agent is still busy: check state first (`automate get "@e2"`), never
 blindly retry, or you double-apply — text typed twice, a button clicked twice.
 Read-only commands (`snapshot`, `get`, `status`, `wait-for`, `window list`) say
 so in the error text; those are always safe to retry.
+
+**Retry a mutating `run` only with the same `--idempotency-key`.** Pick a key
+per logical step (`--idempotency-key step-07`); a retry that reuses it after
+`indeterminate`, an IPC timeout or `daemon_unresponsive` returns the recorded
+result (`replayed: true`) instead of executing again — this is what stops
+`Add-Content` from being applied twice. The journal is per agent process (64
+entries) and empty after `connect`, so after a reconnect verify the side effect
+(`Test-Path`, file length) rather than retrying.
+
+**`run` exit codes are trustworthy; still verify side effects.** The child
+runs with `$ErrorActionPreference='Stop'`, so a failed cmdlet (locked file, bad
+path, access denied) exits non-zero with the error on stderr — "exit 0 but the
+file was never created" is no longer possible for cmdlet errors. Native
+executables keep their own exit codes. For anything that matters, confirm the
+effect (`automate run "Test-Path ..." --wait`) before building on it. Never
+redirect `*>` into a file the script itself writes — the child holds it open
+and the script fails with "being used by another process"; `run --wait`
+captures output without any file.
 
 **Never touch `\\TSCLIENT\...` from `automate run`.** Drive redirection is
 serviced by the same task that carries the automation channel, so reading the
@@ -123,7 +143,20 @@ command; do **not** reconnect, that throws away a working session. The message
 quotes the last lines of daemon.log so you can see what it is doing. Only if it
 stays unresponsive for over a minute does `connect` replace it (killing the
 stuck one first). Cold `connect` with automation can take up to ~2.5 minutes;
-its timeout now covers that.
+its timeout now covers that. A third verdict, `daemon_version_mismatch`, means
+the daemon is from a different agent-rdp version than the CLI (it outlived an
+upgrade): run `connect` again, which replaces it — every other command refuses
+rather than silently driving old code.
+
+**When something fails, run `agent-rdp diagnose` before reporting it.** It
+writes a zip with `daemon.log`, `transcript.jsonl` (every request with outcome
+and timing), the `diagnostics/` failure captures, a current screenshot and the
+remote agent's log; it works even when the daemon is dead. Captures are
+automatic: a `locate` with no match, a refused `click-at`, an `automate` error
+or a waited `run` with non-zero exit each save a screenshot plus a `.json`
+with the request, the error and (for OCR misses) every line OCR did read, into
+`<session>/diagnostics/`. Include the zip in any bug report, together with the
+exact commands that led there.
 
 **OCR coordinates are top-left pixels.** `locate` returns `x/y/width/height`
 with the origin at the top-left of the desktop and `center_x/center_y` as the
@@ -157,9 +190,10 @@ agent-rdp connect --host <ip> --width 1920 --height 1080
 agent-rdp connect --host <ip> -u <user> -p <pass> --drive /local/path:DriveName
 agent-rdp disconnect                       # there is no `session close`
 agent-rdp session list
-agent-rdp session info
+agent-rdp session info                     # includes daemon version vs CLI version
 agent-rdp --session work connect ...       # named session
 agent-rdp --session work screenshot
+agent-rdp diagnose                         # zip of logs, transcript, captures, screenshot
 
 # Screenshot
 agent-rdp screenshot -o desktop.png        # PNG, default ./screenshot.png
@@ -263,6 +297,8 @@ agent-rdp automate run "Get-Process" --wait --process-timeout 5000
 agent-rdp automate run "$PSVersionTable" --wait --shell pwsh.exe   # non-default shell
 agent-rdp automate run "ping -t 127.0.0.1" --stream                # returns pid
 agent-rdp automate run-poll <pid>                                  # drain incrementally
+agent-rdp automate run "Add-Content C:\l.txt x" --wait --idempotency-key step-07
+                                          # same key on retry -> replayed, not re-run
 ```
 
 Snapshots include `disabled` on interactive elements — a free pre-action state

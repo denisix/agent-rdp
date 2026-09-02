@@ -6,12 +6,15 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { IpcClient, getSessionDir, getSocketPath } from './client.js';
 import { RdpError } from './types.js';
 
 const MAX_STARTUP_WAIT_MS = 10000;
 const STARTUP_POLL_INTERVAL_MS = 100;
+const PING_TIMEOUT_MS = 10000;
+const SHUTDOWN_TIMEOUT_MS = 10000;
+const EXIT_WAIT_MS = 5000;
 
 // Create require function for resolving platform package paths in ESM
 const require = createRequire(import.meta.url);
@@ -84,6 +87,24 @@ function findBinary(): string {
 }
 
 /**
+ * Version of the binary this package would spawn (`agent-rdp X.Y.Z` -> `X.Y.Z`),
+ * or null if it cannot be determined.
+ *
+ * Read from the binary rather than package.json: the binary is what the daemon
+ * is compared against, and the two can drift when a platform package is
+ * updated independently.
+ */
+function binaryVersion(binary: string): string | null {
+  try {
+    const out = spawnSync(binary, ['--version'], { encoding: 'utf8', timeout: 5000 });
+    const match = (out.stdout ?? '').trim().match(/(\d+\.\d+\.\d+\S*)\s*$/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Manages the daemon lifecycle for a session.
  */
 export class DaemonManager {
@@ -102,32 +123,105 @@ export class DaemonManager {
    * Check if the daemon is running.
    */
   isRunning(): boolean {
+    return this.runningPid() !== null;
+  }
+
+  /**
+   * The daemon's pid if its pid file is valid and the process exists.
+   */
+  private runningPid(): number | null {
     if (!fs.existsSync(this.pidFile)) {
-      return false;
+      return null;
     }
 
     try {
       const pid = parseInt(fs.readFileSync(this.pidFile, 'utf8').trim(), 10);
       // Check if process exists
       process.kill(pid, 0);
-      return true;
+      return pid;
     } catch {
-      return false;
+      return null;
     }
   }
 
   /**
    * Ensure the daemon is running, spawning it if necessary.
    * Returns an IpcClient connected to the daemon.
+   *
+   * A daemon that is running but was started by a different agent-rdp
+   * version is replaced. The socket and pid paths depend only on the session
+   * name, so after an upgrade a stale daemon would otherwise keep serving the
+   * old code - including the automation scripts it embeds - indefinitely.
    */
   async ensureRunning(): Promise<IpcClient> {
-    if (!this.isRunning()) {
-      await this.spawn();
+    const pid = this.runningPid();
+    if (pid !== null) {
+      const client = new IpcClient(this.session);
+      await client.connect();
+
+      const staleVersion = await this.staleDaemonVersion(client);
+      if (staleVersion === null) {
+        return client;
+      }
+      await this.replaceStaleDaemon(client, pid, staleVersion);
     }
+
+    await this.spawn();
 
     const client = new IpcClient(this.session);
     await client.connect();
     return client;
+  }
+
+  /**
+   * The running daemon's version if it differs from the binary this package
+   * would spawn; null when they match or the comparison is not possible.
+   */
+  private async staleDaemonVersion(client: IpcClient): Promise<string | null> {
+    let expected: string | null;
+    try {
+      expected = binaryVersion(findBinary());
+    } catch {
+      expected = null;
+    }
+    if (expected === null) {
+      return null;
+    }
+
+    const pong = await client.send({ type: 'ping' }, PING_TIMEOUT_MS);
+    const daemonVersion = pong.data?.type === 'pong' ? (pong.data.version ?? '') : '';
+    return daemonVersion === expected ? null : daemonVersion;
+  }
+
+  /**
+   * Stop a version-mismatched daemon: graceful shutdown first, kill if it
+   * does not exit. The daemon removes its own socket/pid files on a clean
+   * exit; after a kill, the next daemon's bind replaces them.
+   */
+  private async replaceStaleDaemon(client: IpcClient, pid: number, staleVersion: string): Promise<void> {
+    process.stderr.write(
+      `agent-rdp: daemon pid ${pid} is version ${staleVersion || '<unversioned>'}, ` +
+        `replacing it with the installed binary\n`,
+    );
+    try {
+      await client.send({ type: 'shutdown' }, SHUTDOWN_TIMEOUT_MS);
+    } catch {
+      // Falls through to the wait/kill below.
+    }
+    await client.close();
+
+    const start = Date.now();
+    while (Date.now() - start < EXIT_WAIT_MS && this.isRunning()) {
+      await sleep(100);
+    }
+    if (this.isRunning()) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // Already gone.
+      }
+      await sleep(200);
+    }
   }
 
   /**

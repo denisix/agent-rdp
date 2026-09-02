@@ -225,6 +225,7 @@ mod codegen {
                     timeout_ms: 10000,
                     shell: None,
                     stream: false,
+                    idempotency_key: None,
                 },
             ),
             (
@@ -237,6 +238,7 @@ mod codegen {
                     timeout_ms: 5000,
                     shell: Some("pwsh.exe".to_string()),
                     stream: false,
+                    idempotency_key: None,
                 },
             ),
             (

@@ -113,6 +113,29 @@ fn automate_timeout_ms(request: &Request, base_timeout_ms: u64) -> u64 {
 /// Split out from `run` so the mapping can be checked without a daemon - the
 /// `focused` shorthand in particular encodes decisions that are easy to regress.
 /// `Err` carries a message for the user; nothing here talks to the daemon.
+/// The key becomes the DVC request id verbatim, so it has to be short and
+/// plain: it travels inside JSON, lands in log lines and file names, and a
+/// stray quote or newline would break framing before it ever reached the
+/// agent.
+fn validate_idempotency_key(key: &str) -> Result<(), String> {
+    if key.is_empty() || key.len() > 64 {
+        return Err(format!(
+            "--idempotency-key must be 1-64 characters (got {})",
+            key.len()
+        ));
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+    {
+        return Err(
+            "--idempotency-key may only contain ASCII letters, digits, '.', '_', ':' and '-'"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn build_request(action: AutomateAction) -> Result<AutomateRequest, String> {
     Ok(match action {
         AutomateAction::Snapshot {
@@ -208,15 +231,22 @@ fn build_request(action: AutomateAction) -> Result<AutomateRequest, String> {
             process_timeout,
             shell,
             stream,
-        } => AutomateRequest::Run {
-            command,
-            args: cmd_args,
-            wait,
-            hidden,
-            timeout_ms: process_timeout.unwrap_or(10000),
-            shell,
-            stream,
-        },
+            idempotency_key,
+        } => {
+            if let Some(ref key) = idempotency_key {
+                validate_idempotency_key(key)?;
+            }
+            AutomateRequest::Run {
+                command,
+                args: cmd_args,
+                wait,
+                hidden,
+                timeout_ms: process_timeout.unwrap_or(10000),
+                shell,
+                stream,
+                idempotency_key,
+            }
+        }
 
         AutomateAction::RunPoll { pid } => AutomateRequest::RunPoll { pid },
 
@@ -287,6 +317,27 @@ fn describe_focused(element: &AccessibilityElement) -> String {
     }
 
     line
+}
+
+#[cfg(test)]
+mod idempotency_key_tests {
+    use super::validate_idempotency_key;
+
+    #[test]
+    fn accepts_plain_keys() {
+        for key in ["k1", "chunk-07", "job:42.retry_1", "a".repeat(64).as_str()] {
+            assert!(validate_idempotency_key(key).is_ok(), "{key}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_long_and_unsafe_keys() {
+        assert!(validate_idempotency_key("").is_err());
+        assert!(validate_idempotency_key(&"a".repeat(65)).is_err());
+        for key in ["bad key", "quote\"", "new\nline", "slash/", "ünïcode"] {
+            assert!(validate_idempotency_key(key).is_err(), "{key:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -496,6 +547,7 @@ mod tests {
             timeout_ms: 240_000,
             shell: None,
             stream: false,
+            idempotency_key: None,
         });
         // Otherwise the CLI would abandon a 4-minute command at 30s.
         assert_eq!(automate_timeout_ms(&request, 30_000), 270_000);
@@ -525,6 +577,7 @@ mod tests {
             timeout_ms: 240_000,
             shell: None,
             stream: true,
+            idempotency_key: None,
         });
         assert_eq!(automate_timeout_ms(&detached, 30_000), 30_000);
     }

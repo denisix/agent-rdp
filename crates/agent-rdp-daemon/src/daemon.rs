@@ -346,10 +346,13 @@ impl Daemon {
     async fn shutdown(&mut self) -> anyhow::Result<()> {
         info!("Shutting down daemon...");
 
-        // Disconnect RDP session if connected
+        // Disconnect RDP session if connected. A shorter join than the
+        // default: the CLI that sent `Shutdown` is waiting on this with its
+        // own budget (10s for a version-mismatch replacement), and a
+        // processor that has not stopped in 2s is not going to.
         let mut session = self.rdp_session.lock().await;
         if let Some(rdp) = session.take() {
-            if let Err(e) = rdp.disconnect().await {
+            if let Err(e) = rdp.disconnect_with_join(std::time::Duration::from_secs(2)).await {
                 warn!("Error during RDP disconnect: {}", e);
             }
         }
@@ -408,8 +411,9 @@ async fn handle_client(
 
         let is_shutdown = matches!(request, Request::Shutdown);
 
+        let started = Instant::now();
         let response = process_request(
-            request,
+            request.clone(),
             &rdp_session,
             &automation_state,
             &ws_handle,
@@ -419,6 +423,13 @@ async fn handle_client(
             &clipboard_changed_rx,
             &session_generation,
         ).await;
+
+        // Evidence for the next bug report: what was asked, what came back,
+        // and - when the failure is the kind a screenshot explains - the
+        // screen at that moment. Both return immediately (the work is
+        // spawned); neither touches the main accept loop.
+        crate::transcript::record(&session_name, &request, &response, started.elapsed());
+        crate::diagnostics::maybe_capture(&session_name, &rdp_session, &request, &response);
 
         // `to_vec` + push instead of `to_string + "\n"`: appending to a String
         // that just reached exactly its capacity re-allocates and copies the
@@ -452,7 +463,9 @@ async fn process_request(
     session_generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Response {
     match request {
-        Request::Ping => Response::success(ResponseData::Pong),
+        Request::Ping => Response::success(ResponseData::Pong {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
 
         Request::SessionInfo => {
             let session = rdp_session.lock().await;
@@ -475,6 +488,7 @@ async fn process_request(
                 width,
                 height,
                 pid: std::process::id(),
+                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 uptime_secs: start_time.elapsed().as_secs(),
                 last_frame_age_ms,
             }))

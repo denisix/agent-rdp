@@ -96,7 +96,7 @@ Messages are JSON documents, one per DVC message (framing as above).
 ```json
 {
   "type": "handshake",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "agent_pid": 12345,
   "capabilities": ["snapshot", "click", "select", "toggle", ...]
 }
@@ -260,12 +260,12 @@ Commands use native Windows UI Automation patterns for reliable interaction:
 
 | Command | Purpose |
 |---------|---------|
-| `run` / `run_poll` | Launch a process; wait, or stream its output incrementally. Streamed output is captured to files under `%TEMP%\agent-rdp-run` and read back by offset, so nothing is lost if the process exits between polls; finished entries stay pollable for 10 minutes. Child stderr arrives CLIXML-serialized (PowerShell's behavior on a redirected stderr); the daemon reduces it to the text of error/warning records and drops progress noise |
+| `run` / `run_poll` | Launch a process; wait, or stream its output incrementally. The child's prelude sets `$ErrorActionPreference='Stop'`, `$ProgressPreference='SilentlyContinue'` and UTF-8 console output, so non-terminating cmdlet errors exit 1 instead of 0. Streamed output is captured to files under `%TEMP%\agent-rdp-run` and read back by offset, so nothing is lost if the process exits between polls; finished entries stay pollable for 10 minutes. Child stderr arrives CLIXML-serialized (PowerShell's behavior on a redirected stderr); the daemon reduces it to the text of error/warning records and drops progress noise. A `run` carrying `idempotency_key` uses it as the request id (see Indeterminate Results) |
 | `file_write_chunk` | Append one base64 chunk to a remote file; verifies SHA-256 on the last chunk |
 | `file_read_chunk` | Read a byte range of a remote file as base64 |
 | `file_stat` | Existence, size and SHA-256 of a remote path |
 | `query_result` | Look up the recorded outcome of an earlier request by id |
-| `status` | Agent pid, version, capabilities |
+| `status` | Agent pid, version, capabilities, `log_path` (the agent's own log, pulled by `agent-rdp diagnose`) |
 
 File transfer is byte-oriented on both sides (`[IO.File]` plus base64 on the
 wire): text-mode I/O would re-encode the payload through the console codepage
@@ -299,6 +299,16 @@ Because the agent's loop is strictly serial, a `query_result` sent while the
 original command is still executing queues behind it and is answered once the
 agent frees up.
 
+The same journal makes retries idempotent. Before dispatching any request the
+agent checks whether it has already answered that id: if so, and the request's
+fingerprint (SHA-256 of command + params) matches the recorded one, it replays
+the journaled result — with `replayed: true` added to the data — instead of
+executing again; a matching id with a different fingerprint is refused with
+`idempotency_key_reused`. The daemon's own ids are random, so this only fires
+for a caller-supplied `idempotency_key` on `run` (which becomes the request id
+verbatim; the daemon rejects a key that is still in flight). The journal lives
+in the agent process, so it is empty after a reconnect.
+
 ### Error Codes
 
 | Code | Description |
@@ -306,6 +316,7 @@ agent frees up.
 | `element_not_found` | Selector didn't match any element |
 | `stale_ref` | @ref number not in current snapshot |
 | `command_failed` | UI Automation operation failed |
+| `idempotency_key_reused` | Request id already journaled for a different command; not executed |
 | `timeout` | Operation exceeded timeout |
 | `channel_closed` | DVC channel was closed |
 | `unknown` | Unspecified error |

@@ -157,7 +157,20 @@ pub enum ResponseData {
     },
 
     /// Pong response for ping.
-    Pong,
+    Pong {
+        /// Version of the daemon binary (`CARGO_PKG_VERSION`).
+        ///
+        /// The daemon persists across CLI upgrades: the socket and pid paths
+        /// are derived from the session name alone, so a freshly installed
+        /// CLI happily reuses a daemon started by the previous version - and
+        /// that daemon keeps serving old code, including the automation
+        /// scripts it embeds, until someone kills it. The CLI compares this
+        /// against its own version to detect that. Defaulted so a reply from
+        /// a daemon predating the field still parses (as an empty string,
+        /// which the CLI treats as "older").
+        #[serde(default)]
+        version: String,
+    },
 
     /// Accessibility tree snapshot.
     Snapshot(AccessibilitySnapshot),
@@ -236,6 +249,11 @@ pub struct SessionInfo {
 
     /// Daemon process ID.
     pub pid: u32,
+
+    /// Version of the daemon binary (`CARGO_PKG_VERSION`). Empty when the
+    /// daemon predates this field. See `ResponseData::Pong`.
+    #[serde(default)]
+    pub daemon_version: String,
 
     /// Time since daemon started (seconds).
     #[ts(type = "number")]
@@ -411,6 +429,14 @@ pub enum ErrorCode {
     /// down costs a full reconnect.
     #[error("daemon unresponsive")]
     DaemonUnresponsive,
+
+    /// The running daemon was started by a different version of agent-rdp
+    /// than the CLI issuing the command - typically an upgrade while the
+    /// daemon kept running. Only `connect` replaces it; every other command
+    /// refuses, because silently talking to the old daemon is exactly how
+    /// "the fix didn't change anything" reports happen.
+    #[error("daemon version mismatch")]
+    DaemonVersionMismatch,
 
     /// Clipboard operation failed.
     #[error("clipboard error")]

@@ -107,7 +107,20 @@ drives: Array<MappedDrive>, } | { "type": "session_list",
 /**
  * Active sessions.
  */
-sessions: Array<SessionSummary>, } | { "type": "pong" } | { "type": "snapshot" } & AccessibilitySnapshot | { "type": "element" } & ElementValue | { "type": "window_list", 
+sessions: Array<SessionSummary>, } | { "type": "pong", 
+/**
+ * Version of the daemon binary (`CARGO_PKG_VERSION`).
+ *
+ * The daemon persists across CLI upgrades: the socket and pid paths
+ * are derived from the session name alone, so a freshly installed
+ * CLI happily reuses a daemon started by the previous version - and
+ * that daemon keeps serving old code, including the automation
+ * scripts it embeds, until someone kills it. The CLI compares this
+ * against its own version to detect that. Defaulted so a reply from
+ * a daemon predating the field still parses (as an empty string,
+ * which the CLI treats as "older").
+ */
+version: string, } | { "type": "snapshot" } & AccessibilitySnapshot | { "type": "element" } & ElementValue | { "type": "window_list", 
 /**
  * List of windows.
  */
