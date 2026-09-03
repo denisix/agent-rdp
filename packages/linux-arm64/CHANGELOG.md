@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.14](https://github.com/denisix/agent-rdp/compare/linux-arm64-v0.7.13...linux-arm64-v0.7.14) (2026-09-03)
+
+
+### Miscellaneous Chores
+
+* **linux-arm64:** Synchronize agent-rdp packages versions
+
 ## [0.7.13](https://github.com/denisix/agent-rdp/compare/linux-arm64-v0.7.12...linux-arm64-v0.7.13) (2026-09-02)
 
 
