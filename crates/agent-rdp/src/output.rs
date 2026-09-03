@@ -152,6 +152,12 @@ impl Output {
                 if let Some(age_ms) = info.last_frame_age_ms {
                     println!("Last frame from server: {}s ago", age_ms / 1000);
                 }
+                if let Some(drop) = &info.last_disconnect {
+                    println!(
+                        "Last transport drop: {} ({}s ago): {} - the daemon stayed up; `connect` re-establishes the session",
+                        drop.at, drop.seconds_ago, drop.reason
+                    );
+                }
             }
             ResponseData::DriveList { drives } => {
                 if drives.is_empty() {
@@ -250,6 +256,14 @@ impl Output {
                 if result.replayed {
                     eprintln!("(replayed from the agent's journal - the command was not run again)");
                 }
+                if let Some(started) = result.started_unix {
+                    eprintln!(
+                        "Started: {} (remote clock)",
+                        agent_rdp_daemon::timefmt::utc_rfc3339(
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(started)
+                        )
+                    );
+                }
                 if let Some(code) = result.exit_code {
                     eprintln!("Exit code: {}", code);
                 }
@@ -328,6 +342,24 @@ impl Output {
                 println!("SHA-256: {}", result.sha256);
                 if let (Some(modified), Some(age)) = (&result.modified, result.age_secs) {
                     println!("Modified: {} ({}s ago by the remote clock)", modified, age);
+                }
+            }
+            ResponseData::FileStat(stat) => {
+                if !stat.exists {
+                    println!("{}: does not exist", stat.path);
+                } else if stat.is_directory {
+                    println!("{}: directory", stat.path);
+                } else {
+                    println!("{}: file", stat.path);
+                    if let Some(size) = stat.size {
+                        println!("Size: {} bytes", size);
+                    }
+                    if let Some(sha) = &stat.sha256 {
+                        println!("SHA-256: {}", sha);
+                    }
+                    if let (Some(modified), Some(age)) = (&stat.modified, stat.age_secs) {
+                        println!("Modified: {} ({}s ago by the remote clock)", modified, age);
+                    }
                 }
             }
             ResponseData::ClickResult(result) => {

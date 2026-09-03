@@ -1,6 +1,6 @@
 //! File transfer command implementation.
 
-use agent_rdp_protocol::{FilePullRequest, FilePushRequest, Request};
+use agent_rdp_protocol::{FilePullRequest, FilePushRequest, FileStatRequest, Request};
 
 use crate::cli::{FileAction, FileArgs};
 use crate::output::Output;
@@ -40,11 +40,17 @@ pub async fn run(
             local_path: local,
             max_age_secs: max_age,
         }),
+        FileAction::Stat { remote } => Request::FileStat(FileStatRequest { remote_path: remote }),
     };
 
-    let response = client
-        .send(&request, timeout_ms.saturating_add(TRANSFER_TIMEOUT_MS))
-        .await?;
+    // `stat` is one round trip (read-only, so retried once if the daemon
+    // drops the connection); transfers get the long budget.
+    let budget = if matches!(request, Request::FileStat(_)) {
+        timeout_ms
+    } else {
+        timeout_ms.saturating_add(TRANSFER_TIMEOUT_MS)
+    };
+    let response = manager.send_with_retry(&mut client, &request, budget).await?;
 
     output.print_response(&response);
 

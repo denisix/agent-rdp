@@ -27,7 +27,7 @@ pub async fn run(
     };
 
     let request = Request::Drive(drive_request);
-    let response = client.send(&request, timeout_ms).await?;
+    let response = manager.send_with_retry(&mut client, &request, timeout_ms).await?;
     output.print_response(&response);
 
     if !response.success {

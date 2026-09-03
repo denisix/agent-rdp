@@ -96,7 +96,7 @@ Messages are JSON documents, one per DVC message (framing as above).
 ```json
 {
   "type": "handshake",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "agent_pid": 12345,
   "capabilities": ["snapshot", "click", "select", "toggle", ...]
 }
@@ -178,8 +178,14 @@ When `--enable-win-automation` is specified:
 10. Wait 2000ms for the Run dialog to appear and grab focus (a foreground app such as a maximized browser or game can otherwise steal keystrokes typed too early)
 11. Paste the launch command into the Run dialog via Ctrl+V, instead of typing it character-by-character
 12. Press Enter
-13. Wait for DVC handshake message
-14. Return success or timeout error
+13. Wait for the DVC handshake, polling the shared DVC state without holding
+    the automation lock. The window grows per attempt — 25s, 45s, 75s — and
+    is extended once when the agent is visibly still starting (channel open
+    without a handshake, or a `.ps1` read off the mapped drive in the last
+    30s). Attempt 2+ skips Win+R if the previous launch is still starting.
+14. Return success or timeout error. Worst case ≈ 5 minutes
+    (`launch_and_wait_worst_case()`), which the CLI's `connect` and
+    `automate restart` budgets are tested to exceed.
 
 **Note**: RDPDR drive mapping is still used for bootstrapping (launching the agent), but all subsequent IPC uses DVC.
 
@@ -263,7 +269,7 @@ Commands use native Windows UI Automation patterns for reliable interaction:
 | `run` / `run_poll` | Launch a process; wait, or stream its output incrementally. The child script is assembled by `New-ChildScript`: a prelude (UTF-8 console output without BOM, guarded so a console-less child cannot die on it; `$ProgressPreference='SilentlyContinue'`; `$ErrorActionPreference='Stop'`; `$env:AGENT_RDP_AGENT_PID`), then the user script inside `try { … } catch { … }` whose catch prints the exception chain as plain text to stderr and exits 1, with `$LASTEXITCODE` preserved for native commands. Scripts with a `param` block or `using` statements (detected with the PowerShell parser) get the prelude only. `wait` takes precedence over `stream`. A detached launch reports `early_exit`/`exit_code` if the child is gone ~250ms after start. Streamed output is captured to files under `%TEMP%\agent-rdp-run` and read back by offset (a read failure is reported in-band and retried next poll); finished entries stay pollable for 10 minutes. Remaining CLIXML on stderr (parse errors, unwrapped scripts) is reduced by the daemon to the text of error/warning records, including `<Obj>` records' `ToString`. A `run` carrying `idempotency_key` uses it as the request id (see Indeterminate Results) |
 | `file_write_chunk` | Append one base64 chunk to a remote file; verifies SHA-256 on the last chunk |
 | `file_read_chunk` | Read a byte range of a remote file as base64 |
-| `file_stat` | Existence, size, SHA-256, `modified_unix` (last write, UTC) and `now_unix` (the remote clock) of a remote path — the daemon derives the file's age from the two without assuming the hosts' clocks agree |
+| `file_stat` | Existence, size, SHA-256, `modified_unix` (last write, UTC) and `now_unix` (the remote clock) of a remote path — the daemon derives the file's age from the two without assuming the hosts' clocks agree. Exposed as `agent-rdp file stat` |
 | `query_result` | Look up the recorded outcome of an earlier request by id |
 | `status` | Agent pid, version, capabilities, `log_path` (the agent's own log, pulled by `agent-rdp diagnose`) |
 
@@ -285,6 +291,34 @@ own budget get that budget plus the default instead — `run --wait` and
 `wait-for` would otherwise be cut off while the agent was still working. After
 3 consecutive failures the channel is treated as dead and the error suggests
 reconnecting.
+
+### Transient vs Fatal Transport Errors (Agent)
+
+`Read-DvcMessage` treats only a fixed set of Win32 errors as the channel
+being gone — 6 `ERROR_INVALID_HANDLE`, 109 `ERROR_BROKEN_PIPE`, 232
+`ERROR_NO_DATA`, 233 `ERROR_PIPE_NOT_CONNECTED`, 1167
+`ERROR_DEVICE_NOT_CONNECTED` — and reports them with a `DVC_FATAL:` message
+prefix, which is the only thing the main loop exits on. Every other read
+failure (a CPU-starved host produces `ERROR_OPERATION_ABORTED`,
+`ERROR_NO_SYSTEM_RESOURCES`, short and zero-byte reads) is logged, the
+partial message is dropped, the loop pauses 200ms and reads again; more than
+20 in a row is treated as fatal. A fragment without `CHANNEL_FLAG_FIRST`
+arriving while nothing is accumulated is the tail of a dropped message and is
+skipped, so the reader resynchronises instead of failing the next JSON parse.
+Write failures are always fatal (`DVC_FATAL:` too): a reply that cannot be
+sent is a reply the daemon times out on anyway.
+
+### Relaunch Supervisor (Daemon)
+
+The DVC processor's `close()` callback notifies a per-session supervisor
+task (spawned by `connect`, bound to that session's generation and DVC
+state). If the RDP session is still alive and automation is enabled, it
+waits 5s and relaunches the agent through the same path as `automate
+restart`, at most 3 times per 10 minutes; the two are serialized by
+`relaunch_in_flight`. IronRDP also fires `close()` on an ordinary
+disconnect, which is why the supervisor is scoped to one session and exits
+when `cleanup()` drops the DVC state. `automate status` reports
+`relaunches`.
 
 ### Indeterminate Results
 
@@ -329,10 +363,13 @@ The daemon removes the entire automation directory on disconnect or shutdown.
 
 ### On Channel Close (Agent)
 
-When the DVC channel closes or errors, the PS agent:
+When the DVC channel is gone (a `DVC_FATAL:` error), the PS agent:
 1. Logs error details
 2. Closes file handle and WTS handle
 3. Exits gracefully
+
+The daemon then relaunches it if the RDP session is still alive (see
+Relaunch Supervisor above).
 
 ## Key Implementation Files
 

@@ -256,6 +256,8 @@ export class DaemonManager {
       env: {
         ...process.env,
         AGENT_RDP_MODELS_DIR: process.env.AGENT_RDP_MODELS_DIR ?? findModelsDir(),
+        // A daemon panic without a backtrace is a one-line mystery in daemon.log.
+        RUST_BACKTRACE: process.env.RUST_BACKTRACE ?? '1',
       },
     });
 

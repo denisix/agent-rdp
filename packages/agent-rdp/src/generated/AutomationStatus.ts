@@ -26,6 +26,13 @@ version?: string,
  */
 log_path?: string, 
 /**
+ * How many times the daemon relaunched the agent on its own since this
+ * session connected (the DVC channel closed while the RDP session was
+ * alive). Non-zero means the agent process is dying under you - look at
+ * the remote log via `agent-rdp diagnose`.
+ */
+relaunches: number, 
+/**
  * Seconds since the current agent's DVC handshake completed. Distinct
  * from `agent_running`: an agent can be "running" per the PS-reported
  * fields yet the daemon-side DVC channel could have gone stale without

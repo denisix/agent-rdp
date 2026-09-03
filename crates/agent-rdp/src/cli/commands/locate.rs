@@ -125,7 +125,7 @@ pub async fn run(
     // still legitimately waiting.
     let locate_timeout_ms = args.wait.map_or(timeout_ms, |wait_ms| wait_ms + timeout_ms);
 
-    let response = client.send(&request, locate_timeout_ms).await?;
+    let response = manager.send_with_retry(&mut client, &request, locate_timeout_ms).await?;
 
     if !response.success {
         output.print_response(&response);

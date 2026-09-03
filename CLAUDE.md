@@ -54,6 +54,25 @@ IPC request, `transcript.rs`), and `diagnostics/` (screenshot + context pairs
 saved on failures, `diagnostics.rs`). `agent-rdp diagnose` zips all of it;
 `cleanup_session` must never delete these (`EVIDENCE_ENTRIES`).
 
+**`connect` is not destructive by default.** A daemon that misses a ping is
+re-pinged and then *refused* (`daemon_unresponsive`), never killed - it used
+to be SIGKILLed after one missed ping, and callers who used `connect` as a
+retry reflex killed daemons that were busy serving another command (the
+other command then saw the connection drop mid-request). Only
+`connect --replace` stops a daemon, gracefully first; a version-mismatched
+daemon is the one exception (always replaced). Every kill is recorded in
+`transcript.jsonl`.
+
+**Automation self-heal.** The DVC `close()` callback notifies a per-session
+supervisor (spawned by `connect` from `AutomationState::closed_rx`,
+scoped by `session_generation`, ended when `cleanup()` drops the DVC state)
+that relaunches the agent while the RDP session is alive - bounded to 3 per
+10 minutes, serialized with `automate restart` through `relaunch_in_flight`.
+IronRDP fires `close()` on ordinary disconnects too, which is why the
+supervisor is per session and generation-checked. `launch_and_wait` never
+holds `automation_state` across a handshake wait. The PS agent exits only on
+`DVC_FATAL:`-prefixed errors; every other read error is transient.
+
 **Version contract.** The daemon reports `CARGO_PKG_VERSION` in `Pong` and
 `SessionInfo`; the CLI (`session_manager.rs`) and the TS SDK (`daemon.ts`)
 compare it with their own. Socket/pid paths depend only on the session name,
@@ -127,7 +146,13 @@ shortest silently decides the real limit:
 4. the remote command's own budget (`--process-timeout`, `wait-for --timeout`)
 
 A CLI-side loop (`run-poll --follow`) extends only layer 3 by its own budget;
-each iteration keeps the ordinary per-request layers.
+each iteration keeps the ordinary per-request layers. The automation
+bootstrap's worst case (`launch_and_wait_worst_case()`: three launches with
+handshake windows of 25/45/75s, each extendable once while the agent is
+visibly still starting) is asserted against `DEFAULT_CONNECT_TIMEOUT_MS` and
+`RESTART_MIN_TIMEOUT_MS` by a unit test - change one, change all. The CLI
+retries a request once after a dropped connection **only** if
+`Request::is_read_only()` (protocol crate) says so.
 
 Adding a command that can legitimately run long means extending 1–3 to cover 4.
 

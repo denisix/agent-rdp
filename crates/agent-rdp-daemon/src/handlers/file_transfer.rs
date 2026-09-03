@@ -374,6 +374,48 @@ pub async fn handle_pull(
     }))
 }
 
+/// Inspect a remote path without transferring it.
+pub async fn handle_stat(
+    rdp_session: &Arc<Mutex<Option<RdpSession>>>,
+    automation_state: &SharedAutomationState,
+    params: agent_rdp_protocol::FileStatRequest,
+) -> Response {
+    let ipc = match ready_ipc(rdp_session, automation_state).await {
+        Ok(ipc) => ipc,
+        Err(response) => return response,
+    };
+
+    let stat = match ipc
+        .send_request_with_timeout(
+            &AutomateRequest::FileStat { path: params.remote_path.clone() },
+            VERIFY_TIMEOUT,
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(e) => {
+            return Response::error(
+                ErrorCode::AutomationError,
+                format!("Cannot stat '{}': {}", params.remote_path, e),
+            )
+        }
+    };
+
+    let exists = stat["exists"].as_bool().unwrap_or(false);
+    let is_directory = stat["is_directory"].as_bool().unwrap_or(false);
+    let freshness = file_freshness(&stat);
+    Response::success(ResponseData::FileStat(agent_rdp_protocol::FileStatResult {
+        path: params.remote_path,
+        exists,
+        is_directory,
+        size: if exists && !is_directory { stat["size"].as_u64() } else { None },
+        sha256: stat["sha256"].as_str().map(str::to_string),
+        modified: freshness.as_ref().map(|f| f.modified.clone()),
+        modified_unix: freshness.as_ref().map(|f| f.modified_unix),
+        age_secs: freshness.as_ref().map(|f| f.age_secs),
+    }))
+}
+
 /// What `file_stat` says about when the file was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Freshness {

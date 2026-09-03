@@ -104,6 +104,11 @@ agent-rdp connect --host 192.168.1.100
 # stdin (most secure)
 echo 'secret' | agent-rdp connect --host 192.168.1.100 -u Administrator --password-stdin
 
+# Only when the session's daemon has stayed unresponsive for over a minute:
+# stop it (gracefully, then by force) and start a fresh one. Plain `connect`
+# refuses an unresponsive daemon rather than killing one that is merely busy.
+agent-rdp connect --replace --host 192.168.1.100
+
 agent-rdp disconnect
 ```
 
@@ -213,6 +218,7 @@ corrupted transfer fails loudly instead of leaving a plausible-looking file.
 agent-rdp file push ./report.xlsx "C:\\Users\\Admin\\report.xlsx"
 agent-rdp file pull "C:\\Users\\Admin\\export.csv" ./export.csv
 agent-rdp file pull "C:\\out\\result.json" ./result.json --max-age 120   # stale_file if older
+agent-rdp file stat "C:\\scripts\\job.ps1"    # exists, size, SHA-256, modified/age - no transfer
 ```
 
 Transfers are byte-exact, which also makes this the reliable way to place a
@@ -399,8 +405,22 @@ process exists — reconnect, and `<session>/daemon.log` says why it exited. The
 second means the process is alive but did not answer a health check within
 10s: it is busy (a long `run --wait`, a file transfer). Wait and retry; do not
 reconnect, that discards a working session. The message includes the tail of
-daemon.log. `connect` replaces a daemon that stays unresponsive, killing the
-stuck one first.
+daemon.log. Plain `connect` also refuses an unresponsive daemon (after
+re-pinging it for ~30s) — it never kills one that may just be busy serving
+another command; `connect --replace` is the explicit way to stop it and start
+afresh, recorded in the transcript. A `not_connected` after the RDP transport
+dropped says so ("The RDP transport dropped Ns ago (<reason>); the daemon
+itself is alive"), and `session info` shows the last drop — that is a
+`connect`, not a daemon restart. Read-only requests that lose their connection
+mid-flight are retried once automatically; mutating ones never are.
+
+**The automation agent heals itself.** If its DVC channel closes while the
+RDP session is alive, the daemon relaunches it (at most 3 times per 10
+minutes; `automate status` reports `relaunches`), and the agent no longer
+exits on the transient read errors a CPU-starved host produces. Cold
+`connect --enable-win-automation` on such a host is given up to ~5 minutes:
+three launch attempts with handshake windows of 25/45/75s, each extended when
+the agent is visibly still starting.
 
 **`daemon_version_mismatch`** means the daemon was started by a different
 agent-rdp version than the CLI — it kept running across an upgrade, and is

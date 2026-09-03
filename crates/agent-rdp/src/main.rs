@@ -62,6 +62,29 @@ async fn async_main(is_daemon: bool) {
         .with_target(false)
         .init();
 
+    // A panic in a spawned task does not end the daemon, but it does end
+    // whatever that task was doing - a client connection, a capture, a
+    // supervisor. Log it in daemon.log's own format (timestamped, marked) in
+    // addition to the default hook, so a report that says "the command just
+    // returned EOF" can be matched to the moment something went wrong.
+    if is_daemon {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "unknown location".to_string());
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            error!("DAEMON PANIC at {}: {}", location, message);
+            default_hook(info);
+        }));
+    }
+
     let cli = Cli::parse();
     let json = cli.json;
     let session = cli.session.clone();
@@ -142,6 +165,7 @@ fn command_label(cli: &Cli) -> String {
         Commands::File(args) => match args.action {
             cli::FileAction::Push { .. } => "file push".into(),
             cli::FileAction::Pull { .. } => "file pull".into(),
+            cli::FileAction::Stat { .. } => "file stat".into(),
         },
         Commands::Automate(args) => {
             let action = match &args.action {
@@ -211,7 +235,7 @@ fn watchdog_budget_ms(cli: &Cli) -> Option<u64> {
             // Relaunching the agent retries the Win+R/handshake sequence up
             // to three times; the command's own IPC timeout is raised to
             // match, so the watchdog has to clear that too.
-            cli::AutomateAction::Restart => 120_000,
+            cli::AutomateAction::Restart => cli::commands::automate::RESTART_MIN_TIMEOUT_MS,
             _ => 0,
         },
         // A transfer is many chunked round trips plus a hash of the whole
@@ -256,6 +280,25 @@ mod watchdog_tests {
         assert!(watchdog_budget_ms(&parse(&["automate", "run", "session", "daemon"])).is_some());
     }
 
+    /// The bootstrap's worst case (three launches with growing, once-
+    /// extendable handshake windows) must fit inside both budgets that wait
+    /// on it, or the shortest one silently decides the real limit.
+    #[test]
+    fn connect_and_restart_budgets_cover_the_bootstrap_worst_case() {
+        let worst_ms = agent_rdp_daemon::automation::launch_and_wait_worst_case().as_millis() as u64;
+        assert!(
+            DEFAULT_CONNECT_TIMEOUT_MS > worst_ms + 10_000,
+            "connect budget {}ms does not clear the {}ms bootstrap worst case",
+            DEFAULT_CONNECT_TIMEOUT_MS,
+            worst_ms
+        );
+        assert!(
+            cli::commands::automate::RESTART_MIN_TIMEOUT_MS > worst_ms + 10_000,
+            "restart budget does not clear the {}ms bootstrap worst case",
+            worst_ms
+        );
+    }
+
     #[test]
     fn follow_extends_the_watchdog_only() {
         let budget = watchdog_budget_ms(&parse(&[
@@ -278,8 +321,11 @@ mod watchdog_tests {
 /// waits plus a backing-off handshake wait of up to ~25s, so its worst case
 /// is ~91s before any network latency. The previous 90s default sat exactly
 /// on that line and cold starts timed out with the daemon still legitimately
-/// working. 150s clears it with room for the RDP handshake itself.
-const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 150_000;
+/// working. Since then the handshake windows grew (25/45/75s, each extendable
+/// once on a host that is visibly still starting PowerShell), so the bootstrap
+/// worst case is `launch_and_wait_worst_case()` ≈ 305s; this clears it with
+/// room for the RDP handshake itself. A unit test keeps the two in step.
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 330_000;
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     use output::Output;

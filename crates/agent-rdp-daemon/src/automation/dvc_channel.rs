@@ -92,6 +92,10 @@ pub struct DvcSharedState {
     pub channel_id: Option<u32>,
     /// Sender to send DVC data through the RDP session.
     pub command_tx: Option<DvcCommandSender>,
+    /// Fired from `close()` so the session's relaunch supervisor learns that
+    /// the agent process ended while the RDP session may still be alive.
+    /// Dropped with the state at cleanup, which ends the supervisor.
+    pub closed_notify: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl Default for DvcSharedState {
@@ -102,7 +106,16 @@ impl Default for DvcSharedState {
             handshake_at: None,
             channel_id: None,
             command_tx: None,
+            closed_notify: None,
         }
+    }
+}
+
+impl DvcSharedState {
+    /// The agent has opened the channel but not completed its handshake -
+    /// it is starting up. A relaunch now would produce two agents.
+    pub fn is_launching(&self) -> bool {
+        self.channel_id.is_some() && self.handshake.is_none()
     }
 }
 
@@ -296,6 +309,13 @@ impl DvcProcessor for AutomationDvc {
         state.channel_id = None;
         state.handshake = None;
         state.handshake_at = None;
+
+        // Synchronous, never blocks: this runs inside the frame processor
+        // under its write lock. The supervisor decides whether the session
+        // is still alive and a relaunch is warranted.
+        if let Some(notify) = state.closed_notify.as_ref() {
+            let _ = notify.send(());
+        }
 
         // Notify all pending requests that the channel closed
         for (id, sender) in state.pending.drain() {

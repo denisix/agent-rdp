@@ -21,7 +21,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # Global state
 $script:RefMap = @{}  # ref number -> AutomationElement mapping
 $script:SnapshotId = $null
-$script:Version = "1.5.0"  # run: wrapped child script with plain-text error chain, early_exit, wait beats stream; file_stat: mtime
+$script:Version = "1.6.0"  # DVC: transient read errors survive, FIRST-flag resync; run: started_unix
 # Local log path on Windows machine (RDPDR not used for logging anymore)
 $script:LocalLogPath = "$env:TEMP\agent-rdp-automation.log"
 $script:DvcHandle = [IntPtr]::Zero
@@ -199,9 +199,12 @@ function Start-Agent {
             $errorMsg = $_.Exception.Message
             Write-Log "DVC error: $errorMsg" "ERROR"
 
-            # Check if it's a channel error (likely means daemon disconnected)
-            if ($errorMsg -match "Win32 error" -or $errorMsg -match "channel") {
-                Write-Log "DVC channel error, exiting agent" "WARN"
+            # Only an explicitly fatal transport error ends the agent. The
+            # old substring test ("Win32 error" / "channel") also matched
+            # every transient read error a CPU-starved host produces, so the
+            # agent exited under load and the daemon reported channel_closed.
+            if ($errorMsg.StartsWith($script:DvcFatalPrefix)) {
+                Write-Log "DVC channel is gone, exiting agent" "WARN"
                 break
             }
 

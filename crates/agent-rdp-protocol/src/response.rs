@@ -204,6 +204,57 @@ pub enum ResponseData {
 
     /// Result of a file push/pull.
     FileTransferResult(FileTransferResult),
+
+    /// Result of `file stat`.
+    FileStat(FileStatResult),
+}
+
+/// What the remote machine says about a path, without transferring it.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct FileStatResult {
+    /// The path that was inspected.
+    pub path: String,
+    /// Whether anything exists at the path. A missing file is an answer,
+    /// not an error.
+    pub exists: bool,
+    /// True for a directory (size/hash/times are then absent).
+    #[serde(default)]
+    pub is_directory: bool,
+    /// Size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub size: Option<u64>,
+    /// SHA-256 of the content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sha256: Option<String>,
+    /// Last write time (RFC 3339, UTC) by the remote clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub modified: Option<String>,
+    /// The same as Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub modified_unix: Option<u64>,
+    /// Seconds since the last write, by the remote clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub age_secs: Option<u64>,
+}
+
+/// Why and when the daemon lost its RDP session while staying up.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct LastDisconnect {
+    /// When the transport dropped (RFC 3339, UTC, daemon host clock).
+    pub at: String,
+    /// Seconds since then.
+    #[ts(type = "number")]
+    pub seconds_ago: u64,
+    /// What the frame processor saw (read failure, server-initiated
+    /// termination, ...).
+    pub reason: String,
 }
 
 /// Outcome of a file transfer in either direction.
@@ -279,6 +330,13 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub last_frame_age_ms: Option<u64>,
+
+    /// Present while disconnected after a transport drop: the RDP session
+    /// ended but the daemon did not. Distinguishes "reconnect the session"
+    /// from "the daemon is gone".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub last_disconnect: Option<LastDisconnect>,
 }
 
 /// Connection state.

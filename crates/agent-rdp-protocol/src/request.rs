@@ -49,6 +49,10 @@ pub enum Request {
     /// Copy a file from the remote machine to the local machine.
     FilePull(FilePullRequest),
 
+    /// Existence, size, hash and modification time of a remote file, without
+    /// transferring it.
+    FileStat(FileStatRequest),
+
     /// Relaunch the UI Automation agent without a full RDP reconnect.
     ///
     /// Requires automation to have been initialized at `connect` (i.e.
@@ -65,6 +69,27 @@ pub enum Request {
 
     /// Shutdown the daemon gracefully.
     Shutdown,
+}
+
+impl Request {
+    /// Whether the request can be re-sent without changing anything on the
+    /// remote side. The CLI retries such a request once when the daemon
+    /// closes the connection before answering; a mutating request is never
+    /// retried automatically, because "did it apply?" is exactly the
+    /// question a dropped connection leaves open.
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Request::Ping
+            | Request::SessionInfo
+            | Request::Screenshot(_)
+            | Request::Locate(_)
+            | Request::FileStat(_) => true,
+            Request::Clipboard(ClipboardRequest::Get) => true,
+            Request::Drive(DriveRequest::List) => true,
+            Request::Automate(automate) => automate.is_read_only(),
+            _ => false,
+        }
+    }
 }
 
 /// A drive to map at connect time.
@@ -545,6 +570,13 @@ pub struct FilePushRequest {
 /// Copy a file from the remote machine to this one.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct FileStatRequest {
+    /// Path to inspect on the remote machine.
+    pub remote_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
 pub struct FilePullRequest {
     /// Path of the file to read on the remote machine.
     pub remote_path: String,
@@ -556,6 +588,34 @@ pub struct FilePullRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub max_age_secs: Option<u64>,
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+
+    #[test]
+    fn reads_are_retryable_and_writes_are_not() {
+        assert!(Request::Ping.is_read_only());
+        assert!(Request::SessionInfo.is_read_only());
+        assert!(Request::Clipboard(ClipboardRequest::Get).is_read_only());
+        assert!(Request::Drive(DriveRequest::List).is_read_only());
+        assert!(Request::FileStat(FileStatRequest { remote_path: "C:\\x".into() }).is_read_only());
+        assert!(Request::Automate(AutomateRequest::Status).is_read_only());
+
+        assert!(!Request::Disconnect.is_read_only());
+        assert!(!Request::Shutdown.is_read_only());
+        assert!(!Request::Clipboard(ClipboardRequest::Set { text: "x".into() }).is_read_only());
+        assert!(!Request::AutomationRestart.is_read_only());
+        assert!(!Request::Automate(AutomateRequest::Click { selector: "e1".into(), double_click: false })
+            .is_read_only());
+        assert!(!Request::FilePull(FilePullRequest {
+            remote_path: "a".into(),
+            local_path: "b".into(),
+            max_age_secs: None
+        })
+        .is_read_only());
+    }
 }
 
 #[cfg(test)]

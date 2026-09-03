@@ -6,6 +6,7 @@ import type { ConnectRequest } from "./ConnectRequest.js";
 import type { DriveRequest } from "./DriveRequest.js";
 import type { FilePullRequest } from "./FilePullRequest.js";
 import type { FilePushRequest } from "./FilePushRequest.js";
+import type { FileStatRequest } from "./FileStatRequest.js";
 import type { KeyboardRequest } from "./KeyboardRequest.js";
 import type { LocateRequest } from "./LocateRequest.js";
 import type { MouseRequest } from "./MouseRequest.js";
@@ -15,4 +16,4 @@ import type { ScrollRequest } from "./ScrollRequest.js";
 /**
  * A request from the CLI to the daemon.
  */
-export type Request = { "type": "connect" } & ConnectRequest | { "type": "disconnect" } | { "type": "screenshot" } & ScreenshotRequest | { "type": "mouse" } & MouseRequest | { "type": "keyboard" } & KeyboardRequest | { "type": "scroll" } & ScrollRequest | { "type": "clipboard" } & ClipboardRequest | { "type": "drive" } & DriveRequest | { "type": "automate" } & AutomateRequest | { "type": "locate" } & LocateRequest | { "type": "click_at" } & ClickAtRequest | { "type": "file_push" } & FilePushRequest | { "type": "file_pull" } & FilePullRequest | { "type": "automation_restart" } | { "type": "session_info" } | { "type": "ping" } | { "type": "shutdown" };
+export type Request = { "type": "connect" } & ConnectRequest | { "type": "disconnect" } | { "type": "screenshot" } & ScreenshotRequest | { "type": "mouse" } & MouseRequest | { "type": "keyboard" } & KeyboardRequest | { "type": "scroll" } & ScrollRequest | { "type": "clipboard" } & ClipboardRequest | { "type": "drive" } & DriveRequest | { "type": "automate" } & AutomateRequest | { "type": "locate" } & LocateRequest | { "type": "click_at" } & ClickAtRequest | { "type": "file_push" } & FilePushRequest | { "type": "file_pull" } & FilePullRequest | { "type": "file_stat" } & FileStatRequest | { "type": "automation_restart" } | { "type": "session_info" } | { "type": "ping" } | { "type": "shutdown" };

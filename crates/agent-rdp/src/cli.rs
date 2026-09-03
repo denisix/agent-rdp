@@ -163,6 +163,13 @@ pub struct ConnectArgs {
     /// Enable Windows UI Automation (requires automation agent on remote host)
     #[arg(long)]
     pub enable_win_automation: bool,
+
+    /// If the session's daemon is running but unresponsive, stop it (gracefully,
+    /// then by force) and start a fresh one. Without this, `connect` refuses
+    /// with `daemon_unresponsive` - so a retry loop can never kill a daemon
+    /// that is merely busy serving another command.
+    #[arg(long)]
+    pub replace: bool,
 }
 
 /// Screenshot command arguments.
@@ -737,6 +744,14 @@ pub enum FileAction {
         /// file" without reading the content.
         #[arg(long = "max-age")]
         max_age: Option<u64>,
+    },
+
+    /// Existence, size, SHA-256 and modification time of a remote path,
+    /// without transferring it - check that a pushed script is there (and
+    /// fresh) before launching it
+    Stat {
+        /// Remote path to inspect
+        remote: String,
     },
 }
 

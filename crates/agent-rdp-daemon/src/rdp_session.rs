@@ -137,6 +137,19 @@ pub struct RdpSession {
     /// by `disconnect`, aborted on drop - never just detached, see
     /// `disconnect_with_join`.
     task_handle: tokio::task::JoinHandle<()>,
+    /// Shared with the RDPDR backend: when the remote last read a script.
+    script_activity: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// What the daemon learns when a session's frame processor stops without
+/// being asked to.
+#[derive(Debug, Clone)]
+pub struct DisconnectEvent {
+    /// Generation of the session that dropped (see `DisconnectNotify`).
+    pub generation: u64,
+    /// What the processor saw: a read failure, a server-initiated
+    /// termination, a failed reactivation.
+    pub reason: String,
 }
 
 /// How long `disconnect` waits for the frame processor to exit on its own
@@ -180,7 +193,7 @@ const CLIPBOARD_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// new session would tear that new session down instead - reported as
 /// "daemon_not_running" on the very next command, or as the automation agent
 /// failing to launch with "Not connected" moments after `connect` succeeded.
-pub type DisconnectNotify = (mpsc::Sender<u64>, u64);
+pub type DisconnectNotify = (mpsc::Sender<DisconnectEvent>, u64);
 
 impl RdpSession {
     /// Enable OS-level TCP keepalive on the RDP socket so a black-holed
@@ -204,6 +217,10 @@ impl RdpSession {
         disconnect_notify: Option<DisconnectNotify>,
     ) -> Result<Self, RdpError> {
         info!("Connecting to {}:{}", config.host, config.port);
+
+        // Shared with the RDPDR backend (script reads) and kept on the
+        // session for the bootstrap's "is the agent still starting?" check.
+        let script_activity = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // Build connector config
         let connector_config = connector::Config {
@@ -291,6 +308,7 @@ impl RdpSession {
         if !config.drives.is_empty() {
             // Create multi-drive backend with all drive paths
             let mut backend = MultiDriveBackend::new();
+            backend.script_activity = Some(Arc::clone(&script_activity));
 
             // Configure drives - device IDs start at 1
             let drive_list: Vec<(u32, String)> = config
@@ -465,7 +483,22 @@ impl RdpSession {
             shared,
             command_tx,
             task_handle,
+            script_activity,
         })
+    }
+
+    /// How long ago the remote last opened a `.ps1` on a mapped drive, or
+    /// `None` if it never did. See `MultiDriveBackend::script_activity`.
+    pub fn last_script_open_age(&self) -> Option<std::time::Duration> {
+        let at_ms = self.script_activity.load(std::sync::atomic::Ordering::Relaxed);
+        if at_ms == 0 {
+            return None;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Some(std::time::Duration::from_millis(now_ms.saturating_sub(at_ms)))
     }
 
     /// Perform TLS upgrade on the stream.
@@ -805,6 +838,7 @@ async fn run_frame_processor(
 ) {
     info!("Frame processor started");
     let mut graceful_shutdown = false;
+    let mut drop_reason = String::from("frame processor stopped");
 
     loop {
         tokio::select! {
@@ -1014,19 +1048,26 @@ async fn run_frame_processor(
                                 reactivate(&mut framed, &mut active_stage, &shared, &activation_factory).await
                             {
                                 error!("Deactivation-Reactivation Sequence failed: {}", e);
+                                drop_reason = format!("deactivation-reactivation sequence failed: {}", e);
                                 break;
                             }
                         }
                         if should_terminate {
                             // Server-initiated termination - notify daemon
                             if let Some((notify, generation)) = disconnect_notify {
-                                let _ = notify.send(generation).await;
+                                let _ = notify
+                                    .send(DisconnectEvent {
+                                        generation,
+                                        reason: "server-initiated termination (disconnect PDU)".to_string(),
+                                    })
+                                    .await;
                             }
                             return;
                         }
                     }
                     Err(e) => {
                         error!("Failed to read PDU: {}", e);
+                        drop_reason = format!("failed to read from the RDP transport: {}", e);
                         break;
                     }
                 }
@@ -1118,8 +1159,11 @@ async fn run_frame_processor(
     // session it currently holds from one for a session already replaced.
     if !graceful_shutdown {
         if let Some((notify, generation)) = disconnect_notify {
-            info!("Notifying daemon of connection drop (generation {})", generation);
-            let _ = notify.send(generation).await;
+            info!(
+                "Notifying daemon of connection drop (generation {}): {}",
+                generation, drop_reason
+            );
+            let _ = notify.send(DisconnectEvent { generation, reason: drop_reason }).await;
         }
     }
 }

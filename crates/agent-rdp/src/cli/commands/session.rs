@@ -80,7 +80,7 @@ async fn session_info(session: &str, output: &Output, timeout_ms: u64) -> anyhow
             std::process::exit(1);
         }
     };
-    let response = client.send(&Request::SessionInfo, timeout_ms).await?;
+    let response = manager.send_with_retry(&mut client, &Request::SessionInfo, timeout_ms).await?;
     output.print_response(&response);
 
     Ok(())

@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::automation::{new_shared_state, AutomationBootstrap, SharedAutomationState};
 use crate::handlers;
 use crate::ipc_server::IpcServer;
-use crate::rdp_session::RdpSession;
+use crate::rdp_session::{DisconnectEvent, RdpSession};
 use crate::ws_server::WsServerHandle;
 
 /// Highest allowed streaming frame rate.
@@ -55,11 +55,16 @@ pub struct Daemon {
     shutdown_tx: broadcast::Sender<()>,
 
     /// Channel to receive connection drop notifications from RDP session,
-    /// carrying the generation of the session that dropped.
-    disconnect_rx: tokio::sync::mpsc::Receiver<u64>,
+    /// carrying the generation of the session that dropped and why.
+    disconnect_rx: tokio::sync::mpsc::Receiver<DisconnectEvent>,
 
     /// Sender for connection drop notifications (passed to RDP sessions).
-    disconnect_tx: tokio::sync::mpsc::Sender<u64>,
+    disconnect_tx: tokio::sync::mpsc::Sender<DisconnectEvent>,
+
+    /// The most recent transport drop, kept until the next successful
+    /// `connect`, so "not connected" can say *why* and *when* - the
+    /// difference between "reconnect the session" and "the daemon is gone".
+    last_disconnect: SharedLastDisconnect,
 
     /// Generation of the session currently stored in `rdp_session`.
     ///
@@ -122,6 +127,7 @@ impl Daemon {
             shutdown_tx,
             disconnect_rx,
             disconnect_tx,
+            last_disconnect: Arc::new(std::sync::Mutex::new(None)),
             session_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ws_handle,
             stream_fps,
@@ -171,11 +177,12 @@ impl Daemon {
                             let start_time = self.start_time;
                             let shutdown_tx = self.shutdown_tx.clone();
                             let disconnect_tx = self.disconnect_tx.clone();
+                            let last_disconnect = Arc::clone(&self.last_disconnect);
                             let clipboard_changed_rx = Arc::clone(&self.clipboard_changed_rx);
                             let session_generation = Arc::clone(&self.session_generation);
 
                             tokio::spawn(async move {
-                                if let Err(e) = handle_client(stream, session, automation_state, ws_handle, session_name, start_time, shutdown_tx, disconnect_tx, clipboard_changed_rx, session_generation).await {
+                                if let Err(e) = handle_client(stream, session, automation_state, ws_handle, session_name, start_time, shutdown_tx, disconnect_tx, clipboard_changed_rx, session_generation, last_disconnect).await {
                                     error!("Client handler error: {}", e);
                                 }
                             });
@@ -195,7 +202,8 @@ impl Daemon {
                 // caller had to respawn a daemon rather than simply reconnect.
                 // Drop the dead session instead and stay up, so commands report
                 // "not connected" and `connect` can re-establish in place.
-                Some(dropped_generation) = self.disconnect_rx.recv() => {
+                Some(event) = self.disconnect_rx.recv() => {
+                    let dropped_generation = event.generation;
                     // A notification from a session that has already been
                     // replaced must not touch the session that replaced it.
                     // Without this check, a drop notice still in flight when
@@ -212,7 +220,20 @@ impl Daemon {
                         continue;
                     }
 
-                    warn!("RDP connection dropped; session is now disconnected (daemon staying up)");
+                    warn!(
+                        "RDP connection dropped ({}); session is now disconnected (daemon staying up)",
+                        event.reason
+                    );
+                    *self.last_disconnect.lock().unwrap() = Some(DisconnectInfo {
+                        at: std::time::SystemTime::now(),
+                        reason: event.reason.clone(),
+                    });
+                    crate::transcript::append_event(
+                        &self.session_name,
+                        serde_json::json!({
+                            "rdp_transport_dropped": { "reason": event.reason, "generation": dropped_generation }
+                        }),
+                    );
 
                     // Tear the dead session down on a separate task. This arm
                     // runs inside the accept loop's `select!`, so every lock it
@@ -378,9 +399,10 @@ async fn handle_client(
     session_name: String,
     start_time: Instant,
     shutdown_tx: broadcast::Sender<()>,
-    disconnect_tx: tokio::sync::mpsc::Sender<u64>,
+    disconnect_tx: tokio::sync::mpsc::Sender<DisconnectEvent>,
     clipboard_changed_rx: ClipboardChangedRx,
     session_generation: Arc<std::sync::atomic::AtomicU64>,
+    last_disconnect: SharedLastDisconnect,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -412,7 +434,7 @@ async fn handle_client(
         let is_shutdown = matches!(request, Request::Shutdown);
 
         let started = Instant::now();
-        let response = process_request(
+        let mut response = process_request(
             request.clone(),
             &rdp_session,
             &automation_state,
@@ -423,6 +445,18 @@ async fn handle_client(
             &clipboard_changed_rx,
             &session_generation,
         ).await;
+
+        // "Not connected" after a transport drop is a different situation
+        // from "never connected" and from "the daemon is gone", and the
+        // caller cannot tell them apart from the bare code. Annotate here,
+        // once, rather than at the two dozen sites that produce the code.
+        annotate_not_connected(&mut response, &last_disconnect);
+        if matches!(request, Request::Connect(_)) && response.success {
+            *last_disconnect.lock().unwrap() = None;
+        }
+        if let Some(ResponseData::SessionInfo(ref mut info)) = response.data {
+            info.last_disconnect = last_disconnect.lock().unwrap().as_ref().map(DisconnectInfo::to_protocol);
+        }
 
         // Evidence for the next bug report: what was asked, what came back,
         // and - when the failure is the kind a screenshot explains - the
@@ -458,7 +492,7 @@ async fn process_request(
     ws_handle: &SharedWsHandle,
     session_name: &str,
     start_time: Instant,
-    disconnect_tx: &tokio::sync::mpsc::Sender<u64>,
+    disconnect_tx: &tokio::sync::mpsc::Sender<DisconnectEvent>,
     clipboard_changed_rx: &ClipboardChangedRx,
     session_generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Response {
@@ -491,6 +525,8 @@ async fn process_request(
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 uptime_secs: start_time.elapsed().as_secs(),
                 last_frame_age_ms,
+                // Filled in by `handle_client`, which owns the drop state.
+                last_disconnect: None,
             }))
         }
 
@@ -554,7 +590,55 @@ async fn process_request(
         Request::FilePull(params) => {
             handlers::file_transfer::handle_pull(rdp_session, automation_state, params).await
         }
+
+        Request::FileStat(params) => {
+            handlers::file_transfer::handle_stat(rdp_session, automation_state, params).await
+        }
     }
+}
+
+/// The most recent transport drop while the daemon stayed up.
+#[derive(Debug, Clone)]
+pub struct DisconnectInfo {
+    pub at: std::time::SystemTime,
+    pub reason: String,
+}
+
+impl DisconnectInfo {
+    fn seconds_ago(&self) -> u64 {
+        self.at.elapsed().map(|d| d.as_secs()).unwrap_or(0)
+    }
+
+    fn to_protocol(&self) -> agent_rdp_protocol::LastDisconnect {
+        agent_rdp_protocol::LastDisconnect {
+            at: crate::timefmt::utc_rfc3339(self.at),
+            seconds_ago: self.seconds_ago(),
+            reason: self.reason.clone(),
+        }
+    }
+}
+
+/// Shared handle to the last drop, written by the drop arm and read by
+/// every client handler. A std mutex: the critical sections are a clone.
+pub type SharedLastDisconnect = Arc<std::sync::Mutex<Option<DisconnectInfo>>>;
+
+/// Extend a `not_connected` error with what happened to the session.
+fn annotate_not_connected(response: &mut Response, last_disconnect: &SharedLastDisconnect) {
+    let Some(error) = response.error.as_mut() else { return };
+    if error.code != ErrorCode::NotConnected {
+        return;
+    }
+    let Some(info) = last_disconnect.lock().unwrap().clone() else {
+        return;
+    };
+    error.message = format!(
+        "{}. The RDP transport dropped {}s ago ({}); the daemon itself is alive - \
+         re-establish the session with `agent-rdp connect ...` (automation is relaunched \
+         automatically).",
+        error.message.trim_end_matches('.'),
+        info.seconds_ago(),
+        info.reason
+    );
 }
 
 /// Whether a drop notification belongs to a session that has already been

@@ -32,4 +32,10 @@ replayed: boolean,
  * carries its status. A script that fails before its first real
  * statement is otherwise indistinguishable from one that is running.
  */
-early_exit: boolean, };
+early_exit: boolean, 
+/**
+ * When the process was started, in Unix seconds by the *remote* clock -
+ * the same clock `file pull`/`file stat` report modification times in,
+ * so a run can be tied to the files it produced.
+ */
+started_unix?: number, };

@@ -304,6 +304,7 @@ mod tests {
             pid: None,
             replayed: false,
             early_exit: false,
+            started_unix: None,
         }));
         (Request::Automate(request), response)
     }

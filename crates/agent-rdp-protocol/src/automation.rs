@@ -3,6 +3,29 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+impl AutomateRequest {
+    /// Whether re-issuing this request cannot change remote state. A lost
+    /// reply is ambiguous about whether the *action* happened, but the safe
+    /// response to it is not: retrying a read is always safe, retrying a
+    /// click or fill risks applying it twice. Used by the daemon's
+    /// indeterminate-result text and by the CLI's automatic retry after a
+    /// dropped IPC connection.
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            AutomateRequest::Snapshot { .. }
+                | AutomateRequest::Get { .. }
+                | AutomateRequest::Status
+                | AutomateRequest::WaitFor { .. }
+                | AutomateRequest::RunPoll { .. }
+                | AutomateRequest::FileStat { .. }
+                | AutomateRequest::FileReadChunk { .. }
+                | AutomateRequest::QueryResult { .. }
+                | AutomateRequest::Window { action: WindowAction::List, .. }
+        )
+    }
+}
+
 /// Automation request sent from CLI to daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
@@ -435,6 +458,12 @@ pub struct AutomationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub log_path: Option<String>,
+    /// How many times the daemon relaunched the agent on its own since this
+    /// session connected (the DVC channel closed while the RDP session was
+    /// alive). Non-zero means the agent process is dying under you - look at
+    /// the remote log via `agent-rdp diagnose`.
+    #[serde(default)]
+    pub relaunches: u32,
     /// Seconds since the current agent's DVC handshake completed. Distinct
     /// from `agent_running`: an agent can be "running" per the PS-reported
     /// fields yet the daemon-side DVC channel could have gone stale without
@@ -488,6 +517,12 @@ pub struct RunResult {
     /// statement is otherwise indistinguishable from one that is running.
     #[serde(default)]
     pub early_exit: bool,
+    /// When the process was started, in Unix seconds by the *remote* clock -
+    /// the same clock `file pull`/`file stat` report modification times in,
+    /// so a run can be tied to the files it produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub started_unix: Option<u64>,
 }
 
 /// Incremental output from a process started with `Run { stream: true, .. }`.

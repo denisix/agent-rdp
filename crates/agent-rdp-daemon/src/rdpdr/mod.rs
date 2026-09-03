@@ -41,6 +41,11 @@ pub struct MultiDriveBackend {
     pub(crate) file_dir_map: HashMap<u32, DirIterState>,
     /// Files marked for deletion on close (set via FileDispositionInformation).
     pub(crate) delete_on_close: HashMap<u32, bool>,
+    /// Epoch milliseconds of the last time the remote opened a `.ps1` on a
+    /// mapped drive - the automation agent loading its scripts. The bootstrap
+    /// uses it to tell "PowerShell is still starting" from "the launch did
+    /// nothing" without any agent-side marker.
+    pub(crate) script_activity: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl MultiDriveBackend {
@@ -95,6 +100,15 @@ impl MultiDriveBackend {
 
     /// Insert a file entry with handle.
     pub(crate) fn insert_file(&mut self, file_id: u32, device_id: u32, path: PathBuf, file: File) {
+        if let Some(activity) = self.script_activity.as_ref() {
+            if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("ps1")).unwrap_or(false) {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                activity.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         self.file_map.insert(file_id, Some(file));
         self.file_path_map.insert(file_id, path);
         self.file_device_map.insert(file_id, device_id);

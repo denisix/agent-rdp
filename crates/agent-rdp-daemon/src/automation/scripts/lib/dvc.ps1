@@ -179,9 +179,30 @@ $script:MaxMessageSize = 1024 * 1024
 # File handle reads on DVC include this header before the actual data
 $script:ChannelPduHeaderSize = 8
 
-# CHANNEL_PDU_HEADER flags (MS-RDPBCGR 2.2.6.1.1). FIRST is 0x1; only LAST
-# is needed to know when a message is complete.
+# CHANNEL_PDU_HEADER flags (MS-RDPBCGR 2.2.6.1.1). LAST says a message is
+# complete; FIRST is what lets the reader resynchronise after a dropped
+# partial - a fragment without it, arriving when nothing is accumulated, is
+# the tail of a message whose head was lost and must be skipped, not parsed.
+$script:ChannelFlagFirst = 0x00000001
 $script:ChannelFlagLast = 0x00000002
+
+# Win32 errors from ReadFile/WriteFile that mean the channel itself is gone.
+# Everything else is treated as transient: a CPU-starved host produces
+# ERROR_OPERATION_ABORTED / ERROR_NO_SYSTEM_RESOURCES / short reads that the
+# old code treated as fatal, so the agent exited under load - which the daemon
+# then reported as `channel_closed`. Messages for fatal errors carry the
+# DVC_FATAL: prefix; the main loop exits only on that.
+$script:DvcFatalWin32Errors = @(
+    6,     # ERROR_INVALID_HANDLE
+    109,   # ERROR_BROKEN_PIPE
+    232,   # ERROR_NO_DATA
+    233,   # ERROR_PIPE_NOT_CONNECTED
+    1167   # ERROR_DEVICE_NOT_CONNECTED
+)
+$script:DvcFatalPrefix = "DVC_FATAL:"
+# Consecutive transient read failures tolerated before giving up anyway.
+$script:DvcMaxTransientFailures = 20
+$script:DvcTransientFailures = 0
 
 # One reusable read buffer. Each ReadFile returns at most one fragment
 # (CHANNEL_CHUNK_LENGTH = 1600 bytes of data plus the header), so a modest
@@ -202,7 +223,8 @@ $script:ReadBuffer = New-Object byte[] $script:ReadBufferSize
 # to hand each fragment to ConvertFrom-Json on its own, so every large request
 # failed to parse and silently got no reply.
 #
-# Returns $null on no data, throws on error.
+# Returns $null on no data (and after a transient failure, so the caller just
+# reads again); throws with the DVC_FATAL: prefix when the channel is gone.
 # Note: ReadFile is blocking - timeout not implemented (would require overlapped I/O)
 function Read-DvcMessage {
     param(
@@ -222,30 +244,35 @@ function Read-DvcMessage {
 
         if (-not $success) {
             $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-            # Error 109 (ERROR_BROKEN_PIPE) means the channel was closed
-            if ($errorCode -eq 109) {
-                throw "DVC channel closed (ERROR_BROKEN_PIPE)"
+            if ($script:DvcFatalWin32Errors -contains $errorCode) {
+                throw "$($script:DvcFatalPrefix) ReadFile failed with Win32 error $errorCode (channel gone)"
             }
-            throw "ReadFile failed: Win32 error $errorCode"
+            return Skip-DvcTransientFailure -What "ReadFile Win32 error $errorCode" -Fragments $fragments
         }
 
         if ($bytesRead -eq 0) {
             if ($fragments -eq 0) {
                 return $null
             }
-            throw "DVC channel closed in the middle of a $expectedLength-byte message"
+            return Skip-DvcTransientFailure -What "0-byte read after $fragments fragment(s) of a $expectedLength-byte message" -Fragments $fragments
         }
 
         if ($bytesRead -lt $script:ChannelPduHeaderSize) {
-            throw "Fragment too short: $bytesRead bytes (need at least $($script:ChannelPduHeaderSize))"
+            return Skip-DvcTransientFailure -What "fragment of $bytesRead bytes is shorter than the $($script:ChannelPduHeaderSize)-byte header" -Fragments $fragments
         }
 
         $length = [System.BitConverter]::ToUInt32($buffer, 0)
         $flags = [System.BitConverter]::ToUInt32($buffer, 4)
         $dataLength = $bytesRead - $script:ChannelPduHeaderSize
-        $fragments++
 
         if ($null -eq $accumulated) {
+            # Resync: a fragment without FIRST while nothing is accumulated is
+            # the remainder of a message whose head was lost. Parsing it as a
+            # new message would fail JSON and the request would get no reply.
+            if (($flags -band $script:ChannelFlagFirst) -eq 0) {
+                Write-Log "Skipping a $dataLength-byte continuation fragment with no message in progress (resync)" "WARN"
+                continue
+            }
             if ($length -gt $script:MaxMessageSize) {
                 throw "Message too large: $length bytes (limit $($script:MaxMessageSize))"
             }
@@ -253,6 +280,7 @@ function Read-DvcMessage {
             $capacity = if ($length -gt 0) { [int]$length } else { $dataLength }
             $accumulated = [System.IO.MemoryStream]::new($capacity)
         }
+        $fragments++
 
         if ($dataLength -gt 0) {
             $accumulated.Write($buffer, $script:ChannelPduHeaderSize, $dataLength)
@@ -267,6 +295,9 @@ function Read-DvcMessage {
             break
         }
     }
+
+    # A complete message: the channel is healthy.
+    $script:DvcTransientFailures = 0
 
     $bytes = $accumulated.ToArray()
     if ($bytes.Length -eq 0) {
@@ -291,6 +322,23 @@ function Read-DvcMessage {
     }
 }
 
+# Record a transient read failure: drop whatever was accumulated, pause so a
+# starved host is not spun on, and give up only after many in a row.
+function Skip-DvcTransientFailure {
+    param(
+        [string]$What,
+        [int]$Fragments
+    )
+
+    $script:DvcTransientFailures++
+    if ($script:DvcTransientFailures -gt $script:DvcMaxTransientFailures) {
+        throw "$($script:DvcFatalPrefix) $($script:DvcTransientFailures) consecutive read failures, last: $What"
+    }
+    Write-Log "Transient DVC read failure ($($script:DvcTransientFailures)/$($script:DvcMaxTransientFailures)): $What; dropping $Fragments partial fragment(s) and reading again" "WARN"
+    Start-Sleep -Milliseconds 200
+    return $null
+}
+
 # Write a JSON message to DVC using file handle
 # DVC handles message framing - each WriteFile sends a complete message
 function Write-DvcMessage {
@@ -307,13 +355,16 @@ function Write-DvcMessage {
     $bytesWritten = 0
     $success = [Kernel32]::WriteFile($Handle, $buffer, $buffer.Length, [ref]$bytesWritten, [IntPtr]::Zero)
 
+    # A failed write means the pipe is gone: there is no partial-progress
+    # state to recover, and a reply that cannot be sent is a reply the daemon
+    # will time out on anyway.
     if (-not $success) {
         $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-        throw "WriteFile failed: Win32 error $errorCode"
+        throw "$($script:DvcFatalPrefix) WriteFile failed with Win32 error $errorCode"
     }
 
     if ($bytesWritten -ne $buffer.Length) {
-        throw "Incomplete write: wrote $bytesWritten of $($buffer.Length) bytes"
+        throw "$($script:DvcFatalPrefix) incomplete write: wrote $bytesWritten of $($buffer.Length) bytes"
     }
 }
 

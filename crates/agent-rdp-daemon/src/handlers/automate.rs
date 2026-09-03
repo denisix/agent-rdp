@@ -5,12 +5,12 @@ use std::sync::Arc;
 use agent_rdp_protocol::{
     AccessibilityElement, AccessibilitySnapshot, AutomateRequest, AutomationStatus, ClickResult,
     ElementBounds, ElementValue, ErrorCode, Response, ResponseData, RunPollResult, RunResult,
-    WindowAction, WindowInfo,
+    WindowInfo,
 };
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-use crate::automation::{AutomationBootstrap, SharedAutomationState};
+use crate::automation::SharedAutomationState;
 use crate::rdp_session::RdpSession;
 
 /// Relaunch the UI Automation agent without a full RDP reconnect.
@@ -42,16 +42,10 @@ pub async fn handle_restart(
         }
     }
 
-    {
-        let mut state = automation_state.lock().await;
-        state.agent_ready = false;
-        state.agent_pid = None;
-    }
-
-    let session_dir = crate::get_session_dir("");
-    let bootstrap = AutomationBootstrap::new(session_dir);
-
-    match bootstrap.launch_and_wait(rdp_session, automation_state).await {
+    // Shared with the relaunch supervisor; serialized by `relaunch_in_flight`
+    // so a manual restart and an automatic one never drive the Run dialog
+    // at the same time.
+    match crate::automation::relaunch_agent(rdp_session, automation_state).await {
         Ok(()) => {
             let state = automation_state.lock().await;
             let dvc_ipc = state.dvc_ipc.as_ref();
@@ -61,6 +55,7 @@ pub async fn handle_restart(
                 capabilities: dvc_ipc.map(|ipc| ipc.capabilities()).unwrap_or_default(),
                 version: dvc_ipc.and_then(|ipc| ipc.agent_version()),
                 log_path: None,
+                relaunches: state.relaunches,
                 uptime_secs: dvc_ipc.and_then(|ipc| ipc.agent_uptime_secs()),
                 last_rtt_ms: None,
                 consecutive_failures: 0,
@@ -122,7 +117,13 @@ pub async fn handle(
     // their own budget the time they asked for.
     let response_timeout = request_timeout(&request, ipc.default_timeout());
     match ipc.send_request_with_timeout(&request, response_timeout).await {
-        Ok(data) => convert_response(request, data, &ipc),
+        Ok(data) => {
+            let mut response = convert_response(request, data, &ipc);
+            if let Some(ResponseData::AutomationStatus(ref mut status)) = response.data {
+                status.relaunches = automation_state.lock().await.relaunches;
+            }
+            response
+        }
         Err(e) => {
             // A lost reply is not the same as a failed action - surface it under
             // its own code so callers can avoid retrying into a double-apply.
@@ -276,20 +277,15 @@ fn stale_ref_hint(message: String) -> String {
 /// safe response to it is not: retrying a read is always safe, retrying a
 /// click or fill risks applying it twice.
 fn is_read_only(request: &AutomateRequest) -> bool {
-    matches!(
-        request,
-        AutomateRequest::Snapshot { .. }
-            | AutomateRequest::Get { .. }
-            | AutomateRequest::Status
-            | AutomateRequest::WaitFor { .. }
-            | AutomateRequest::RunPoll { .. }
-            | AutomateRequest::Window { action: WindowAction::List, .. }
-    )
+    // The classification lives in the protocol crate so the CLI can use the
+    // same answer for its dropped-connection retry.
+    request.is_read_only()
 }
 
 #[cfg(test)]
 mod is_read_only_tests {
     use super::*;
+    use agent_rdp_protocol::WindowAction;
 
     #[test]
     fn read_only_commands_are_marked_safe_to_retry() {
@@ -459,6 +455,7 @@ fn convert_response(
                     status.uptime_secs = ipc.agent_uptime_secs();
                     status.last_rtt_ms = ipc.last_rtt_ms();
                     status.consecutive_failures = ipc.consecutive_failures();
+                    // `relaunches` is filled by `handle`, which owns the state.
                     Response::success(ResponseData::AutomationStatus(status))
                 }
                 Err(e) => {
@@ -648,6 +645,7 @@ fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
     let pid = data["pid"].as_u64().map(|v| v as u32);
     let replayed = data["replayed"].as_bool().unwrap_or(false);
     let early_exit = data["early_exit"].as_bool().unwrap_or(false);
+    let started_unix = data["started_unix"].as_u64();
 
     Ok(RunResult {
         exit_code,
@@ -656,6 +654,7 @@ fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
         pid,
         replayed,
         early_exit,
+        started_unix,
     })
 }
 
@@ -882,6 +881,7 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
         capabilities,
         version,
         log_path,
+        relaunches: 0,
         uptime_secs: None,
         last_rtt_ms: None,
         consecutive_failures: 0,

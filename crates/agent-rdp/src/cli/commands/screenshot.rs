@@ -40,7 +40,7 @@ pub async fn run(
         format,
         region: args.region,
     });
-    let response = client.send(&request, timeout_ms).await?;
+    let response = manager.send_with_retry(&mut client, &request, timeout_ms).await?;
 
     if !response.success {
         output.print_response(&response);

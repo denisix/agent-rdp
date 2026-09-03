@@ -599,6 +599,7 @@ function Invoke-Run {
     }
 
     $process = [System.Diagnostics.Process]::Start($startInfo)
+    $startedUnix = Get-UnixNow
 
     if ($wait) {
         # Use async reading to avoid deadlock when buffer fills
@@ -620,10 +621,20 @@ function Invoke-Run {
             exit_code = $process.ExitCode
             stdout = $stdoutTask.Result
             stderr = $stderrTask.Result
+            started_unix = $startedUnix
         }
     } else {
-        return Get-LaunchResult -Process $process
+        $launch = Get-LaunchResult -Process $process
+        $launch.started_unix = $startedUnix
+        return $launch
     }
+}
+
+# Seconds since the Unix epoch by this machine's clock - the same clock
+# `file_stat` reports, so a run can be correlated with the files it wrote.
+function Get-UnixNow {
+    $epoch = [datetime]::new(1970, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc)
+    return [int64]([datetime]::UtcNow - $epoch).TotalSeconds
 }
 
 # ---- child script assembly ----
@@ -833,6 +844,7 @@ function Start-StreamedRun {
     if ($Hidden) { $startArgs.WindowStyle = "Hidden" }
 
     $process = Start-Process @startArgs
+    $startedUnix = Get-UnixNow
 
     $state = [PSCustomObject]@{
         Process       = $process
@@ -863,6 +875,7 @@ function Start-StreamedRun {
     $script:StreamedProcesses[$process.Id] = $state
 
     $launch = Get-LaunchResult -Process $process
+    $launch.started_unix = $startedUnix
     if ($launch.early_exit) {
         # Record it now so the first poll already reports `exited`.
         $state.ExitedAt = Get-Date

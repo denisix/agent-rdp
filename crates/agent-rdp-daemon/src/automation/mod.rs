@@ -9,7 +9,10 @@ pub mod dvc_channel;
 pub mod dvc_encode;
 mod dvc_ipc;
 
-pub use bootstrap::AutomationBootstrap;
+pub use bootstrap::{
+    launch_and_wait_worst_case, relaunch_agent, spawn_relaunch_supervisor, AutomationBootstrap,
+    RelaunchBudget, LAUNCH_ATTEMPTS,
+};
 pub use dvc_channel::{
     new_shared_dvc_state, AutomationDvc, DvcCommandReceiver, DvcCommandSender, DvcHandshake,
     DvcSendCommand, SharedDvcState, CHANNEL_NAME,
@@ -41,6 +44,15 @@ pub struct AutomationState {
     pub agent_ready: bool,
     /// Agent process ID (if known).
     pub agent_pid: Option<u32>,
+    /// Receiver for "the DVC channel closed" notifications, created by
+    /// `initialize()` and taken by `connect` to spawn the session's relaunch
+    /// supervisor.
+    pub closed_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    /// A relaunch (`automate restart` or the supervisor) is running. Two at
+    /// once would launch two agents and fight over the Run dialog.
+    pub relaunch_in_flight: bool,
+    /// Relaunches performed by the supervisor since this session connected.
+    pub relaunches: u32,
 }
 
 impl AutomationState {
@@ -58,6 +70,9 @@ impl AutomationState {
             dvc_state: None,
             agent_ready: false,
             agent_pid: None,
+            closed_rx: None,
+            relaunch_in_flight: false,
+            relaunches: 0,
         }
     }
 

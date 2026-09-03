@@ -11,6 +11,34 @@ use tokio::time::timeout;
 /// Default connect timeout in seconds.
 const CONNECT_TIMEOUT_SECS: u64 = 15;
 
+/// Transport-level failures a caller may want to react to by kind: a
+/// connection the daemon closed before answering can be retried for a
+/// read-only request; a timeout must not be (the request may be running).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcError {
+    /// The daemon closed the socket with no reply (it exited or was killed
+    /// while handling the request).
+    ConnectionClosed,
+    /// No reply within the budget.
+    Timeout(u64),
+}
+
+impl std::fmt::Display for IpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IpcError::ConnectionClosed => f.write_str(
+                "The daemon closed the connection before answering - it exited or was \
+                 killed while handling this request. Run `agent-rdp session info`; if that \
+                 reports daemon_not_running, <session>/daemon.log says why it exited, and \
+                 `agent-rdp diagnose` bundles the evidence.",
+            ),
+            IpcError::Timeout(ms) => write!(f, "Request timed out after {}ms", ms),
+        }
+    }
+}
+
+impl std::error::Error for IpcError {}
+
 /// Largest accepted response line, in bytes. Mirrors the daemon-side cap:
 /// `read_line` is otherwise unbounded, so a broken peer could grow the CLI's
 /// memory without limit. 64MB covers the largest legitimate payload (a
@@ -99,7 +127,7 @@ impl IpcClient {
         // fresh client per command, which satisfies that.
         let response = timeout(Duration::from_millis(timeout_ms), self.read_response())
             .await
-            .map_err(|_| anyhow::anyhow!("Request timed out"))??;
+            .map_err(|_| anyhow::Error::new(IpcError::Timeout(timeout_ms)))??;
 
         Ok(response)
     }
@@ -118,12 +146,7 @@ impl IpcClient {
         // releases: killed by its own watchdog 90s after spawn) or was
         // killed, taking the request with it.
         if line.trim().is_empty() {
-            anyhow::bail!(
-                "The daemon closed the connection before answering - it exited or was \
-                 killed while handling this request. Run `agent-rdp session info`; if that \
-                 reports daemon_not_running, <session>/daemon.log says why it exited, and \
-                 `agent-rdp diagnose` bundles the evidence."
-            );
+            return Err(anyhow::Error::new(IpcError::ConnectionClosed));
         }
 
         let response: Response = serde_json::from_str(line.trim())?;

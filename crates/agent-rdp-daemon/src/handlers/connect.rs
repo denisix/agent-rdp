@@ -17,7 +17,7 @@ pub async fn handle(
     automation_state: &SharedAutomationState,
     ws_handle: &SharedWsHandle,
     params: ConnectRequest,
-    disconnect_tx: tokio::sync::mpsc::Sender<u64>,
+    disconnect_tx: tokio::sync::mpsc::Sender<crate::rdp_session::DisconnectEvent>,
     clipboard_changed_rx: &ClipboardChangedRx,
     session_generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Response {
@@ -160,6 +160,22 @@ pub async fn handle(
     }
 
     info!("Connected to {} ({}x{})", host, width, height);
+
+    // The agent's keeper for this session: relaunches it if its DVC channel
+    // closes while the RDP session is still up. Bound to this generation and
+    // to this session's DVC state, so it cannot act on a later session.
+    if enable_automation {
+        let closed_rx = automation_state.lock().await.closed_rx.take();
+        if let Some(closed_rx) = closed_rx {
+            crate::automation::spawn_relaunch_supervisor(
+                closed_rx,
+                Arc::clone(rdp_session),
+                Arc::clone(automation_state),
+                Arc::clone(session_generation),
+                generation,
+            );
+        }
+    }
 
     // Load the OCR models now rather than on the first `locate` call. Model
     // loading is the slow part (disk I/O plus building the rten graphs), so

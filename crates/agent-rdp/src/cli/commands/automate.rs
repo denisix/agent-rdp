@@ -73,10 +73,12 @@ pub async fn run(
     // socket read has to outlast the command's own budget - otherwise the
     // CLI gives up on a request the daemon and agent are still working on,
     // and the caller is left not knowing whether it applied.
-    let response = client.send(&request, automate_timeout_ms(&request, timeout_ms)).await?;
+    let response = manager
+        .send_with_retry(&mut client, &request, automate_timeout_ms(&request, timeout_ms))
+        .await?;
 
     if let Some(budget) = follow_budget {
-        return follow_poll(&mut client, &request, response, budget, output, timeout_ms).await;
+        return follow_poll(&manager, &mut client, &request, response, budget, output, timeout_ms).await;
     }
 
     match (focused_shorthand, output.is_json(), response.success, &response.data) {
@@ -100,8 +102,11 @@ pub async fn run(
     Ok(())
 }
 
-/// Minimum IPC timeout for `automate restart`.
-const RESTART_MIN_TIMEOUT_MS: u64 = 120_000;
+/// Minimum IPC timeout for `automate restart`: three launch attempts with
+/// handshake windows of 25/45/75s, each extendable once while the agent is
+/// visibly starting, plus the fixed launch waits - see
+/// `launch_and_wait_worst_case` in the daemon.
+pub const RESTART_MIN_TIMEOUT_MS: u64 = 320_000;
 
 /// Default wall-clock budget for `run-poll --follow`.
 pub const DEFAULT_FOLLOW_TIMEOUT_MS: u64 = 60_000;
@@ -116,6 +121,7 @@ const FOLLOW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50
 /// Any poll error aborts the loop (it propagates as `cli_error`): retrying
 /// would race the wall-clock budget against the watchdog.
 async fn follow_poll(
+    manager: &SessionManager,
     client: &mut crate::ipc_client::IpcClient,
     request: &Request,
     first: agent_rdp_protocol::Response,
@@ -200,7 +206,7 @@ async fn follow_poll(
         }
 
         tokio::time::sleep(FOLLOW_INTERVAL).await;
-        current = client.send(request, timeout_ms).await?;
+        current = manager.send_with_retry(client, request, timeout_ms).await?;
     }
 }
 
@@ -221,6 +227,29 @@ const RUN_OPTIONS: &[&str] = &[
     "--session",
     "--stream-port",
 ];
+
+/// Arguments that PowerShell will re-parse differently from how the shell
+/// delivered them. The agent quotes each argument as a single-quoted
+/// literal, but a value like `1,2` then reaches a nested `powershell -File`
+/// as one token that PowerShell may split, join or treat as an array - a
+/// field report saw `-Param 1,2` arrive as `12`. Warn, and point at the
+/// form that survives: the whole command as one string with its own quoting.
+fn warn_argument_hazards(args: &[String]) {
+    let hazardous: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| a.contains(',') || (a.starts_with('-') && a.contains(char::is_whitespace)))
+        .collect();
+    if hazardous.is_empty() {
+        return;
+    }
+    eprintln!(
+        "Note: argument(s) {} contain ',' or embedded whitespace and may be re-parsed by \
+         PowerShell (arrays split, values joined). Prefer passing the whole command as one \
+         quoted string with its own quoting, e.g. automate run \"powershell -File x.ps1 -Param '1,2'\".",
+        hazardous.iter().map(|a| format!("'{}'", a)).collect::<Vec<_>>().join(", ")
+    );
+}
 
 fn reject_misplaced_run_options(args: &[String]) -> Result<(), String> {
     let misplaced: Vec<&str> = args
@@ -391,6 +420,7 @@ fn build_request(action: AutomateAction) -> Result<AutomateRequest, String> {
                 validate_idempotency_key(key)?;
             }
             reject_misplaced_run_options(&cmd_args)?;
+            warn_argument_hazards(&cmd_args);
             AutomateRequest::Run {
                 command,
                 args: cmd_args,

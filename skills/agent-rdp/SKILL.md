@@ -6,7 +6,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.13. Check with `agent-rdp session info` (shows
+Tested against agent-rdp 0.7.14. Check with `agent-rdp session info` (shows
 both CLI and daemon versions) — a `daemon_version_mismatch` error means an
 older daemon survived an upgrade; run `connect` again to replace it.
 
@@ -113,11 +113,14 @@ silently launching detached. If you redirect inside the command instead
 `| Out-File -Encoding utf8` before `file pull`.
 
 **"Channel unresponsive" is usually transient.** Re-probe with `automate
-status` — it reports agent uptime, last DVC round-trip and consecutive-failure
-count, so you can tell "degraded but working" from "dead". If the agent really
-is gone, `automate restart` relaunches it without touching the RDP session or
-invalidating refs. A full `disconnect`+`connect` is the last resort: it
-re-issues every ref, and combined with a retry is what corrupts state.
+status` — it reports agent uptime, last DVC round-trip, consecutive-failure
+count and `relaunches`, so you can tell "degraded but working" from "dead".
+If the agent really is gone, the daemon relaunches it by itself when the
+channel closes; `automate restart` does the same on demand without touching
+the RDP session or invalidating refs (it reports "already in progress" if the
+automatic relaunch is running). A full `disconnect`+`connect` is the last
+resort: it re-issues every ref, and combined with a retry is what corrupts
+state.
 
 **Verify with `automate get`, not OCR.** `get` returns `Value:` for text
 controls including multiline editors. OCR misreads confidently — it read
@@ -164,13 +167,46 @@ they race and reorder in the remote UI.
 process is alive but did not answer a health check within 10s — it is busy
 (a long `run --wait`, a file transfer). Wait a few seconds and retry the same
 command; do **not** reconnect, that throws away a working session. The message
-quotes the last lines of daemon.log so you can see what it is doing. Only if it
-stays unresponsive for over a minute does `connect` replace it (killing the
-stuck one first). Cold `connect` with automation can take up to ~2.5 minutes;
-its timeout now covers that. A third verdict, `daemon_version_mismatch`, means
+quotes the last lines of daemon.log so you can see what it is doing. Plain
+`connect` also refuses an unresponsive daemon (after re-pinging it for ~30s)
+rather than killing it; only if it stays unresponsive for over a minute use
+`connect --replace`, which stops it gracefully and starts a fresh one. Cold
+`connect` with automation can take up to ~5 minutes on a CPU-starved host;
+its timeout covers that. A third verdict, `daemon_version_mismatch`, means
 the daemon is from a different agent-rdp version than the CLI (it outlived an
 upgrade): run `connect` again, which replaces it — every other command refuses
 rather than silently driving old code.
+
+**Never use `connect` as a health check or a retry reflex.** `connect` is a
+session action: it tears down and rebuilds the RDP session (and, before
+0.7.14, killed a daemon that missed one ping — with a "reconnect before every
+command" habit that was the main cause of daemons dying between commands and
+of `EOF while parsing a value` on the command running at the time). Probe
+with `session info` (cheap, never destructive) or `automate status`; on
+`daemon_not_running` reconnect once; on `daemon_unresponsive` wait and retry
+the same command. Reconnect only when the session is actually gone.
+
+**`not_connected` after a transport drop names the drop.** If the RDP
+transport fell over while the daemon stayed up (seen under 100% CPU on the
+server), errors say so: "The RDP transport dropped Ns ago (<reason>); the
+daemon itself is alive" — and `session info` shows `Last transport drop`.
+That is a `connect` (the automation agent is relaunched by it), not a
+daemon problem. A read-only request that lost its connection mid-flight is
+retried once automatically; a mutating one reports the drop and is yours to
+verify.
+
+**`channel_closed` means the agent process ended — and it now comes back on
+its own.** The daemon relaunches the agent when its DVC channel closes while
+the RDP session is alive (up to 3 times per 10 minutes); `automate status`
+shows `relaunches`. The agent itself now rides out the transient read errors
+a CPU-starved host produces instead of exiting on them. If `relaunches` keeps
+climbing, something on the server is killing PowerShell — `agent-rdp
+diagnose` pulls the remote agent log.
+
+**Check a pushed file before launching it detached:** `agent-rdp file stat
+"C:\path\script.ps1"` reports existence, size, SHA-256 and age by the remote
+clock in one round trip; `run` results carry `started_unix` on the same
+clock, so a run can be matched to the files it produced.
 
 **When something fails, run `agent-rdp diagnose` before reporting it.** It
 writes a zip with `daemon.log`, `transcript.jsonl` (every request with outcome
@@ -212,6 +248,7 @@ agent-rdp connect --host <ip> -u <user> -p <pass>
 agent-rdp connect --host <ip> -u <user> --password-stdin
 agent-rdp connect --host <ip> --width 1920 --height 1080
 agent-rdp connect --host <ip> -u <user> -p <pass> --drive /local/path:DriveName
+agent-rdp connect --replace --host <ip> ... # only for a daemon that stays unresponsive > 1 min
 agent-rdp disconnect                       # there is no `session close`
 agent-rdp session list
 agent-rdp session info                     # includes daemon version vs CLI version
@@ -258,6 +295,7 @@ agent-rdp drive list                       # remote path: \\tsclient\Share
 agent-rdp file push ./local.txt "C:\Users\Admin\remote.txt"
 agent-rdp file pull "C:\Users\Admin\out.csv" ./out.csv
 agent-rdp file pull "C:\out\result.json" ./r.json --max-age 120  # stale_file if older; prints Modified/age
+agent-rdp file stat "C:\scripts\job.ps1"   # exists? size, SHA-256, age - before a detached launch
 
 # OCR / locate
 agent-rdp locate "Cancel"                  # substring match, returns coords

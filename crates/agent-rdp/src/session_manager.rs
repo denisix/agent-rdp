@@ -9,7 +9,7 @@ use agent_rdp_protocol::{Request, ResponseData};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use crate::ipc_client::IpcClient;
+use crate::ipc_client::{IpcClient, IpcError};
 
 /// Path to the daemon's log file for a session.
 ///
@@ -62,13 +62,52 @@ pub fn daemon_unresponsive_message(session: &str, pid: Option<u32>) -> String {
          not answer a health check within {}s. It is most likely busy with a long \
          operation (an `automate run --wait`, a file transfer, or a wedged remote drive \
          read). Wait a few seconds and retry this command - do NOT reconnect, that \
-         discards a working session. If retries keep failing for more than a minute, \
-         `agent-rdp connect ...` replaces the daemon (the stuck one is killed first). {}",
+         discards a working session. Only if it stays unresponsive for more than a \
+         minute, `agent-rdp connect --replace ...` stops it and starts a fresh daemon \
+         (plain `connect` refuses, so a retry loop can never kill a busy daemon). {}",
         pid_text,
         PING_TIMEOUT_MS / 1000,
         tail_text
     )
 }
+
+/// What `connect` may do to a daemon that exists but is unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacePolicy {
+    /// Report it and stop. The default: `connect` used to SIGKILL after one
+    /// unanswered ping, and a caller's reconnect loop then killed daemons
+    /// that were merely busy serving another command.
+    Refuse,
+    /// `connect --replace`: shut it down (gracefully first) and start anew.
+    Replace,
+}
+
+/// Outcome of weighing a health verdict against the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceDecision {
+    /// Use the daemon as is.
+    Use,
+    /// Refuse with `daemon_unresponsive`.
+    Refuse,
+    /// Stop it and start a fresh one.
+    Replace,
+}
+
+/// A version-mismatched daemon is always replaced (it is the wrong build by
+/// definition and `connect` is the documented fix); an unresponsive one only
+/// when the caller asked for it.
+pub fn decide_replacement(health: &DaemonHealth, policy: ReplacePolicy) -> ReplaceDecision {
+    match (health, policy) {
+        (DaemonHealth::Healthy, _) => ReplaceDecision::Use,
+        (DaemonHealth::VersionMismatch { .. }, _) => ReplaceDecision::Replace,
+        (DaemonHealth::Unresponsive, ReplacePolicy::Refuse) => ReplaceDecision::Refuse,
+        (DaemonHealth::Unresponsive, ReplacePolicy::Replace) => ReplaceDecision::Replace,
+    }
+}
+
+/// Extra pings before an unresponsive verdict is final under `Refuse`.
+const UNRESPONSIVE_CONFIRMATIONS: usize = 2;
+const UNRESPONSIVE_RETRY_GAP: Duration = Duration::from_secs(2);
 
 /// This CLI's version, compared against what the daemon reports in `Pong`.
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -310,40 +349,60 @@ impl SessionManager {
     }
 
     /// Ensure the daemon is running, starting it if necessary.
-    pub async fn ensure_daemon(&self) -> anyhow::Result<IpcClient> {
+    ///
+    /// An unresponsive daemon is re-pinged before the verdict is final, and
+    /// then either reported (`daemon_unresponsive`, as an error that
+    /// downcasts to `DaemonUnavailable`) or - only with `Replace` - stopped
+    /// and restarted. This used to SIGKILL after a single unanswered ping;
+    /// with `connect` as a caller's retry reflex, that killed daemons that
+    /// were busy serving someone else's `run --wait`, and the other caller
+    /// saw the connection drop mid-request.
+    pub async fn ensure_daemon_with(&self, policy: ReplacePolicy) -> anyhow::Result<IpcClient> {
         // Check if already running
         if let Some(pid) = self.alive_pid() {
             debug!("Daemon already running, connecting...");
             match self.connect_to_daemon().await {
-                Ok(mut client) => match Self::check_daemon_health(&mut client).await {
-                    DaemonHealth::Healthy => return Ok(client),
-                    DaemonHealth::VersionMismatch { daemon_version } => {
-                        // `connect` is about to build a new RDP session
-                        // anyway, so this is the one place replacing the
-                        // daemon costs nothing extra. Ask it to stop first:
-                        // a graceful shutdown joins its frame processor and
-                        // removes its own files.
-                        warn!(
-                            "Daemon (pid {}) is agent-rdp {}, this CLI is {} - replacing it",
-                            pid,
-                            if daemon_version.is_empty() { "<unversioned>" } else { &daemon_version },
-                            CLI_VERSION
-                        );
-                        self.stop_daemon(client, pid).await;
+                Ok(mut client) => {
+                    let mut health = Self::check_daemon_health(&mut client).await;
+                    if health == DaemonHealth::Unresponsive && policy == ReplacePolicy::Refuse {
+                        health = self.confirm_unresponsive(&mut client).await;
                     }
-                    DaemonHealth::Unresponsive => {
-                        warn!(
-                            "Daemon (pid {}) not responsive, killing it and starting a fresh one...",
-                            pid
-                        );
-                        drop(client);
-                        // Deleting its pid/socket files alone left the stuck
-                        // process running - with its RDP session - beside the
-                        // replacement, and the two fought over the remote desktop.
-                        Self::kill_process(pid);
-                        sleep(Duration::from_millis(200)).await;
+                    match decide_replacement(&health, policy) {
+                        ReplaceDecision::Use => return Ok(client),
+                        ReplaceDecision::Refuse => {
+                            let message = daemon_unresponsive_message(&self.session, Some(pid));
+                            agent_rdp_daemon::transcript::append_event(
+                                &self.session,
+                                serde_json::json!({
+                                    "cli_refused_replace": { "pid": pid, "command": "connect" }
+                                }),
+                            );
+                            return Err(anyhow::Error::new(DaemonUnavailable::Unresponsive(message)));
+                        }
+                        ReplaceDecision::Replace => {
+                            let reason = match &health {
+                                DaemonHealth::VersionMismatch { daemon_version } => format!(
+                                    "version mismatch: daemon is {}, CLI is {}",
+                                    if daemon_version.is_empty() { "<unversioned>" } else { daemon_version },
+                                    CLI_VERSION
+                                ),
+                                _ => "unresponsive and --replace was given".to_string(),
+                            };
+                            warn!("Daemon (pid {}) {} - replacing it", pid, reason);
+                            agent_rdp_daemon::transcript::append_event(
+                                &self.session,
+                                serde_json::json!({
+                                    "cli_replaced_daemon": { "pid": pid, "reason": reason, "command": "connect" }
+                                }),
+                            );
+                            // Graceful first: a shutdown joins the frame
+                            // processor and removes its own files. The kill
+                            // fallback matters - a stuck daemon left running
+                            // kept its RDP session open beside the replacement.
+                            self.stop_daemon(client, pid).await;
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     warn!("Failed to connect to daemon: {}", e);
                 }
@@ -433,6 +492,61 @@ impl SessionManager {
         }
     }
 
+    /// Re-ping a daemon that missed one health check. A daemon busy with a
+    /// long synchronous operation answers the next ping; one that is truly
+    /// wedged does not, and that is the only case worth reporting as such.
+    async fn confirm_unresponsive(&self, client: &mut IpcClient) -> DaemonHealth {
+        for attempt in 1..=UNRESPONSIVE_CONFIRMATIONS {
+            sleep(UNRESPONSIVE_RETRY_GAP).await;
+            debug!("Re-pinging daemon ({}/{})", attempt, UNRESPONSIVE_CONFIRMATIONS);
+            // A timed-out ping leaves the stream desynchronized; use a fresh
+            // connection for each confirmation.
+            let Ok(mut fresh) = self.connect_to_daemon().await else {
+                return DaemonHealth::Unresponsive;
+            };
+            let health = Self::check_daemon_health(&mut fresh).await;
+            if health != DaemonHealth::Unresponsive {
+                *client = fresh;
+                return health;
+            }
+        }
+        DaemonHealth::Unresponsive
+    }
+
+    /// Send a request, retrying once on a dropped connection if - and only
+    /// if - the request is read-only. A mutating request whose connection
+    /// dropped is exactly the case where "did it apply?" is open, and that
+    /// error must reach the caller.
+    pub async fn send_with_retry(
+        &self,
+        client: &mut IpcClient,
+        request: &Request,
+        timeout_ms: u64,
+    ) -> anyhow::Result<agent_rdp_protocol::Response> {
+        match client.send(request, timeout_ms).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                let closed = e.downcast_ref::<IpcError>() == Some(&IpcError::ConnectionClosed);
+                if !(closed && request.is_read_only()) {
+                    return Err(e);
+                }
+                warn!("Daemon closed the connection; retrying the read-only request once");
+                agent_rdp_daemon::transcript::append_event(
+                    &self.session,
+                    serde_json::json!({ "ipc_retry": { "reason": "connection_closed" } }),
+                );
+                let mut fresh = match self.connect_to_daemon().await {
+                    Ok(fresh) => fresh,
+                    // The daemon really is gone: the original error says so.
+                    Err(_) => return Err(e),
+                };
+                let response = fresh.send(request, timeout_ms).await?;
+                *client = fresh;
+                Ok(response)
+            }
+        }
+    }
+
     /// Stop a daemon we can talk to, then make sure it is gone.
     ///
     /// Graceful first (`Shutdown` lets it join its frame processor and remove
@@ -483,6 +597,10 @@ impl SessionManager {
                 .open(&log_path)
         };
 
+        // A panic in the daemon is otherwise a one-line message with no
+        // frames in daemon.log; the backtrace is what makes it reportable.
+        let backtrace = std::env::var("RUST_BACKTRACE").unwrap_or_else(|_| "1".to_string());
+
         // Fork daemon process
         #[cfg(unix)]
         {
@@ -494,6 +612,7 @@ impl SessionManager {
                 .arg(&self.session)
                 .arg("session")
                 .arg("daemon") // Internal command to run as daemon
+                .env("RUST_BACKTRACE", &backtrace)
                 .stdin(Stdio::null())
                 .stdout(open_log().map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
                 .stderr(open_log().map(Stdio::from).unwrap_or_else(|_| Stdio::null()));
@@ -521,6 +640,7 @@ impl SessionManager {
                 .arg(&self.session)
                 .arg("session")
                 .arg("daemon")
+                .env("RUST_BACKTRACE", &backtrace)
                 .stdin(Stdio::null())
                 .stdout(open_log().map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
                 .stderr(open_log().map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
@@ -590,6 +710,44 @@ impl SessionManager {
         }
 
         sessions
+    }
+}
+
+#[cfg(test)]
+mod replace_policy_tests {
+    use super::*;
+
+    #[test]
+    fn healthy_daemon_is_used_under_any_policy() {
+        assert_eq!(decide_replacement(&DaemonHealth::Healthy, ReplacePolicy::Refuse), ReplaceDecision::Use);
+        assert_eq!(decide_replacement(&DaemonHealth::Healthy, ReplacePolicy::Replace), ReplaceDecision::Use);
+    }
+
+    #[test]
+    fn unresponsive_daemon_is_refused_by_default() {
+        // The regression: `connect` used to kill after one missed ping.
+        assert_eq!(
+            decide_replacement(&DaemonHealth::Unresponsive, ReplacePolicy::Refuse),
+            ReplaceDecision::Refuse
+        );
+        assert_eq!(
+            decide_replacement(&DaemonHealth::Unresponsive, ReplacePolicy::Replace),
+            ReplaceDecision::Replace
+        );
+    }
+
+    #[test]
+    fn version_mismatch_is_replaced_regardless() {
+        let mismatch = DaemonHealth::VersionMismatch { daemon_version: "0.7.6".into() };
+        assert_eq!(decide_replacement(&mismatch, ReplacePolicy::Refuse), ReplaceDecision::Replace);
+        assert_eq!(decide_replacement(&mismatch, ReplacePolicy::Replace), ReplaceDecision::Replace);
+    }
+
+    #[test]
+    fn unresponsive_message_points_at_replace_not_plain_connect() {
+        let msg = daemon_unresponsive_message("default", Some(7));
+        assert!(msg.contains("connect --replace"));
+        assert!(msg.contains("plain `connect` refuses"));
     }
 }
 

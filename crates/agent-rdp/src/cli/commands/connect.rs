@@ -7,7 +7,7 @@ use agent_rdp_protocol::{ConnectRequest, DriveMapping, Request};
 
 use crate::cli::ConnectArgs;
 use crate::output::Output;
-use crate::session_manager::SessionManager;
+use crate::session_manager::{DaemonUnavailable, ReplacePolicy, SessionManager};
 
 pub async fn run(
     session: &str,
@@ -24,7 +24,19 @@ pub async fn run(
     let drives = parse_drive_mappings(&args.drives, output)?;
 
     let manager = SessionManager::new(session.to_string());
-    let mut client = manager.ensure_daemon().await?;
+    let policy = if args.replace { ReplacePolicy::Replace } else { ReplacePolicy::Refuse };
+    let mut client = match manager.ensure_daemon_with(policy).await {
+        Ok(client) => client,
+        Err(e) => {
+            // An unresponsive daemon is a verdict with its own code, not a
+            // generic failure - the caller must be able to tell it apart.
+            if let Some(unavailable) = e.downcast_ref::<DaemonUnavailable>() {
+                output.print_error(unavailable.code(), unavailable.message());
+                std::process::exit(1);
+            }
+            return Err(e);
+        }
+    };
 
     let request = Request::Connect(ConnectRequest {
         host: args.host,
