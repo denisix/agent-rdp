@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.14](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.13...agent-rdp-rust-v0.7.14) (2026-09-03)
+
+
+### Bug Fixes
+
+* stop connect from killing busy daemons, keep the automation agent alive under load ([3cc2a6f](https://github.com/denisix/agent-rdp/commit/3cc2a6f546a31c869446b657069951c6f0916185))
+
 ## [0.7.13](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.12...agent-rdp-rust-v0.7.13) (2026-09-02)
 
 
