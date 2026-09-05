@@ -42,30 +42,116 @@ pub async fn handle_restart(
         }
     }
 
+    // A manual restart overrides the supervisor's give-up: the operator
+    // decided the host is worth another try. Not while a launch is already
+    // running, though - that one's outcome must keep its own bookkeeping.
+    {
+        let mut state = automation_state.lock().await;
+        if state.relaunch_in_flight {
+            return Response::error(
+                ErrorCode::AutomationError,
+                "Automation agent restart refused: a launch of the agent is already in progress \
+                 (`automate status` shows when it finishes)",
+            );
+        }
+        state.launch_failures = 0;
+        state.next_retry_at = None;
+    }
+
     // Shared with the relaunch supervisor; serialized by `relaunch_in_flight`
     // so a manual restart and an automatic one never drive the Run dialog
     // at the same time.
     match crate::automation::relaunch_agent(rdp_session, automation_state).await {
         Ok(()) => {
-            let state = automation_state.lock().await;
-            let dvc_ipc = state.dvc_ipc.as_ref();
-            Response::success(ResponseData::AutomationStatus(AutomationStatus {
-                agent_running: true,
-                agent_pid: state.agent_pid,
-                capabilities: dvc_ipc.map(|ipc| ipc.capabilities()).unwrap_or_default(),
-                version: dvc_ipc.and_then(|ipc| ipc.agent_version()),
-                log_path: None,
-                relaunches: state.relaunches,
-                uptime_secs: dvc_ipc.and_then(|ipc| ipc.agent_uptime_secs()),
-                last_rtt_ms: None,
-                consecutive_failures: 0,
-            }))
+            let (ipc, fallback) = {
+                let state = automation_state.lock().await;
+                let dvc_ipc = state.dvc_ipc.as_ref();
+                let mut fallback = AutomationStatus {
+                    agent_running: true,
+                    agent_pid: state.agent_pid,
+                    capabilities: dvc_ipc.map(|ipc| ipc.capabilities()).unwrap_or_default(),
+                    version: dvc_ipc.and_then(|ipc| ipc.agent_version()),
+                    log_path: None,
+                    relaunches: 0,
+                    uptime_secs: dvc_ipc.and_then(|ipc| ipc.agent_uptime_secs()),
+                    last_rtt_ms: None,
+                    consecutive_failures: 0,
+                    last_error: None,
+                    next_retry_secs: None,
+                };
+                fill_daemon_fields(&mut fallback, &state);
+                (dvc_ipc.cloned(), fallback)
+            };
+            // The real thing (log path, RTT) from the agent that just came
+            // up; the handshake-only view if it does not answer in time.
+            let mut status = match ipc {
+                Some(ipc) => live_status(&ipc).await.unwrap_or(fallback),
+                None => fallback,
+            };
+            fill_daemon_fields(&mut status, &*automation_state.lock().await);
+            Response::success(ResponseData::AutomationStatus(status))
         }
         Err(reason) => Response::error(
             ErrorCode::AutomationError,
             format!("Automation agent restart failed: {}", reason),
         ),
     }
+}
+
+/// `automate status` while the agent cannot be asked: what the daemon
+/// knows on its own. This is the health check that must keep working when
+/// the agent is down - it is how a caller learns *why* and whether a retry
+/// is scheduled.
+fn offline_status(state: &crate::automation::AutomationState) -> Response {
+    let last_error = match (&state.last_error, state.relaunch_in_flight, state.dvc_ipc.is_some()) {
+        (Some(err), _, _) => Some(err.clone()),
+        (None, true, _) => Some("a launch of the automation agent is in progress".to_string()),
+        (None, false, false) => Some(
+            "automation DVC IPC not initialized (the automation directory or drive mapping failed at connect)"
+                .to_string(),
+        ),
+        (None, false, true) => Some(
+            "automation agent not ready (it never completed its handshake this session)".to_string(),
+        ),
+    };
+    Response::success(ResponseData::AutomationStatus(AutomationStatus {
+        agent_running: false,
+        agent_pid: None,
+        capabilities: Vec::new(),
+        version: None,
+        log_path: None,
+        relaunches: state.relaunches,
+        uptime_secs: None,
+        last_rtt_ms: None,
+        consecutive_failures: state
+            .dvc_ipc
+            .as_ref()
+            .map(|ipc| ipc.consecutive_failures())
+            .unwrap_or(0),
+        last_error,
+        next_retry_secs: state.next_retry_secs(std::time::Instant::now()),
+    }))
+}
+
+/// The status fields only the daemon knows: relaunch count, the last
+/// launch failure, and when the supervisor tries next.
+fn fill_daemon_fields(status: &mut AutomationStatus, state: &crate::automation::AutomationState) {
+    status.relaunches = state.relaunches;
+    status.last_error = state.last_error.clone();
+    status.next_retry_secs = state.next_retry_secs(std::time::Instant::now());
+}
+
+/// A `status` round trip to the agent, with the daemon's DVC bookkeeping
+/// folded in.
+async fn live_status(ipc: &crate::automation::DvcIpc) -> anyhow::Result<AutomationStatus> {
+    let data = ipc
+        .send_request_with_timeout(&AutomateRequest::Status, std::time::Duration::from_secs(10))
+        .await?;
+    let mut status = parse_status_response(data)?;
+    status.uptime_secs = ipc.agent_uptime_secs();
+    status.last_rtt_ms = ipc.last_rtt_ms();
+    status.consecutive_failures = ipc.consecutive_failures();
+    Ok(status)
 }
 
 /// Handle an automation request.
@@ -91,6 +177,13 @@ pub async fn handle(
         );
     }
 
+    // `status` is the health check and must answer while the agent is
+    // down; everything else needs the agent.
+    let agent_reachable = state.dvc_ipc.as_ref().map(|ipc| ipc.is_ready()).unwrap_or(false);
+    if matches!(request, AutomateRequest::Status) && !agent_reachable {
+        return offline_status(&state);
+    }
+
     // Check if DVC IPC is ready (handshake received)
     let dvc_ipc = match state.dvc_ipc.as_ref() {
         Some(ipc) => ipc,
@@ -103,9 +196,21 @@ pub async fn handle(
     };
 
     if !dvc_ipc.is_ready() {
+        let detail = match (&state.last_error, state.relaunch_in_flight, state.next_retry_at) {
+            (_, true, _) => "a launch of the agent is in progress".to_string(),
+            (Some(err), _, Some(_)) => format!(
+                "last launch failed: {}; the daemon retries once the session is idle (`automate status`)",
+                err
+            ),
+            (Some(err), _, None) => format!("last launch failed: {}", err),
+            (None, _, _) => "it may still be starting or its launch failed".to_string(),
+        };
         return Response::error(
             ErrorCode::AutomationError,
-            "Automation agent not ready. Agent may still be starting or failed to launch via DVC",
+            format!(
+                "Automation agent not ready: {}. `automate restart` relaunches it now",
+                detail
+            ),
         );
     }
 
@@ -120,7 +225,7 @@ pub async fn handle(
         Ok(data) => {
             let mut response = convert_response(request, data, &ipc);
             if let Some(ResponseData::AutomationStatus(ref mut status)) = response.data {
-                status.relaunches = automation_state.lock().await.relaunches;
+                fill_daemon_fields(status, &*automation_state.lock().await);
             }
             response
         }
@@ -646,6 +751,10 @@ fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
     let replayed = data["replayed"].as_bool().unwrap_or(false);
     let early_exit = data["early_exit"].as_bool().unwrap_or(false);
     let started_unix = data["started_unix"].as_u64();
+    let finished_unix = data["finished_unix"].as_u64();
+    let command_line = data["command_line"].as_str().map(|s| s.to_string());
+    let replayed_at_unix = data["replayed_at_unix"].as_u64();
+    let streamed = data["streamed"].as_bool().unwrap_or(false);
 
     Ok(RunResult {
         exit_code,
@@ -655,6 +764,10 @@ fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
         replayed,
         early_exit,
         started_unix,
+        finished_unix,
+        command_line,
+        replayed_at_unix,
+        streamed,
     })
 }
 
@@ -667,6 +780,7 @@ fn parse_run_poll_response(data: serde_json::Value) -> anyhow::Result<RunPollRes
     let stderr_chunk = clean_clixml(data["stderr_chunk"].as_str().unwrap_or(""));
     let exited = data["exited"].as_bool().unwrap_or(false);
     let exit_code = data["exit_code"].as_i64().map(|v| v as i32);
+    let finished_unix = data["finished_unix"].as_u64();
 
     Ok(RunPollResult {
         pid,
@@ -674,6 +788,7 @@ fn parse_run_poll_response(data: serde_json::Value) -> anyhow::Result<RunPollRes
         stderr_chunk,
         exited,
         exit_code,
+        finished_unix,
     })
 }
 
@@ -885,6 +1000,8 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
         uptime_secs: None,
         last_rtt_ms: None,
         consecutive_failures: 0,
+        last_error: None,
+        next_retry_secs: None,
     })
 }
 
@@ -910,4 +1027,116 @@ fn parse_click_response(data: serde_json::Value) -> anyhow::Result<ClickResult> 
         x,
         y,
     })
+}
+
+#[cfg(test)]
+mod status_and_run_field_tests {
+    use super::*;
+    use crate::automation::AutomationState;
+
+    fn fresh_state() -> AutomationState {
+        AutomationState::new(std::env::temp_dir().join("agent-rdp-status-test"))
+    }
+
+    fn status_of(response: Response) -> AutomationStatus {
+        match response.data {
+            Some(ResponseData::AutomationStatus(status)) => status,
+            other => panic!("expected AutomationStatus, got {:?}", other),
+        }
+    }
+
+    /// `automate status` with the agent down is a success with the
+    /// daemon's own view, not "agent not ready" - it is the health check.
+    #[test]
+    fn offline_status_reports_why_the_agent_is_down() {
+        let mut state = fresh_state();
+        state.enabled = true;
+        state.relaunches = 2;
+        state.last_error = Some("handshake timed out".into());
+        state.next_retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(90));
+
+        let response = offline_status(&state);
+        assert!(response.success);
+        let status = status_of(response);
+        assert!(!status.agent_running);
+        assert_eq!(status.relaunches, 2);
+        assert_eq!(status.last_error.as_deref(), Some("handshake timed out"));
+        let secs = status.next_retry_secs.unwrap();
+        assert!((85..=90).contains(&secs), "{}", secs);
+    }
+
+    #[test]
+    fn offline_status_explains_a_launch_in_progress_and_a_never_started_agent() {
+        let mut state = fresh_state();
+        state.relaunch_in_flight = true;
+        assert!(status_of(offline_status(&state))
+            .last_error
+            .unwrap()
+            .contains("in progress"));
+
+        // With the DVC IPC in place but no handshake yet.
+        let mut state = fresh_state();
+        state.dvc_ipc = Some(crate::automation::DvcIpc::new(crate::automation::new_shared_dvc_state()));
+        let status = status_of(offline_status(&state));
+        assert!(status.last_error.unwrap().contains("never completed its handshake"));
+        assert_eq!(status.next_retry_secs, None);
+    }
+
+    #[test]
+    fn run_response_carries_the_new_fields() {
+        let data = serde_json::json!({
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "boom",
+            "started_unix": 1700000000u64,
+            "finished_unix": 1700000003u64,
+            "command_line": "Get-Item 'a,b'",
+            "replayed": true,
+            "replayed_at_unix": 1699999000u64
+        });
+        let result = parse_run_response(data).unwrap();
+        assert_eq!(result.exit_code, Some(1));
+        assert_eq!(result.stdout.as_deref(), Some(""), "empty stdout stays Some, distinct from detached");
+        assert_eq!(result.finished_unix, Some(1700000003));
+        assert_eq!(result.command_line.as_deref(), Some("Get-Item 'a,b'"));
+        assert!(result.replayed);
+        assert_eq!(result.replayed_at_unix, Some(1699999000));
+
+        // A detached launch: no stdout key at all.
+        let detached = parse_run_response(serde_json::json!({ "pid": 42, "started_unix": 1 })).unwrap();
+        assert_eq!(detached.stdout, None);
+        assert_eq!(detached.finished_unix, None);
+        assert_eq!(detached.command_line, None);
+    }
+
+    #[test]
+    fn run_poll_response_carries_finished_unix_once_exited() {
+        let running = parse_run_poll_response(serde_json::json!({
+            "pid": 7, "stdout_chunk": "a", "stderr_chunk": "", "exited": false
+        }))
+        .unwrap();
+        assert_eq!(running.finished_unix, None);
+        let done = parse_run_poll_response(serde_json::json!({
+            "pid": 7, "stdout_chunk": "", "stderr_chunk": "", "exited": true,
+            "exit_code": 0, "finished_unix": 1700000009u64
+        }))
+        .unwrap();
+        assert_eq!(done.finished_unix, Some(1700000009));
+    }
+}
+
+#[cfg(test)]
+mod offline_status_without_ipc_tests {
+    use super::*;
+    use crate::automation::AutomationState;
+
+    #[test]
+    fn missing_dvc_ipc_is_named_as_such() {
+        let mut state = AutomationState::new(std::env::temp_dir().join("agent-rdp-status-test-2"));
+        state.enabled = true;
+        let response = offline_status(&state);
+        let Some(ResponseData::AutomationStatus(status)) = response.data else { panic!() };
+        assert!(status.last_error.unwrap().contains("DVC IPC not initialized"));
+        assert_eq!(status.consecutive_failures, 0);
+    }
 }

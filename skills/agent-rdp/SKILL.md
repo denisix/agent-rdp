@@ -6,9 +6,10 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.14. Check with `agent-rdp session info` (shows
-both CLI and daemon versions) — a `daemon_version_mismatch` error means an
-older daemon survived an upgrade; run `connect` again to replace it.
+Tested against agent-rdp 0.7.15. Check with `agent-rdp session info` (shows
+both CLI and daemon versions, also in `--json` as `cli_version` /
+`daemon_version`) — a `daemon_version_mismatch` error means an older daemon
+survived an upgrade; run `connect` again to replace it.
 
 If `agent-rdp` is not on PATH, install it first — expected on a fresh machine,
 needs no confirmation:
@@ -33,8 +34,12 @@ guessing.
 
 After connecting, `agent-rdp wait 3000` before the first input: immediate input
 can be dropped while the desktop stabilizes. `connect --enable-win-automation`
-already waits for the agent (~25s), and says so explicitly if it fails to
-start — reconnect rather than polling `automate status`.
+already waits for the agent (~25s, up to ~5 minutes on a starved host) and
+says so explicitly if it fails to start. Do **not** reconnect for that: the
+daemon keeps retrying the launch in the background (with backoff, only once
+nobody has sent input for 2 minutes), and `automate status` works while the
+agent is down — it shows `last_error` and `next_retry_secs`. `automate
+restart` forces a retry immediately.
 
 ## Reliability rules (learned from real failures)
 
@@ -51,9 +56,18 @@ so in the error text; those are always safe to retry.
 per logical step (`--idempotency-key step-07`); a retry that reuses it after
 `indeterminate`, an IPC timeout or `daemon_unresponsive` returns the recorded
 result (`replayed: true`) instead of executing again — this is what stops
-`Add-Content` from being applied twice. The journal is per agent process (64
-entries) and empty after `connect`, so after a reconnect verify the side effect
-(`Test-Path`, file length) rather than retrying.
+`Add-Content` from being applied twice. Keyed results are journaled on the
+remote host (`%LOCALAPPDATA%\agent-rdp\journal`, 7 days / 256 keys, per
+Windows account), so the replay survives a reconnect, an agent relaunch and a
+logoff; a replayed result says when it originally ran (`replayed_at_unix`),
+and a replayed *error* says so in its message. A retry with a longer
+`--process-timeout` still replays (the budget is not part of the key) — so a
+keyed run that *timed out* replays the timeout too: the process did start and
+may have had effects; verify, then use a new key. A parse error or a launch
+that never started is not persisted and a retry executes. The
+journal is empty again only on a different host or profile (RDS farm,
+temporary profile) — verify the side effect (`file stat`, `Test-Path`) there
+rather than retrying.
 
 **`run` exit codes are trustworthy; still verify side effects.** The child
 runs with `$ErrorActionPreference='Stop'` inside an agent-added `try/catch`,
@@ -97,6 +111,52 @@ agent-rdp automate run "long-build.cmd" --stream                     # returns a
 agent-rdp automate run-poll <pid> --follow --follow-timeout 600000   # collect until exit (or 10 min)
 agent-rdp automate run-poll <pid>                                    # single poll; repeat until exited
 ```
+
+**Inline `run` quoting: where each layer stops.** Three layers touch the
+command text, and the reply tells you what survived them (`command_line` in
+`--json`, and on stderr whenever the exit code is non-zero):
+
+1. *Your local shell.* In bash/zsh double quotes, `$_`, `$var` and backticks
+   are expanded **before** agent-rdp sees the text — `"... | ForEach-Object {
+   $_.Line.Trim() }"` arrives as `{ .Line.Trim() }`. Use single quotes
+   locally, or `--` is not enough: the expansion already happened. The CLI
+   prints a note when the text looks like that.
+2. *Argument quoting.* Everything after the command is sent as a separate
+   argument and appended as a single-quoted PowerShell literal: `,`, `$` and
+   wildcards in an argument are literal, and there is no way to pass
+   PowerShell syntax through arguments. Put the syntax in the command string
+   (`automate run "powershell -File x.ps1 -Param '1,2'"`).
+3. *The agent's parser.* The command string is parsed as Windows PowerShell
+   5.1 source before the wrapper is added. A text that does not parse is
+   refused with `parse_error: … line N, column M: …` **without launching
+   anything**, and the message ends with `Command line as executed by the
+   agent:` — the exact text, so you can see which layer changed it. (With
+   `--shell pwsh.exe` the 5.1 parser is skipped and pwsh reports its own
+   errors.)
+
+Anything with pipelines, `$_`, here-strings or more than one line: `file
+push` a `.ps1` and run it with `-File`. That path has no quoting layer at all.
+
+**Under CPU saturation** (seen at 100% CPU with 7 parallel 1C sessions on 2
+vCPU): the transport and the agent stay up since 0.7.14, but anything that
+*spawns a process* can take 30s+ instead of 1s. Give such commands
+`--process-timeout 60000` or more (the IPC and watchdog budgets follow it);
+a process that overruns is killed and reported as `command_failed: Process
+timed out`, with the command line. Health check with `automate status
+--json`: `last_rtt_ms` (round trip of the last request; hundreds of ms under
+load is normal), `consecutive_failures` (non-zero = degraded), `relaunches`
+(the agent died and was brought back), `last_error` / `next_retry_secs`
+(the agent is down and when the daemon tries again). Screenshots carry
+`frame_age_ms`; a frame 30-60s old with a live channel is the server being
+slow to paint, not a dead session.
+
+**Freshness.** Every waited `run` reports `started_unix` and
+`finished_unix` (remote clock), `file stat`/`file pull` report `modified_unix`
+and `age_secs` on the same clock, and `file pull --max-age` refuses a stale
+file. An empty waited stdout is printed as `(no stdout captured: the command
+printed nothing)`; a detached launch says `(detached: output is not
+captured)`. In JSON, `stdout: ""` is "ran, printed nothing" and a missing
+`stdout` is "not captured".
 
 This is the detached mode — use it instead of hand-rolled WMI
 `Win32_Process.Create` + out-file polling. `--follow` prints output as it
@@ -195,18 +255,26 @@ daemon problem. A read-only request that lost its connection mid-flight is
 retried once automatically; a mutating one reports the drop and is yours to
 verify.
 
-**`channel_closed` means the agent process ended — and it now comes back on
-its own.** The daemon relaunches the agent when its DVC channel closes while
-the RDP session is alive (up to 3 times per 10 minutes); `automate status`
-shows `relaunches`. The agent itself now rides out the transient read errors
-a CPU-starved host produces instead of exiting on them. If `relaunches` keeps
-climbing, something on the server is killing PowerShell — `agent-rdp
-diagnose` pulls the remote agent log.
+**`channel_closed` means the agent process ended — and it comes back on its
+own.** The daemon relaunches the agent when its DVC channel closes while the
+RDP session is alive, and keeps retrying a launch that failed (60s, 120s,
+240s, then every 5 minutes; at most 3 relaunch attempts per 10 minutes, each
+up to 3 typed launches; gives up after 6 consecutive failures until `automate
+restart`). Because a launch types
+Win+R and pastes into the session, an automatic one waits until no input has
+been sent for 2 minutes — so it never interrupts a `keyboard`/`mouse`
+sequence you are driving. `automate status` shows `relaunches`, `last_error`
+and `next_retry_secs` (and works while the agent is down). Set
+`AGENT_RDP_NO_AUTO_RELAUNCH=1` before `connect` to turn automatic relaunches
+off. The agent itself rides out the transient read errors a CPU-starved host
+produces instead of exiting on them. If `relaunches` keeps climbing,
+something on the server is killing PowerShell — `agent-rdp diagnose` pulls
+the remote agent log.
 
 **Check a pushed file before launching it detached:** `agent-rdp file stat
 "C:\path\script.ps1"` reports existence, size, SHA-256 and age by the remote
-clock in one round trip; `run` results carry `started_unix` on the same
-clock, so a run can be matched to the files it produced.
+clock in one round trip; `run` results carry `started_unix`/`finished_unix`
+on the same clock, so a run can be matched to the files it produced.
 
 **When something fails, run `agent-rdp diagnose` before reporting it.** It
 writes a zip with `daemon.log`, `transcript.jsonl` (every request with outcome
@@ -351,22 +419,65 @@ agent-rdp automate window list
 agent-rdp automate window focus "~*Notepad*"
 agent-rdp automate window maximize|minimize|restore|close
 agent-rdp automate wait-for <selector> --timeout 5000 --state visible
-agent-rdp automate status                  # uptime, last RTT, consecutive failures
-agent-rdp automate restart                 # relaunch agent without an RDP reconnect
+agent-rdp automate status                  # works while the agent is down: last_error, next_retry_secs
+agent-rdp automate restart                 # relaunch agent now, without an RDP reconnect
 
 # Run commands/apps (preferred way to open apps)
 agent-rdp automate run "notepad.exe"
 agent-rdp automate run "Get-Process" --wait --process-timeout 5000
-agent-rdp automate run "$PSVersionTable" --wait --shell pwsh.exe   # non-default shell
+agent-rdp automate run '$PSVersionTable' --wait --shell pwsh.exe   # single quotes locally: $ survives
 agent-rdp automate run "ping -t 127.0.0.1" --stream                # returns pid
 agent-rdp automate run-poll <pid>                                  # drain incrementally
 agent-rdp automate run "Add-Content C:\l.txt x" --wait --idempotency-key step-07
-                                          # same key on retry -> replayed, not re-run
+                                          # same key on retry -> replayed, not re-run (survives reconnect)
+# every waited run: started_unix/finished_unix (remote clock), command_line (what the agent ran)
 ```
 
 Snapshots include `disabled` on interactive elements — a free pre-action state
 check. A disabled "Отменить проведение" tells you the document isn't posted
 before you click anything.
+
+**1C Enterprise (Taxi interface) — what UIA exposes.** Only named form
+`Pane` titles plus the toolbar and menus are exported; table rows, form
+fields and form buttons are not. `automate click` on such elements throws
+`NotImplementedException` (no InvokePattern) — click by coordinates from the
+snapshot's `bounds` instead (`agent-rdp mouse click x y`, or `click-at`).
+Double-click a list row to open the document; **Enter in a list means
+"Create"**, not "Open". `Ctrl+F4` does not close a list form — use the ✕ in
+its title bar. Side panels ("Функции"): Up/Down + Enter is not deterministic;
+prefer typing into the search field. A `NullReferenceException` from
+`System.Management.Automation` in COM calls is the binder, not 1C (see above).
+
+**Foreground lock from a background child.** A process started by `automate
+run` is not the foreground process, so `SetForegroundWindow` from it fails
+silently (Windows' foreground lock). The ladder that works, ready to paste
+into a pushed script:
+
+```powershell
+$sig = @'
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+'@
+$U = Add-Type -MemberDefinition $sig -Name Win -Namespace Fg -PassThru
+function Set-Foreground([IntPtr]$hwnd) {
+    [System.Windows.Forms.SendKeys]::SendWait('%')        # 1. the Alt trick unlocks the foreground
+    if ($U::SetForegroundWindow($hwnd)) { return $true }
+    $fg = $U::GetForegroundWindow()                        # 2. attach to the foreground thread's input
+    $fgT = $U::GetWindowThreadProcessId($fg, [IntPtr]::Zero); $me = $U::GetCurrentThreadId()
+    [void]$U::AttachThreadInput($me, $fgT, $true)
+    try { $ok = $U::SetForegroundWindow($hwnd) } finally { [void]$U::AttachThreadInput($me, $fgT, $false) }
+    if ($ok) { return $true }
+    [void]$U::ShowWindow($hwnd, 6); [void]$U::ShowWindow($hwnd, 9)   # 3. minimize/restore forces it
+    return $U::SetForegroundWindow($hwnd)
+}
+```
+
+`automate window focus <selector>` does the equivalent from the agent, which
+is usually simpler when the window is visible to UIA.
 
 ## JSON output
 

@@ -38,4 +38,30 @@ early_exit: boolean,
  * the same clock `file pull`/`file stat` report modification times in,
  * so a run can be tied to the files it produced.
  */
-started_unix?: number, };
+started_unix?: number, 
+/**
+ * When the process exited, in Unix seconds by the remote clock (waited
+ * runs only). The freshness marker for `stdout`: a result whose
+ * `finished_unix` is older than the caller's own step started is a
+ * replay or a stale read, not this run's output.
+ */
+finished_unix?: number, 
+/**
+ * The exact PowerShell source the agent handed to the child shell:
+ * the command text followed by each argument as a single-quoted
+ * literal. This is what a parse error refers to - compare it with what
+ * you typed to see which layer (your local shell, the argument
+ * quoting) changed it.
+ */
+command_line?: string, 
+/**
+ * When `replayed`: the remote-clock time the original execution was
+ * recorded, in Unix seconds.
+ */
+replayed_at_unix?: number, 
+/**
+ * The process was started with `stream: true`: its output is being
+ * captured for `RunPoll`, as opposed to a plain detached launch where
+ * nothing is captured.
+ */
+streamed: boolean, };

@@ -552,6 +552,12 @@ public class Win32 {
 function Invoke-Run {
     param($Params)
 
+    # Whether a child process was actually started by this run. The
+    # dispatch loop persists a keyed *failure* only if it was - a parse
+    # error or a Process.Start failure had no side effect and must not be
+    # replayed for a week. Reset first, before anything here can throw.
+    $script:LastRunLaunched = $false
+
     $command = $Params.command
     # Quote each argument as a PowerShell single-quoted string literal (doubling
     # embedded single quotes) so args containing spaces or quotes survive as one
@@ -572,45 +578,82 @@ function Invoke-Run {
     # and even backtick-escaping spaces still failed on literal parentheses like
     # `(x86)`. -EncodedCommand removes the command-line quoting layer entirely.
     $userScript = if ($commandArgs) { "$command $commandArgs" } else { $command }
-    $script = New-ChildScript -UserScript $userScript
+
+    # Everything from here on reports the exact text the child was given.
+    # A quoting accident (the caller's local shell expanding `$_`, an
+    # argument re-tokenised on the way in) otherwise surfaces as a parse
+    # error quoting text the caller never typed, with no way to see what
+    # actually arrived.
+    try {
+        $result = Start-RunChild -UserScript $userScript -Shell $shell -Wait $wait -Hidden $hidden -TimeoutMs $timeoutMs -Stream $stream
+        $result.command_line = $userScript
+        return $result
+    } catch {
+        throw "$($_.Exception.Message)`nCommand line as executed by the agent: $userScript"
+    }
+}
+
+function Start-RunChild {
+    param(
+        [string]$UserScript,
+        [string]$Shell,
+        [bool]$Wait,
+        [bool]$Hidden,
+        [int]$TimeoutMs,
+        [bool]$Stream
+    )
+
+    $shape = Get-ChildScriptShape -UserScript $UserScript
+    # The agent's parser is the child's parser when the child is Windows
+    # PowerShell, so a script that does not parse here will not parse there
+    # either: refuse it now, with the parser's own positions, instead of
+    # launching a child whose only output is a CLIXML-wrapped parse error.
+    # A different shell (pwsh 7 syntax the 5.1 parser rejects) is launched
+    # unwrapped as before and reports its own errors.
+    if ($shape.parse_errors.Count -gt 0 -and (Test-DefaultShell -Shell $Shell)) {
+        throw "parse_error: the command does not parse as Windows PowerShell: $($shape.parse_errors -join '; ')"
+    }
+
+    $script = New-ChildScript -UserScript $UserScript -Shape $shape
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
 
     # `--wait` wins over `--stream`, as documented. The reverse order returned
     # only a pid for `--wait --stream`, and every byte of output went to files
     # the caller was never told to poll.
-    if ($stream -and -not $wait) {
-        return Start-StreamedRun -Shell $shell -EncodedCommand $encodedCommand -Hidden $hidden
+    if ($Stream -and -not $Wait) {
+        return Start-StreamedRun -Shell $Shell -EncodedCommand $encodedCommand -Hidden $Hidden
     }
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $shell
+    $startInfo.FileName = $Shell
     $startInfo.Arguments = "-NoProfile -EncodedCommand $encodedCommand"
     $startInfo.WorkingDirectory = $env:USERPROFILE
     $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardOutput = $wait
-    $startInfo.RedirectStandardError = $wait
-    $startInfo.CreateNoWindow = $hidden
+    $startInfo.RedirectStandardOutput = $Wait
+    $startInfo.RedirectStandardError = $Wait
+    $startInfo.CreateNoWindow = $Hidden
     # Decode the child's output as UTF-8. Left unset, .NET decodes using the
     # console's OEM codepage (cp866 on a Russian-locale host), which is where
     # Cyrillic output came back as mojibake regardless of what the child sent.
-    if ($wait) {
+    if ($Wait) {
         $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
         $startInfo.StandardErrorEncoding = [Text.Encoding]::UTF8
     }
 
     $process = [System.Diagnostics.Process]::Start($startInfo)
+    $script:LastRunLaunched = $true
     $startedUnix = Get-UnixNow
 
-    if ($wait) {
+    if ($Wait) {
         # Use async reading to avoid deadlock when buffer fills
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
 
-        $exited = $process.WaitForExit($timeoutMs)
+        $exited = $process.WaitForExit($TimeoutMs)
 
         if (-not $exited) {
             try { $process.Kill() } catch {}
-            throw "Process timed out after $timeoutMs ms and was killed"
+            throw "Process timed out after $TimeoutMs ms and was killed"
         }
 
         # Wait for async reads to complete (with short timeout since process exited)
@@ -622,6 +665,10 @@ function Invoke-Run {
             stdout = $stdoutTask.Result
             stderr = $stderrTask.Result
             started_unix = $startedUnix
+            # The freshness marker for this output: the caller can tell a
+            # reply produced now from one replayed out of the journal, and
+            # correlate it with `file stat` on the same clock.
+            finished_unix = Get-UnixNow
         }
     } else {
         $launch = Get-LaunchResult -Process $process
@@ -704,35 +751,63 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 }
 '@
 
-# A script with a param() block or `using` statements cannot live inside
-# `try { }` - those must be the first statements of a script - and a script
-# that does not parse gets no wrapper either, so PowerShell reports the parse
-# error itself (that path still arrives as CLIXML; the daemon cleans it).
-function Test-ChildScriptWrappable {
+# How the user's text parses, decided once per run. A script with a param()
+# block or `using` statements cannot live inside `try { }` - those must be
+# the first statements of a script - so it gets the prelude only. Parse
+# errors are reported as "line:col: message" for the caller to see; whether
+# they stop the launch is the caller's decision (it depends on the shell).
+function Get-ChildScriptShape {
     param([string]$UserScript)
 
+    $shape = @{ wrappable = $true; parse_errors = @() }
     try {
         $tokens = $null
         $errors = $null
         $ast = [System.Management.Automation.Language.Parser]::ParseInput($UserScript, [ref]$tokens, [ref]$errors)
-        if ($errors -and $errors.Count -gt 0) { return $false }
-        if ($null -ne $ast.ParamBlock) { return $false }
-        if ($ast.UsingStatements -and $ast.UsingStatements.Count -gt 0) { return $false }
-        return $true
+        if ($errors -and $errors.Count -gt 0) {
+            $shape.wrappable = $false
+            $shape.parse_errors = @($errors | ForEach-Object {
+                "line $($_.Extent.StartLineNumber), column $($_.Extent.StartColumnNumber): $($_.Message)"
+            })
+        }
+        if ($null -ne $ast -and $null -ne $ast.ParamBlock) { $shape.wrappable = $false }
+        if ($null -ne $ast -and $ast.UsingStatements -and $ast.UsingStatements.Count -gt 0) { $shape.wrappable = $false }
     } catch {
-        return $true
+        # The parser itself failing is not the user's fault; wrap and run.
+    }
+    return $shape
+}
+
+# Whether the child is Windows PowerShell - the interpreter whose parser
+# this agent runs on - rather than pwsh or another shell.
+function Test-DefaultShell {
+    param([string]$Shell)
+
+    if (-not $Shell) { return $true }
+    try {
+        $leaf = [System.IO.Path]::GetFileName($Shell).ToLowerInvariant()
+        return ($leaf -eq "powershell.exe" -or $leaf -eq "powershell")
+    } catch {
+        # An unparseable path is not Windows PowerShell as far as we can
+        # tell; launch it unwrapped and let it report its own errors.
+        return $false
     }
 }
 
 function New-ChildScript {
-    param([string]$UserScript)
+    param(
+        [string]$UserScript,
+        $Shape
+    )
+
+    if ($null -eq $Shape) { $Shape = Get-ChildScriptShape -UserScript $UserScript }
 
     # The agent's own pid, so a script can clean up stray powershell.exe
     # processes without killing the process that is running it.
     $prelude = $script:ChildPrelude + "`n" +
                '$env:AGENT_RDP_AGENT_PID = ''' + $PID + '''' + "`n"
 
-    if (Test-ChildScriptWrappable -UserScript $UserScript) {
+    if ($Shape.wrappable) {
         return $prelude + $script:ChildWrapperHead + "`n" + $UserScript + $script:ChildWrapperTail
     }
     return $prelude + $UserScript
@@ -844,6 +919,7 @@ function Start-StreamedRun {
     if ($Hidden) { $startArgs.WindowStyle = "Hidden" }
 
     $process = Start-Process @startArgs
+    $script:LastRunLaunched = $true
     $startedUnix = Get-UnixNow
 
     $state = [PSCustomObject]@{
@@ -857,6 +933,7 @@ function Start-StreamedRun {
         StdoutDecoder = [System.Text.Encoding]::UTF8.GetDecoder()
         StderrDecoder = [System.Text.Encoding]::UTF8.GetDecoder()
         ExitedAt      = $null
+        ExitedUnix    = $null
         ExitCode      = $null
     }
 
@@ -876,9 +953,12 @@ function Start-StreamedRun {
 
     $launch = Get-LaunchResult -Process $process
     $launch.started_unix = $startedUnix
+    # Output is being captured for run_poll - not a plain detached launch.
+    $launch.streamed = $true
     if ($launch.early_exit) {
         # Record it now so the first poll already reports `exited`.
         $state.ExitedAt = Get-Date
+        $state.ExitedUnix = Get-UnixNow
         $state.ExitCode = $launch.exit_code
     }
     return $launch
@@ -964,6 +1044,7 @@ function Invoke-RunPoll {
         $exited = $true
         $exitCode = $process.ExitCode
         $state.ExitedAt = Get-Date
+        $state.ExitedUnix = Get-UnixNow
         $state.ExitCode = $exitCode
     }
 
@@ -978,13 +1059,15 @@ function Invoke-RunPoll {
     if ($out.Error) { $stderrText += "[run-poll: stdout not readable this poll: $($out.Error)]`n" }
     if ($err.Error) { $stderrText += "[run-poll: stderr not readable this poll: $($err.Error)]`n" }
 
-    return @{
+    $poll = @{
         pid = $targetPid
         stdout_chunk = $out.Text
         stderr_chunk = $stderrText
         exited = $exited
         exit_code = $exitCode
     }
+    if ($exited -and $null -ne $state.ExitedUnix) { $poll.finished_unix = $state.ExitedUnix }
+    return $poll
 }
 
 function Invoke-WaitFor {
@@ -1184,10 +1267,24 @@ function Invoke-FileStat {
 # the acknowledgement was lost" - the difference between safely retrying a
 # mutating command and applying it twice. Keeping the last few results lets
 # the daemon come back and ask what actually happened instead of guessing.
+#
+# Two tiers. Every request's result is kept in memory (bounded, FIFO). A
+# `run` that carried a caller-chosen idempotency key is also written to disk,
+# because that is the case where the key outlives this process: the caller
+# retries after a reconnect or an agent relaunch, and "empty journal, so run
+# it again" was the double-apply the key exists to prevent.
 
 $script:ResultJournal = @{}
 $script:ResultJournalOrder = New-Object System.Collections.ArrayList
 $script:ResultJournalLimit = 64
+
+# Disk tier bounds. Best effort: a missing or unreadable entry means "unknown",
+# and an unknown key executes.
+$script:JournalMaxEntries = 256
+$script:JournalRetentionDays = 7
+$script:JournalMaxStreamChars = 524288  # 512K characters of stdout / stderr each
+$script:JournalDir = $null
+$script:JournalDirResolved = $false
 
 function Add-JournaledResult {
     param(
@@ -1195,19 +1292,26 @@ function Add-JournaledResult {
         [bool]$Success,
         $Data,
         $ErrorInfo,
-        [string]$Fingerprint
+        [string]$Fingerprint,
+        [switch]$Persist
     )
 
     if (-not $Id) { return }
 
-    $script:ResultJournal[$Id] = @{
+    $entry = @{
         success = $Success
         data = $Data
         error = $ErrorInfo
         fingerprint = $Fingerprint
         at = (Get-Date).ToString("o")
+        at_unix = Get-UnixNow
     }
-    [void]$script:ResultJournalOrder.Add($Id)
+    $script:ResultJournal[$Id] = $entry
+    # Re-journaling an id must not list it twice, or the FIFO evicts a live
+    # key early.
+    if (-not $script:ResultJournalOrder.Contains($Id)) {
+        [void]$script:ResultJournalOrder.Add($Id)
+    }
 
     # Bounded: this is a safety net for the last few commands, not a log.
     while ($script:ResultJournalOrder.Count -gt $script:ResultJournalLimit) {
@@ -1215,18 +1319,16 @@ function Add-JournaledResult {
         $script:ResultJournalOrder.RemoveAt(0)
         $script:ResultJournal.Remove($oldest)
     }
+
+    if ($Persist) {
+        Write-PersistedJournalEntry -Id $Id -Entry $entry
+    }
 }
 
-# SHA-256 over the command name and its parameters, so a replay can tell "the
-# same request again" from "a new request that happens to reuse the id".
-function Get-RequestFingerprint {
-    param(
-        [string]$Command,
-        $Params
-    )
+function Get-Sha256Hex {
+    param([string]$Text)
 
-    $json = if ($null -eq $Params) { "" } else { $Params | ConvertTo-Json -Compress -Depth 10 }
-    $bytes = [Text.Encoding]::UTF8.GetBytes("$Command|$json")
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace "-", "")
@@ -1235,15 +1337,54 @@ function Get-RequestFingerprint {
     }
 }
 
+# SHA-256 over the command name and its parameters, so a replay can tell "the
+# same request again" from "a new request that happens to reuse the id".
+# `timeout_ms` is left out: retrying a timed-out command with a longer
+# budget is the same request, not a reuse of its key.
+function Get-RequestFingerprint {
+    param(
+        [string]$Command,
+        $Params
+    )
+
+    $json = ""
+    if ($null -ne $Params) {
+        $copy = $Params
+        if ($Params -is [hashtable]) {
+            $copy = $Params.Clone()
+            $copy.Remove("timeout_ms")
+        } elseif ($Params.PSObject -and $Params.PSObject.Properties["timeout_ms"]) {
+            $copy = $Params.PSObject.Copy()
+            $copy.PSObject.Properties.Remove("timeout_ms")
+        }
+        $json = $copy | ConvertTo-Json -Compress -Depth 10
+    }
+    return Get-Sha256Hex -Text "$Command|$json"
+}
+
 # The raw journal entry for an id (with its fingerprint), or $null. Used by
 # the dispatch loop for replay; `Get-JournaledResult` below is the
-# `query_result` command's view of the same data.
+# `query_result` command's view of the same data. With -IncludeDisk a key
+# this process has never seen is looked up on disk, where a previous agent
+# may have left it.
 function Get-JournalEntry {
-    param([string]$Id)
+    param(
+        [string]$Id,
+        [switch]$IncludeDisk
+    )
 
     if (-not $Id) { return $null }
-    if (-not $script:ResultJournal.ContainsKey($Id)) { return $null }
-    return $script:ResultJournal[$Id]
+    if ($script:ResultJournal.ContainsKey($Id)) { return $script:ResultJournal[$Id] }
+    if (-not $IncludeDisk) { return $null }
+
+    $entry = Get-PersistedJournalEntry -Id $Id
+    if ($null -eq $entry) { return $null }
+    # Cache it in memory (the file already exists; no re-persist).
+    $script:ResultJournal[$Id] = $entry
+    if (-not $script:ResultJournalOrder.Contains($Id)) {
+        [void]$script:ResultJournalOrder.Add($Id)
+    }
+    return $entry
 }
 
 function Get-JournaledResult {
@@ -1252,19 +1393,219 @@ function Get-JournaledResult {
     $id = $Params.id
     if (-not $id) { throw "query_result requires 'id'" }
 
-    if (-not $script:ResultJournal.ContainsKey($id)) {
+    $entry = Get-JournalEntry -Id $id -IncludeDisk
+    if ($null -eq $entry) {
         # Deliberately distinguishes "we never saw it" from "still running":
         # the daemon only asks once the agent is answering again, so an
         # unknown id at that point means the request never executed.
         return @{ known = $false }
     }
 
-    $entry = $script:ResultJournal[$id]
     return @{
         known = $true
         success = $entry.success
         data = $entry.data
         error = $entry.error
         at = $entry.at
+        at_unix = $entry.at_unix
+    }
+}
+
+# ---- disk tier ----
+#
+# Under %LOCALAPPDATA%, not %TEMP%: on a session host TEMP is per logon
+# session and deleted at logoff, which is precisely when a caller comes back
+# with the same key. LOCALAPPDATA is per Windows account and per host, so a
+# temporary profile or a farm that lands the user on another host starts
+# empty - callers verify the side effect there, as documented. Never the
+# \\TSCLIENT drive (see the DVC/RDPDR deadlock note in AUTOMATION.md).
+
+function Get-JournalDir {
+    if ($script:JournalDirResolved) { return $script:JournalDir }
+    $script:JournalDirResolved = $true
+
+    # No fallback to TEMP: that is the per-logon directory the whole tier
+    # exists to avoid. Without a local profile the journal is memory-only.
+    $root = $env:LOCALAPPDATA
+    if (-not $root) {
+        Write-Log "Result journal is memory-only: LOCALAPPDATA is not set" "WARN"
+        return $null
+    }
+
+    $dir = Join-Path -Path (Join-Path -Path $root -ChildPath "agent-rdp") -ChildPath "journal"
+    try {
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $script:JournalDir = $dir
+    } catch {
+        Write-Log "Result journal is memory-only: cannot create $dir ($($_.Exception.Message))" "WARN"
+        $script:JournalDir = $null
+    }
+    return $script:JournalDir
+}
+
+# Keys may contain characters that are not valid in a file name (`:`), so
+# the file is named by the key's hash.
+function Get-JournalPath {
+    param([string]$Id)
+
+    $dir = Get-JournalDir
+    if (-not $dir) { return $null }
+    return Join-Path -Path $dir -ChildPath ((Get-Sha256Hex -Text $Id).ToLowerInvariant() + ".json")
+}
+
+# Recursive PSCustomObject -> hashtable, so an entry read back from JSON has
+# the same shape as one recorded live (the replay path adds keys to it, and
+# PowerShell 5.1's ConvertFrom-Json has no -AsHashtable). Arrays are
+# returned with the unary comma so a single-element array does not unroll
+# into its element on the way out of the function.
+function ConvertTo-Hashtable {
+    param($InputObject)
+
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [string] -or $InputObject -is [ValueType]) { return $InputObject }
+    if ($InputObject -is [hashtable]) {
+        $copy = @{}
+        foreach ($key in $InputObject.Keys) { $copy[$key] = ConvertTo-Hashtable -InputObject $InputObject[$key] }
+        return $copy
+    }
+    if ($InputObject -is [System.Collections.IEnumerable]) {
+        $list = New-Object System.Collections.ArrayList
+        foreach ($item in $InputObject) { [void]$list.Add((ConvertTo-Hashtable -InputObject $item)) }
+        return ,$list.ToArray()
+    }
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $table = @{}
+        foreach ($property in $InputObject.PSObject.Properties) {
+            $table[$property.Name] = ConvertTo-Hashtable -InputObject $property.Value
+        }
+        return $table
+    }
+    return $InputObject
+}
+
+# The on-disk copy of a result: the same fields, with stdout/stderr capped so
+# one chatty command cannot fill the profile. A capped entry still answers
+# the question the key asks - did it run, and how did it exit.
+function ConvertTo-PersistedJournalData {
+    param($Data)
+
+    if ($null -eq $Data -or -not ($Data -is [hashtable])) { return $Data }
+    $copy = $Data.Clone()
+    foreach ($stream in @("stdout", "stderr")) {
+        $text = $copy[$stream]
+        if ($text -is [string] -and $text.Length -gt $script:JournalMaxStreamChars) {
+            $copy[$stream] = $text.Substring(0, $script:JournalMaxStreamChars) + "`n[truncated by the result journal]"
+            $copy["journal_truncated"] = $true
+        }
+    }
+    return $copy
+}
+
+# Write-once: the first execution's result is the one that counts, and a
+# second writer (two agents for the same account racing on one key) must not
+# replace it. A temp file plus File.Move is atomic on NTFS; Move-Item -Force
+# is a delete followed by a move and is not.
+function Write-PersistedJournalEntry {
+    param(
+        [string]$Id,
+        [hashtable]$Entry
+    )
+
+    $path = Get-JournalPath -Id $Id
+    if (-not $path) { return }
+
+    try {
+        $record = @{
+            id = $Id
+            success = $Entry.success
+            data = ConvertTo-PersistedJournalData -Data $Entry.data
+            error = $Entry.error
+            fingerprint = $Entry.fingerprint
+            at = $Entry.at
+            at_unix = $Entry.at_unix
+        }
+        $json = $record | ConvertTo-Json -Depth 20 -Compress
+        $tmp = "$path.$PID.tmp"
+        # UTF-8 without BOM through .NET: Set-Content in PowerShell 5.1 writes
+        # the ANSI codepage and would corrupt non-ASCII output.
+        [System.IO.File]::WriteAllText($tmp, $json, [System.Text.UTF8Encoding]::new($false))
+        try {
+            [System.IO.File]::Move($tmp, $path)
+        } catch {
+            # Destination exists: an earlier execution already owns this key.
+            # Anything else (ACL, disk) is worth a log line.
+            if (-not (Test-Path -LiteralPath $path)) {
+                Write-Log "Could not move journal entry into place for '$Id': $($_.Exception.Message)" "WARN"
+            }
+            try { [System.IO.File]::Delete($tmp) } catch {}
+        }
+        Remove-ExpiredJournalEntries
+    } catch {
+        Write-Log "Could not persist journal entry for '$Id': $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Get-PersistedJournalEntry {
+    param([string]$Id)
+
+    $path = Get-JournalPath -Id $Id
+    if (-not $path) { return $null }
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+
+    try {
+        $json = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false))
+        $record = ConvertTo-Hashtable -InputObject ($json | ConvertFrom-Json)
+        if ($null -eq $record -or -not ($record -is [hashtable])) { throw "not a JSON object" }
+        if ($record.id -ne $Id -or -not $record.fingerprint) { throw "id or fingerprint missing" }
+        return @{
+            success = [bool]$record.success
+            data = $record.data
+            error = $record.error
+            fingerprint = [string]$record.fingerprint
+            at = $record.at
+            at_unix = $record.at_unix
+        }
+    } catch {
+        # Unreadable is unknown, and unknown executes - the same answer a
+        # missing file gives. Remove the file too: a corrupt entry has no
+        # value, and left in place it would block the write-once record of
+        # the execution that is about to happen.
+        Write-Log "Discarding unreadable journal entry for '$Id' at ${path}: $($_.Exception.Message)" "WARN"
+        try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch {}
+        return $null
+    }
+}
+
+function Remove-ExpiredJournalEntries {
+    $dir = Get-JournalDir
+    if (-not $dir) { return }
+
+    try {
+        $files = @(Get-ChildItem -LiteralPath $dir -Filter "*.json" -File -ErrorAction SilentlyContinue)
+        $cutoff = (Get-Date).AddDays(-$script:JournalRetentionDays)
+        $live = New-Object System.Collections.ArrayList
+        foreach ($file in $files) {
+            if ($file.LastWriteTime -lt $cutoff) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+            } else {
+                [void]$live.Add($file)
+            }
+        }
+        if ($live.Count -gt $script:JournalMaxEntries) {
+            $excess = $live | Sort-Object LastWriteTime | Select-Object -First ($live.Count - $script:JournalMaxEntries)
+            foreach ($file in $excess) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+        # Stale temp files from a writer that died mid-write.
+        foreach ($tmp in @(Get-ChildItem -LiteralPath $dir -Filter "*.tmp" -File -ErrorAction SilentlyContinue)) {
+            if ($tmp.LastWriteTime -lt (Get-Date).AddMinutes(-10)) {
+                Remove-Item -LiteralPath $tmp.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        Write-Log "Journal pruning failed: $($_.Exception.Message)" "WARN"
     }
 }

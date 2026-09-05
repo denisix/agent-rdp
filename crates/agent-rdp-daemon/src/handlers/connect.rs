@@ -239,18 +239,23 @@ pub async fn handle(
         } else {
             info!("Bootstrapping Windows UI Automation...");
 
-            let session_dir = crate::get_session_dir("");
-            let bootstrap = AutomationBootstrap::new(session_dir);
-
             // RDP itself is fine even if this fails, so don't fail the
             // connect - but do report it, otherwise the caller sees a clean
             // "Connected" and only discovers the problem later as an
-            // unexplained "agent not ready".
-            match bootstrap.launch_and_wait(rdp_session, automation_state).await {
+            // unexplained "agent not ready". The guarded path marks the
+            // bootstrap as in flight (so the supervisor cannot double it)
+            // and, on failure, schedules the supervisor's retries.
+            match crate::automation::launch_guarded(rdp_session, automation_state).await {
                 Ok(()) => automation_ready = Some(true),
                 Err(reason) => {
                     automation_ready = Some(false);
-                    automation_error = Some(reason);
+                    automation_error = Some(format!(
+                        "{}. The daemon keeps retrying in the background once the session has \
+                         been idle for {}s (`automate status` shows last_error and \
+                         next_retry_secs); `automate restart` forces a retry now",
+                        reason,
+                        crate::automation::RETRY_INPUT_QUIET.as_secs()
+                    ));
                 }
             }
         }

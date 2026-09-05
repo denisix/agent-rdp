@@ -21,7 +21,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # Global state
 $script:RefMap = @{}  # ref number -> AutomationElement mapping
 $script:SnapshotId = $null
-$script:Version = "1.6.0"  # DVC: transient read errors survive, FIRST-flag resync; run: started_unix
+$script:Version = "1.7.0"  # persistent idempotency journal; run: command_line, finished_unix, parse_error before launch
 # Local log path on Windows machine (RDPDR not used for logging anymore)
 $script:LocalLogPath = "$env:TEMP\agent-rdp-automation.log"
 $script:DvcHandle = [IntPtr]::Zero
@@ -70,7 +70,8 @@ function Start-Agent {
         "snapshot", "click", "select", "toggle", "expand", "collapse",
         "context_menu", "focus", "get", "fill", "clear",
         "scroll", "window", "run", "run_poll", "wait_for", "status",
-        "file_write_chunk", "file_read_chunk", "file_stat", "query_result"
+        "file_write_chunk", "file_read_chunk", "file_stat", "query_result",
+        "persistent_journal"
     )
 
     try {
@@ -118,14 +119,35 @@ function Start-Agent {
             # other case - a key reused for a *different* command - which is
             # refused rather than silently answered with a stale result.
             $fingerprint = Get-RequestFingerprint -Command $request.command -Params $request.params
+            # A run with a caller-chosen key is the one case where the id
+            # outlives this process, so it is the one case that reaches the
+            # disk tier (see the journal section of actions.ps1).
+            $keyed = ($request.command -eq "run" -and [bool]$request.params.idempotency_key)
             if ($request.command -ne "query_result") {
-                $replay = Get-JournalEntry -Id $request.id
+                $replay = Get-JournalEntry -Id $request.id -IncludeDisk:$keyed
                 if ($null -ne $replay) {
                     if ($replay.fingerprint -eq $fingerprint) {
                         Write-Log "Replaying journaled result for request $($request.id) (not re-executed)"
+                        # Work on copies: the journal entry itself must stay
+                        # as recorded, or every replay would stack another
+                        # marker onto it.
                         $replayData = $replay.data
-                        if ($replayData -is [hashtable]) { $replayData["replayed"] = $true }
-                        Send-DvcResponse -Handle $script:DvcHandle -Id $request.id -Success $replay.success -Data $replayData -ErrorInfo $replay.error
+                        if ($replayData -is [hashtable]) {
+                            $replayData = $replayData.Clone()
+                            $replayData["replayed"] = $true
+                            if ($null -ne $replay.at_unix) { $replayData["replayed_at_unix"] = $replay.at_unix }
+                        }
+                        $replayError = $replay.error
+                        if ($replayError -is [hashtable]) {
+                            $replayError = $replayError.Clone()
+                            $when = ""
+                            if ($null -ne $replay.at_unix) {
+                                $epoch = [datetime]::new(1970, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc)
+                                $when = " at " + $epoch.AddSeconds([double]$replay.at_unix).ToString("yyyy-MM-ddTHH:mm:ssZ")
+                            }
+                            $replayError["message"] = "$($replayError.message) (replayed from the journal: this idempotency key already ran$when; use a new key to run it again)"
+                        }
+                        Send-DvcResponse -Handle $script:DvcHandle -Id $request.id -Success $replay.success -Data $replayData -ErrorInfo $replayError
                     } else {
                         Write-Log "Request id $($request.id) reused for a different command; refusing" "WARN"
                         $reuseError = @{
@@ -181,8 +203,13 @@ function Start-Agent {
             # in transit, the result is still here to be queried back.
             # `query_result` itself is not journaled - it is a lookup, and
             # recording lookups would evict the results being looked up.
+            # A keyed run reaches the disk tier if it succeeded or if a child
+            # process was started (a timeout after launch may have had side
+            # effects; a parse error or start failure had none and must not
+            # be replayed for a week).
+            $persist = $keyed -and ($success -or [bool]$script:LastRunLaunched)
             if ($request.command -ne "query_result") {
-                Add-JournaledResult -Id $request.id -Success $success -Data $responseData -ErrorInfo $responseError -Fingerprint $fingerprint
+                Add-JournaledResult -Id $request.id -Success $success -Data $responseData -ErrorInfo $responseError -Fingerprint $fingerprint -Persist:$persist
             }
 
             # Send response via DVC

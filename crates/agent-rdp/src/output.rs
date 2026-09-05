@@ -65,10 +65,15 @@ impl Output {
                 let mut value = serde_json::to_value(response).unwrap();
                 let warning = match automation_error {
                     Some(reason) => format!(
-                        "The UI Automation agent did not start: {}. Reconnect to retry.",
+                        "The UI Automation agent did not start: {}. The daemon keeps retrying \
+                         (`automate status` shows last_error/next_retry_secs); `automate \
+                         restart` forces a retry now.",
                         reason
                     ),
-                    None => "The UI Automation agent did not start. Reconnect to retry.".to_string(),
+                    None => "The UI Automation agent did not start. The daemon keeps retrying \
+                             (`automate status` shows progress); `automate restart` forces a \
+                             retry now."
+                        .to_string(),
                 };
                 if let Some(data) = value.get_mut("data") {
                     data["warning"] = serde_json::Value::String(warning);
@@ -106,14 +111,17 @@ impl Output {
                 if *automation_ready == Some(false) {
                     match automation_error {
                         Some(reason) => eprintln!(
-                            "Warning: the UI Automation agent did not start: {}. Reconnect to \
-                             retry; see the session's daemon.log for details.",
+                            "Warning: the UI Automation agent did not start: {}. Do not \
+                             reconnect for this - the daemon keeps retrying (`automate status` \
+                             shows last_error/next_retry_secs) and `automate restart` forces \
+                             a retry now; see the session's daemon.log for details.",
                             reason
                         ),
                         None => eprintln!(
                             "Warning: the UI Automation agent did not start, so `automate` \
-                             commands will not work. Reconnect to retry; see the session's \
-                             daemon.log for why."
+                             commands will not work yet. The daemon keeps retrying (`automate \
+                             status` shows progress); `automate restart` forces a retry now; \
+                             see the session's daemon.log for why."
                         ),
                     }
                 }
@@ -134,7 +142,8 @@ impl Output {
                     println!("Resolution: {}x{}", w, h);
                 }
                 println!("PID: {}", info.pid);
-                let cli_version = env!("CARGO_PKG_VERSION");
+                let cli_version = crate::session_manager::CLI_VERSION;
+                println!("CLI version: {}", info.cli_version.as_deref().unwrap_or(cli_version));
                 if info.daemon_version.is_empty() {
                     println!(
                         "Daemon version: unknown (predates {}; run `agent-rdp connect` to replace it)",
@@ -247,30 +256,65 @@ impl Output {
                         status.consecutive_failures
                     );
                 }
+                if status.relaunches > 0 {
+                    println!("Relaunches this session: {}", status.relaunches);
+                }
+                if let Some(ref err) = status.last_error {
+                    println!("Last launch error: {}", err);
+                }
+                match status.next_retry_secs {
+                    Some(0) => println!(
+                        "Next automatic relaunch: as soon as the session has been idle for 2 minutes"
+                    ),
+                    Some(secs) => println!("Next automatic relaunch: in {}s (once the session is idle)", secs),
+                    None if !status.agent_running => println!(
+                        "Next automatic relaunch: none scheduled - `automate restart` relaunches now"
+                    ),
+                    None => {}
+                }
             }
             ResponseData::RunResult(result) => {
                 // Status lines go to stderr so stdout carries only what the
                 // remote command actually printed - otherwise every parser
                 // has to strip an "Exit code: 0" line the program never
                 // produced.
+                let remote_time = |unix: u64| {
+                    agent_rdp_daemon::timefmt::utc_rfc3339(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix),
+                    )
+                };
                 if result.replayed {
-                    eprintln!("(replayed from the agent's journal - the command was not run again)");
+                    match result.replayed_at_unix {
+                        Some(at) => eprintln!(
+                            "(replayed from the journal - the command was not run again; it originally ran at {} by the remote clock)",
+                            remote_time(at)
+                        ),
+                        None => eprintln!("(replayed from the journal - the command was not run again)"),
+                    }
                 }
                 if let Some(started) = result.started_unix {
-                    eprintln!(
-                        "Started: {} (remote clock)",
-                        agent_rdp_daemon::timefmt::utc_rfc3339(
-                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(started)
-                        )
-                    );
+                    eprintln!("Started: {} (remote clock)", remote_time(started));
+                }
+                if let Some(finished) = result.finished_unix {
+                    eprintln!("Finished: {} (remote clock)", remote_time(finished));
                 }
                 if let Some(code) = result.exit_code {
                     eprintln!("Exit code: {}", code);
+                }
+                // A non-zero exit is where "what did it actually run" matters;
+                // the JSON output always carries `command_line`.
+                if matches!(result.exit_code, Some(code) if code != 0) {
+                    if let Some(ref line) = result.command_line {
+                        eprintln!("Command line as executed by the agent: {}", line);
+                    }
                 }
                 if let Some(ref stdout) = result.stdout {
                     if !stdout.is_empty() {
                         println!("{}", stdout);
                     }
+                }
+                if let Some(note) = run_capture_note(result) {
+                    eprintln!("{}", note);
                 }
                 if let Some(ref stderr) = result.stderr {
                     if !stderr.is_empty() {
@@ -483,5 +527,79 @@ pub fn error_code_for(code: &str) -> agent_rdp_protocol::ErrorCode {
         "invalid_request" => ErrorCode::InvalidRequest,
         "ipc_error" | "cli_error" => ErrorCode::IpcError,
         _ => ErrorCode::InternalError,
+    }
+}
+
+/// The one-line note that says what happened to a run's stdout when there
+/// is none to print: a waited run that printed nothing, a streamed launch
+/// whose output is waiting in `run-poll`, or a detached launch where nothing
+/// was captured at all. `None` when stdout was printed or nothing applies.
+pub fn run_capture_note(result: &agent_rdp_protocol::RunResult) -> Option<String> {
+    match result.stdout {
+        Some(ref stdout) if !stdout.is_empty() => None,
+        Some(_) => Some("(no stdout captured: the command printed nothing)".to_string()),
+        // A replayed streamed launch belongs to an earlier agent process;
+        // its spool may be gone, so do not promise a run-poll.
+        None if result.streamed && result.replayed => Some(
+            "(streaming launch replayed from the journal: its output was captured by an \
+             earlier agent process and may no longer be pollable)"
+                .to_string(),
+        ),
+        None if result.streamed => result
+            .pid
+            .map(|pid| format!("(streaming: collect output with `automate run-poll {}`)", pid)),
+        None if result.exit_code.is_none() && result.pid.is_some() => {
+            Some("(detached: output is not captured - use --wait or --stream)".to_string())
+        }
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod run_capture_note_tests {
+    use super::run_capture_note;
+    use agent_rdp_protocol::RunResult;
+
+    fn result() -> RunResult {
+        RunResult {
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            pid: None,
+            replayed: false,
+            early_exit: false,
+            started_unix: None,
+            finished_unix: None,
+            command_line: None,
+            replayed_at_unix: None,
+            streamed: false,
+        }
+    }
+
+    #[test]
+    fn waited_runs_distinguish_empty_from_uncaptured() {
+        let printed = RunResult { exit_code: Some(0), stdout: Some("hi".into()), ..result() };
+        assert_eq!(run_capture_note(&printed), None);
+        let empty = RunResult { exit_code: Some(0), stdout: Some(String::new()), ..result() };
+        assert!(run_capture_note(&empty).unwrap().contains("printed nothing"));
+        // A replayed waited result with empty stdout is still "printed nothing".
+        let replayed = RunResult { replayed: true, ..empty };
+        assert!(run_capture_note(&replayed).unwrap().contains("printed nothing"));
+    }
+
+    #[test]
+    fn streamed_and_detached_launches_get_their_own_notes() {
+        let streamed = RunResult { pid: Some(7), streamed: true, ..result() };
+        assert_eq!(
+            run_capture_note(&streamed).as_deref(),
+            Some("(streaming: collect output with `automate run-poll 7`)")
+        );
+        let replayed_stream = RunResult { pid: Some(7), streamed: true, replayed: true, ..result() };
+        assert!(run_capture_note(&replayed_stream).unwrap().contains("may no longer be pollable"));
+        let detached = RunResult { pid: Some(7), ..result() };
+        assert!(run_capture_note(&detached).unwrap().starts_with("(detached:"));
+        // An early-exited detached launch has an exit code and no stdout.
+        let early = RunResult { pid: Some(7), exit_code: Some(1), early_exit: true, ..result() };
+        assert_eq!(run_capture_note(&early), None);
     }
 }

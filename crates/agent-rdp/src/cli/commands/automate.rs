@@ -168,6 +168,7 @@ async fn follow_poll(
                     stderr_chunk: std::mem::take(&mut all_stderr),
                     exited: true,
                     exit_code: result.exit_code,
+                    finished_unix: result.finished_unix,
                 };
                 output.print_response(&agent_rdp_protocol::Response::success(
                     ResponseData::RunPollResult(merged),
@@ -190,6 +191,7 @@ async fn follow_poll(
                     stderr_chunk: std::mem::take(&mut all_stderr),
                     exited: false,
                     exit_code: None,
+                    finished_unix: None,
                 };
                 output.print_response(&agent_rdp_protocol::Response::success(
                     ResponseData::RunPollResult(merged),
@@ -249,6 +251,43 @@ fn warn_argument_hazards(args: &[String]) {
          quoted string with its own quoting, e.g. automate run \"powershell -File x.ps1 -Param '1,2'\".",
         hazardous.iter().map(|a| format!("'{}'", a)).collect::<Vec<_>>().join(", ")
     );
+}
+
+/// Signs that the caller's *local* shell rewrote the command before agent-rdp
+/// saw it - the classic being `"... | ForEach-Object { $_.Line.Trim() }"` in
+/// double quotes, where bash expands `$_` to its last argument (usually
+/// nothing) and the agent receives `{ .Line.Trim() }`. The agent echoes what
+/// it ran as `command_line`; this note explains the discrepancy up front.
+/// A `Some` is the warning text.
+fn local_shell_expansion_hint(command: &str) -> Option<String> {
+    // A script block whose first token starts with `.` is what a vanished
+    // `$_` leaves behind - unless it is a relative path or a dot-source
+    // (`{ .\build.ps1 }`, `{ . .\lib.ps1 }`), which are legitimate.
+    let orphaned_member = command.split('{').skip(1).any(|block| {
+        let block = block.trim_start();
+        block.starts_with('.')
+            && !block.starts_with(".\\")
+            && !block.starts_with("./")
+            && !block.starts_with("..")
+            && !block.starts_with(". ")
+    });
+    // Script-block pipelines that are nearly always written with `$_`, and
+    // no `$` survived anywhere in the command. The simplified syntax
+    // (`Where-Object Name -eq x`) has no block and is left alone.
+    let dollarless_pipeline = !command.contains('$')
+        && ["ForEach-Object {", "Where-Object {", "| % {", "| ? {", "|% {", "|? {"]
+            .iter()
+            .any(|marker| command.contains(marker));
+    if !orphaned_member && !dollarless_pipeline {
+        return None;
+    }
+    Some(
+        "Note: this command looks like your local shell expanded `$_`/`$var` before agent-rdp \
+         saw it (a script block starting with `.`, or a *-Object pipeline with no `$` left). \
+         Quote the command with single quotes locally, or `file push` a .ps1 and run it with \
+         -File. The reply's `command_line` shows exactly what the agent executed."
+            .to_string(),
+    )
 }
 
 fn reject_misplaced_run_options(args: &[String]) -> Result<(), String> {
@@ -421,6 +460,9 @@ fn build_request(action: AutomateAction) -> Result<AutomateRequest, String> {
             }
             reject_misplaced_run_options(&cmd_args)?;
             warn_argument_hazards(&cmd_args);
+            if let Some(hint) = local_shell_expansion_hint(&command) {
+                eprintln!("{}", hint);
+            }
             AutomateRequest::Run {
                 command,
                 args: cmd_args,
@@ -795,5 +837,38 @@ mod tests {
     #[test]
     fn non_automate_requests_are_unchanged() {
         assert_eq!(automate_timeout_ms(&Request::Ping, 30_000), 30_000);
+    }
+}
+
+#[cfg(test)]
+mod shell_expansion_hint_tests {
+    use super::local_shell_expansion_hint;
+
+    #[test]
+    fn a_vanished_dollar_underscore_is_recognised() {
+        // bash: "... { $_.Line.Trim() }" -> "... { .Line.Trim() }"
+        assert!(local_shell_expansion_hint("Get-Content x | ForEach-Object { .Line.Trim() }").is_some());
+        assert!(local_shell_expansion_hint("gci | ? {.Length -gt 1}").is_some());
+        // *-Object with no `$` anywhere.
+        assert!(local_shell_expansion_hint("Get-Process | Where-Object { .CPU -gt 1 }").is_some());
+        assert!(local_shell_expansion_hint("ls | ForEach-Object { Write-Host }").is_some());
+    }
+
+    #[test]
+    fn intact_commands_are_left_alone() {
+        assert!(local_shell_expansion_hint("Get-Content x | ForEach-Object { $_.Line.Trim() }").is_none());
+        assert!(local_shell_expansion_hint("Get-Process").is_none());
+        assert!(local_shell_expansion_hint("powershell -File x.ps1 -Param '1,2'").is_none());
+        // A hashtable literal is not an orphaned member access.
+        assert!(local_shell_expansion_hint("@{ a = 1 }").is_none());
+        assert!(local_shell_expansion_hint("if ($x) { Write-Host 1 }").is_none());
+        // Simplified syntax has no script block and no `$_`.
+        assert!(local_shell_expansion_hint("Get-Process | Where-Object Name -eq notepad").is_none());
+        assert!(local_shell_expansion_hint("gci | ForEach-Object Name").is_none());
+        // Relative paths and dot-sourcing inside a block.
+        assert!(local_shell_expansion_hint("if (Test-Path x) { .\\build.ps1 }").is_none());
+        assert!(local_shell_expansion_hint("& { . .\\lib.ps1; Run }").is_none());
+        assert!(local_shell_expansion_hint("& { ./run.sh }").is_none());
+        assert!(local_shell_expansion_hint("& { ..\\up.ps1 }").is_none());
     }
 }

@@ -59,10 +59,79 @@ impl RelaunchBudget {
     }
 }
 
-/// Relaunch the agent on an already-initialized session: `automate restart`
-/// and the supervisor both come here. Serialized via `relaunch_in_flight`
-/// so two callers cannot drive the Run dialog at once.
-pub async fn relaunch_agent(
+/// Consecutive failed launches after which the supervisor stops retrying
+/// on its own. `automate restart` resets the count.
+pub const MAX_LAUNCH_FAILURES: u32 = 6;
+
+/// The supervisor types into the session (Win+R, paste, Enter) to launch
+/// the agent, and if the Run dialog does not come up that text lands in
+/// whatever has focus. So it only does this once nobody has driven the
+/// session for this long.
+pub const RETRY_INPUT_QUIET: Duration = Duration::from_secs(120);
+
+/// How often the supervisor checks whether a scheduled retry is due.
+const SUPERVISOR_TICK: Duration = Duration::from_secs(30);
+
+/// Environment variable that disables automatic relaunches entirely
+/// (`automate restart` still works). Read once when the supervisor starts;
+/// the daemon inherits the environment of the `connect` that spawned it.
+pub const AUTO_RELAUNCH_KILL_SWITCH: &str = "AGENT_RDP_NO_AUTO_RELAUNCH";
+
+/// Delay before the next automatic launch after `failures` consecutive
+/// failed ones: 60s, 120s, 240s, then 300s.
+pub fn retry_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(4);
+    Duration::from_secs((60u64 << doublings).min(300))
+}
+
+/// Whether automatic relaunches are disabled by the environment.
+pub fn auto_relaunch_disabled() -> bool {
+    std::env::var_os(AUTO_RELAUNCH_KILL_SWITCH)
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// Record what a launch attempt did to the retry schedule. Success clears
+/// everything; a failure schedules the next automatic attempt, or gives up
+/// after `MAX_LAUNCH_FAILURES` with a message that says so.
+pub fn record_launch_outcome(
+    state: &mut AutomationState,
+    result: &Result<(), String>,
+    now: std::time::Instant,
+) {
+    match result {
+        Ok(()) => {
+            state.last_error = None;
+            state.next_retry_at = None;
+            state.launch_failures = 0;
+        }
+        Err(reason) => {
+            state.launch_failures = state.launch_failures.saturating_add(1);
+            if state.auto_relaunch_disabled {
+                state.next_retry_at = None;
+                state.last_error = Some(format!(
+                    "{} (automatic relaunch is disabled by {}; `automate restart` relaunches)",
+                    reason, AUTO_RELAUNCH_KILL_SWITCH
+                ));
+            } else if state.launch_failures >= MAX_LAUNCH_FAILURES {
+                state.next_retry_at = None;
+                state.last_error = Some(format!(
+                    "{} (gave up after {} consecutive failed launches; `automate restart` tries again)",
+                    reason, state.launch_failures
+                ));
+            } else {
+                state.next_retry_at = Some(now + retry_backoff(state.launch_failures));
+                state.last_error = Some(reason.clone());
+            }
+        }
+    }
+}
+
+/// The one launch path for an initialized session: `connect`'s bootstrap,
+/// `automate restart` and the supervisor all come here. Serialized via
+/// `relaunch_in_flight` so two callers cannot drive the Run dialog at once -
+/// and so a supervisor tick sees `connect`'s own bootstrap as in flight.
+pub async fn launch_guarded(
     rdp_session: &Arc<Mutex<Option<RdpSession>>>,
     automation_state: &Arc<Mutex<AutomationState>>,
 ) -> Result<(), String> {
@@ -72,7 +141,7 @@ pub async fn relaunch_agent(
             return Err("automation is not enabled for this session".to_string());
         }
         if state.relaunch_in_flight {
-            return Err("a relaunch of the automation agent is already in progress".to_string());
+            return Err("a launch of the automation agent is already in progress".to_string());
         }
         state.relaunch_in_flight = true;
         state.agent_ready = false;
@@ -84,11 +153,155 @@ pub async fn relaunch_agent(
 
     let mut state = automation_state.lock().await;
     state.relaunch_in_flight = false;
+    record_launch_outcome(&mut state, &result, std::time::Instant::now());
     result
 }
 
-/// Watch one session's DVC channel and relaunch the agent when the channel
-/// closes while the RDP session is still alive.
+/// Relaunch the agent on an already-initialized session (`automate restart`
+/// and the supervisor). Counts in `relaunches` on success.
+pub async fn relaunch_agent(
+    rdp_session: &Arc<Mutex<Option<RdpSession>>>,
+    automation_state: &Arc<Mutex<AutomationState>>,
+) -> Result<(), String> {
+    let result = launch_guarded(rdp_session, automation_state).await;
+    if result.is_ok() {
+        automation_state.lock().await.relaunches += 1;
+    }
+    result
+}
+
+/// Everything the supervisor's retry decision depends on, captured at one
+/// instant so the decision itself is a pure function.
+#[derive(Debug, Clone, Copy)]
+pub struct RetrySnapshot {
+    pub generation_matches: bool,
+    pub session_alive: bool,
+    pub enabled: bool,
+    pub relaunch_in_flight: bool,
+    pub handshake_done: bool,
+    pub agent_starting: bool,
+    pub next_retry_at: Option<std::time::Instant>,
+    pub last_input_age: Option<Duration>,
+    pub auto_relaunch_disabled: bool,
+}
+
+/// Whether the supervisor should launch the agent now; the reason not to,
+/// otherwise. `next_retry_at` is armed only by a recorded failure (or a
+/// close notification), never by an in-progress bootstrap, so a `connect`
+/// still waiting for its first handshake can never be doubled.
+pub fn should_retry(s: &RetrySnapshot, now: std::time::Instant) -> Result<(), &'static str> {
+    if !s.generation_matches {
+        return Err("session replaced");
+    }
+    if s.auto_relaunch_disabled {
+        return Err("automatic relaunch disabled by AGENT_RDP_NO_AUTO_RELAUNCH");
+    }
+    if !s.session_alive {
+        return Err("RDP session is gone");
+    }
+    if !s.enabled {
+        return Err("automation not enabled");
+    }
+    if s.relaunch_in_flight {
+        return Err("a launch is in progress");
+    }
+    if s.handshake_done {
+        return Err("agent is up");
+    }
+    let Some(due) = s.next_retry_at else {
+        return Err("no retry scheduled");
+    };
+    if now < due {
+        return Err("retry not due yet");
+    }
+    if s.agent_starting {
+        return Err("an agent is visibly still starting");
+    }
+    if let Some(age) = s.last_input_age {
+        if age < RETRY_INPUT_QUIET {
+            return Err("session input is not quiet yet");
+        }
+    }
+    Ok(())
+}
+
+async fn retry_snapshot(
+    rdp_session: &Arc<Mutex<Option<RdpSession>>>,
+    automation_state: &Arc<Mutex<AutomationState>>,
+    session_generation: &Arc<std::sync::atomic::AtomicU64>,
+    generation: u64,
+) -> RetrySnapshot {
+    let generation_matches =
+        session_generation.load(std::sync::atomic::Ordering::SeqCst) == generation;
+    let (session_alive, last_input_age) = {
+        let session = rdp_session.lock().await;
+        match session.as_ref() {
+            Some(rdp) => (true, rdp.last_input_age()),
+            None => (false, None),
+        }
+    };
+    let (enabled, relaunch_in_flight, handshake_done, next_retry_at, dvc_state, auto_relaunch_disabled) = {
+        let state = automation_state.lock().await;
+        (
+            state.enabled,
+            state.relaunch_in_flight,
+            state
+                .dvc_state
+                .as_ref()
+                .map(|s| s.lock().handshake.is_some())
+                .unwrap_or(false),
+            state.next_retry_at,
+            state.dvc_state.clone(),
+            state.auto_relaunch_disabled,
+        )
+    };
+    let agent_starting = match dvc_state {
+        Some(dvc_state) => AutomationBootstrap::agent_is_starting(&dvc_state, rdp_session).await,
+        None => false,
+    };
+    RetrySnapshot {
+        generation_matches,
+        session_alive,
+        enabled,
+        relaunch_in_flight,
+        handshake_done,
+        agent_starting,
+        next_retry_at,
+        last_input_age,
+        auto_relaunch_disabled,
+    }
+}
+
+/// One supervised launch attempt. A budget refusal reschedules a minute
+/// out without counting as a failure; a failed launch schedules its own
+/// retry through `record_launch_outcome`.
+async fn supervisor_attempt(
+    budget: &mut RelaunchBudget,
+    reason: &str,
+    rdp_session: &Arc<Mutex<Option<RdpSession>>>,
+    automation_state: &Arc<Mutex<AutomationState>>,
+) {
+    let now = std::time::Instant::now();
+    if !budget.try_take(now) {
+        warn!("Relaunch supervisor: relaunch budget exhausted (3 per 10 minutes); trying again in a minute");
+        automation_state.lock().await.next_retry_at = Some(now + Duration::from_secs(60));
+        return;
+    }
+    info!("Relaunch supervisor: {}; relaunching the agent", reason);
+    match relaunch_agent(rdp_session, automation_state).await {
+        Ok(()) => {
+            let relaunches = automation_state.lock().await.relaunches;
+            info!("Relaunch supervisor: agent is back (relaunch #{})", relaunches);
+        }
+        Err(e) => warn!("Relaunch supervisor: relaunch failed: {}", e),
+    }
+}
+
+/// Watch one session's automation agent: relaunch it when its DVC channel
+/// closes while the RDP session is still alive, and keep retrying (with
+/// backoff, once the session is idle) when a launch fails - including
+/// `connect`'s own bootstrap, which otherwise left the agent down until
+/// someone ran `automate restart`.
 ///
 /// Scoped to a session: `rx` ends when `cleanup()` drops the DVC state, and
 /// a changed `session_generation` means a newer `connect` owns everything
@@ -105,41 +318,64 @@ pub fn spawn_relaunch_supervisor(
     const SETTLE: Duration = Duration::from_secs(5);
     tokio::spawn(async move {
         let mut budget = RelaunchBudget::new(Duration::from_secs(600), 3);
-        while rx.recv().await.is_some() {
-            // Drain bursts: a close can be reported more than once.
-            while rx.try_recv().is_ok() {}
+        let auto_disabled = automation_state.lock().await.auto_relaunch_disabled;
+        if auto_disabled {
+            info!("Relaunch supervisor: automatic relaunch disabled by {}", AUTO_RELAUNCH_KILL_SWITCH);
+        }
+        loop {
+            let closed = match tokio::time::timeout(SUPERVISOR_TICK, rx.recv()).await {
+                Ok(None) => break,
+                Ok(Some(())) => {
+                    // Drain bursts: a close can be reported more than once.
+                    while rx.try_recv().is_ok() {}
+                    true
+                }
+                Err(_) => false,
+            };
 
             if session_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
                 info!("Relaunch supervisor: session replaced; exiting");
                 return;
             }
-            sleep(SETTLE).await;
-            if rdp_session.lock().await.is_none() {
-                info!("Relaunch supervisor: RDP session is gone; nothing to relaunch");
-                continue;
-            }
-            {
-                let state = automation_state.lock().await;
-                if !state.enabled || state.relaunch_in_flight {
-                    continue;
+
+            if closed {
+                sleep(SETTLE).await;
+                // A close arms an immediate retry; the same gate as a
+                // scheduled one decides whether it is safe to type now.
+                let mut state = automation_state.lock().await;
+                let agent_up = state
+                    .dvc_state
+                    .as_ref()
+                    .map(|s| s.lock().handshake.is_some())
+                    .unwrap_or(false);
+                if state.enabled && !state.relaunch_in_flight && !agent_up {
+                    if state.next_retry_at.is_none() {
+                        state.next_retry_at = Some(std::time::Instant::now());
+                    }
+                    if state.last_error.is_none() {
+                        state.last_error =
+                            Some("the agent's DVC channel closed (the agent process ended)".to_string());
+                    }
+                    info!("Relaunch supervisor: DVC channel closed while the RDP session is alive");
                 }
-                if state.dvc_state.as_ref().map(|s| s.lock().handshake.is_some()).unwrap_or(false) {
-                    // Already back (a manual `automate restart` beat us).
-                    continue;
-                }
             }
-            if !budget.try_take(std::time::Instant::now()) {
-                warn!("Relaunch supervisor: relaunch budget exhausted (3 per 10 minutes); leaving the agent down");
-                continue;
-            }
-            info!("Relaunch supervisor: DVC channel closed while the RDP session is alive; relaunching the agent");
-            match relaunch_agent(&rdp_session, &automation_state).await {
+
+            let snapshot =
+                retry_snapshot(&rdp_session, &automation_state, &session_generation, generation).await;
+            match should_retry(&snapshot, std::time::Instant::now()) {
                 Ok(()) => {
-                    let mut state = automation_state.lock().await;
-                    state.relaunches += 1;
-                    info!("Relaunch supervisor: agent is back (relaunch #{})", state.relaunches);
+                    let reason = if closed {
+                        "DVC channel closed while the RDP session is alive"
+                    } else {
+                        "scheduled retry after a failed launch"
+                    };
+                    supervisor_attempt(&mut budget, reason, &rdp_session, &automation_state).await;
                 }
-                Err(e) => warn!("Relaunch supervisor: relaunch failed: {}", e),
+                Err(why) => {
+                    if snapshot.next_retry_at.is_some() {
+                        debug!("Relaunch supervisor: not launching yet ({})", why);
+                    }
+                }
             }
         }
         debug!("Relaunch supervisor: DVC state dropped; exiting");
@@ -209,6 +445,10 @@ impl AutomationBootstrap {
         state.closed_rx = Some(closed_rx);
         state.relaunch_in_flight = false;
         state.relaunches = 0;
+        state.last_error = None;
+        state.next_retry_at = None;
+        state.launch_failures = 0;
+        state.auto_relaunch_disabled = auto_relaunch_disabled();
 
         state.enabled = true;
         info!(
@@ -249,6 +489,16 @@ impl AutomationBootstrap {
 
         debug!("PowerShell command: {}", ps_command);
 
+        // These keystrokes are ours, not an operator's: they must not count
+        // against the supervisor's input-quiet gate, or a failed launch
+        // would push its own retry out by RETRY_INPUT_QUIET every time.
+        let input_mark = rdp.input_activity_mark();
+        let result = self.type_launch_command(rdp, ps_command).await;
+        rdp.restore_input_activity(input_mark);
+        result
+    }
+
+    async fn type_launch_command(&self, rdp: &RdpSession, ps_command: String) -> anyhow::Result<()> {
         // Set the command in clipboard first (paste is more reliable than typing
         // long commands character-by-character into the Run dialog)
         rdp.clipboard_set(ps_command).await
@@ -470,6 +720,9 @@ impl AutomationBootstrap {
         state.agent_pid = None;
         state.dvc_ipc = None;
         state.dvc_state = None;
+        state.last_error = None;
+        state.next_retry_at = None;
+        state.launch_failures = 0;
 
         Ok(())
     }
@@ -513,9 +766,9 @@ mod tests {
         assert!(LIB_ACTIONS.contains("$agentRdpErr.ScriptStackTrace"));
         assert!(LIB_ACTIONS.contains("[Console]::Error.WriteLine"));
         assert!(LIB_ACTIONS.contains("$env:AGENT_RDP_AGENT_PID = '''"));
-        assert!(LIB_ACTIONS.contains("function Test-ChildScriptWrappable"));
+        assert!(LIB_ACTIONS.contains("function Get-ChildScriptShape"));
         assert!(LIB_ACTIONS.contains("$ast.ParamBlock"));
-        assert!(LIB_ACTIONS.contains("if ($stream -and -not $wait)"));
+        assert!(LIB_ACTIONS.contains("if ($Stream -and -not $Wait)"));
         assert!(LIB_ACTIONS.contains("early_exit = $true"));
 
         // The wrapper travels inside -EncodedCommand toward the ~32KB
@@ -542,6 +795,169 @@ mod tests {
         // The main loop keys on the prefix, not on substrings.
         assert!(AGENT_SCRIPT.contains("$errorMsg.StartsWith($script:DvcFatalPrefix)"));
         assert!(!AGENT_SCRIPT.contains("$errorMsg -match \"Win32 error\""));
+    }
+
+    /// A `run` that does not parse as Windows PowerShell is refused before
+    /// any child is launched, with the parser's positions; every run
+    /// reply and every run error carries the text the agent executed.
+    #[test]
+    fn run_refuses_parse_errors_and_echoes_the_command_line() {
+        assert!(LIB_ACTIONS.contains("function Test-DefaultShell"));
+        assert!(LIB_ACTIONS.contains("\"parse_error: the command does not parse as Windows PowerShell:"));
+        assert!(LIB_ACTIONS.contains("line $($_.Extent.StartLineNumber), column $($_.Extent.StartColumnNumber)"));
+        // Only the default shell shares the agent's parser.
+        assert!(LIB_ACTIONS.contains("-and (Test-DefaultShell -Shell $Shell)"));
+        assert!(LIB_ACTIONS.contains("$result.command_line = $userScript"));
+        assert!(LIB_ACTIONS.contains("`nCommand line as executed by the agent: $userScript"));
+    }
+
+    /// Waited runs and finished stream polls report when the process
+    /// exited, by the remote clock: the freshness marker for their output.
+    #[test]
+    fn run_reports_finished_unix() {
+        assert!(LIB_ACTIONS.contains("finished_unix = Get-UnixNow"));
+        assert!(LIB_ACTIONS.contains("$state.ExitedUnix = Get-UnixNow"));
+        assert!(LIB_ACTIONS.contains("$poll.finished_unix = $state.ExitedUnix"));
+    }
+
+    /// Keyed `run` results reach the disk journal so a retry after a
+    /// reconnect or relaunch replays instead of re-executing.
+    #[test]
+    fn keyed_runs_are_journaled_on_disk() {
+        // Location: per-account local profile, never TEMP (per-session on
+        // RDS, wiped at logoff) and never the mapped drive.
+        assert!(LIB_ACTIONS.contains("$root = $env:LOCALAPPDATA"));
+        assert!(!LIB_ACTIONS.contains("TSCLIENT\\agent-rdp"));
+        assert!(LIB_ACTIONS.contains("function Write-PersistedJournalEntry"));
+        assert!(LIB_ACTIONS.contains("function Get-PersistedJournalEntry"));
+        assert!(LIB_ACTIONS.contains("function Remove-ExpiredJournalEntries"));
+        assert!(LIB_ACTIONS.contains("function ConvertTo-Hashtable"));
+        // Write-once through File.Move; UTF-8 without BOM on both sides.
+        assert!(LIB_ACTIONS.contains("[System.IO.File]::Move($tmp, $path)"));
+        assert!(LIB_ACTIONS.contains("[System.IO.File]::WriteAllText($tmp, $json, [System.Text.UTF8Encoding]::new($false))"));
+        assert!(LIB_ACTIONS.contains("[System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false))"));
+        assert!(LIB_ACTIONS.contains("journal_truncated"));
+        // Only keyed runs persist; the dispatch loop decides.
+        assert!(AGENT_SCRIPT.contains("$keyed = ($request.command -eq \"run\" -and [bool]$request.params.idempotency_key)"));
+        assert!(AGENT_SCRIPT.contains("-IncludeDisk:$keyed"));
+        assert!(AGENT_SCRIPT.contains("-Persist:$persist"));
+        // Replays are marked with the original time and never mutate the
+        // stored entry.
+        assert!(AGENT_SCRIPT.contains("$replayData = $replayData.Clone()"));
+        assert!(AGENT_SCRIPT.contains("$replayData[\"replayed_at_unix\"] = $replay.at_unix"));
+        assert!(AGENT_SCRIPT.contains("replayed from the journal: this idempotency key already ran"));
+        // The budget is not part of the key.
+        assert!(LIB_ACTIONS.contains("$copy.Remove(\"timeout_ms\")"));
+        assert!(LIB_ACTIONS.contains("$copy.PSObject.Properties.Remove(\"timeout_ms\")"));
+        // Duplicate ids no longer inflate the FIFO.
+        assert!(LIB_ACTIONS.contains("if (-not $script:ResultJournalOrder.Contains($Id))"));
+        assert!(AGENT_SCRIPT.contains("\"persistent_journal\""));
+        assert!(AGENT_SCRIPT.contains("$script:Version = \"1.7.0\""));
+    }
+
+    #[test]
+    fn retry_backoff_grows_and_caps() {
+        assert_eq!(retry_backoff(0), Duration::from_secs(60));
+        assert_eq!(retry_backoff(1), Duration::from_secs(60));
+        assert_eq!(retry_backoff(2), Duration::from_secs(120));
+        assert_eq!(retry_backoff(3), Duration::from_secs(240));
+        assert_eq!(retry_backoff(4), Duration::from_secs(300));
+        assert_eq!(retry_backoff(50), Duration::from_secs(300), "no overflow, just the cap");
+    }
+
+    fn ready_snapshot(now: std::time::Instant) -> RetrySnapshot {
+        RetrySnapshot {
+            generation_matches: true,
+            session_alive: true,
+            enabled: true,
+            relaunch_in_flight: false,
+            handshake_done: false,
+            agent_starting: false,
+            next_retry_at: Some(now - Duration::from_secs(1)),
+            last_input_age: Some(RETRY_INPUT_QUIET + Duration::from_secs(1)),
+            auto_relaunch_disabled: false,
+        }
+    }
+
+    /// The retry decision, case by case. The load-bearing ones: an
+    /// in-progress bootstrap (no retry armed, or in flight) never launches
+    /// a second agent, and recent operator input holds the launch back.
+    #[test]
+    fn should_retry_table() {
+        let now = std::time::Instant::now();
+        assert_eq!(should_retry(&ready_snapshot(now), now), Ok(()));
+
+        let mut s = ready_snapshot(now);
+        s.next_retry_at = None;
+        assert_eq!(should_retry(&s, now), Err("no retry scheduled"), "connect's bootstrap in progress");
+
+        let mut s = ready_snapshot(now);
+        s.relaunch_in_flight = true;
+        assert_eq!(should_retry(&s, now), Err("a launch is in progress"));
+
+        let mut s = ready_snapshot(now);
+        s.next_retry_at = Some(now + Duration::from_secs(30));
+        assert_eq!(should_retry(&s, now), Err("retry not due yet"));
+
+        let mut s = ready_snapshot(now);
+        s.last_input_age = Some(Duration::from_secs(10));
+        assert_eq!(should_retry(&s, now), Err("session input is not quiet yet"));
+
+        let mut s = ready_snapshot(now);
+        s.last_input_age = None;
+        assert_eq!(should_retry(&s, now), Ok(()), "never driven is quiet");
+
+        let mut s = ready_snapshot(now);
+        s.handshake_done = true;
+        assert_eq!(should_retry(&s, now), Err("agent is up"));
+
+        let mut s = ready_snapshot(now);
+        s.agent_starting = true;
+        assert_eq!(should_retry(&s, now), Err("an agent is visibly still starting"));
+
+        let mut s = ready_snapshot(now);
+        s.generation_matches = false;
+        assert_eq!(should_retry(&s, now), Err("session replaced"));
+
+        let mut s = ready_snapshot(now);
+        s.session_alive = false;
+        assert_eq!(should_retry(&s, now), Err("RDP session is gone"));
+
+        let mut s = ready_snapshot(now);
+        s.auto_relaunch_disabled = true;
+        assert!(should_retry(&s, now).is_err());
+    }
+
+    /// Failures schedule the next attempt with growing backoff and give up
+    /// after the cap; one success wipes the slate.
+    #[test]
+    fn launch_outcome_bookkeeping() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AutomationState::new(dir.path().to_path_buf());
+        let t0 = std::time::Instant::now();
+
+        record_launch_outcome(&mut state, &Err("handshake timed out".into()), t0);
+        assert_eq!(state.launch_failures, 1);
+        assert_eq!(state.next_retry_at, Some(t0 + Duration::from_secs(60)));
+        assert_eq!(state.last_error.as_deref(), Some("handshake timed out"));
+        assert_eq!(state.next_retry_secs(t0), Some(60));
+        assert_eq!(state.next_retry_secs(t0 + Duration::from_secs(90)), Some(0), "due is 0, not negative");
+
+        record_launch_outcome(&mut state, &Err("again".into()), t0);
+        assert_eq!(state.next_retry_at, Some(t0 + Duration::from_secs(120)));
+
+        for _ in 0..(MAX_LAUNCH_FAILURES - 2) {
+            record_launch_outcome(&mut state, &Err("again".into()), t0);
+        }
+        assert_eq!(state.launch_failures, MAX_LAUNCH_FAILURES);
+        assert_eq!(state.next_retry_at, None, "gave up");
+        assert!(state.last_error.as_deref().unwrap().contains("gave up after 6"));
+        assert!(state.last_error.as_deref().unwrap().contains("automate restart"));
+
+        record_launch_outcome(&mut state, &Ok(()), t0);
+        assert_eq!(state.launch_failures, 0);
+        assert_eq!(state.next_retry_at, None);
+        assert_eq!(state.last_error, None);
     }
 
     #[test]
@@ -638,5 +1054,104 @@ mod tests {
 
         assert_eq!(mapping.name, "agent-automation");
         assert!(mapping.path.contains("automation-"));
+    }
+}
+
+#[cfg(test)]
+mod retry_edge_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn state() -> AutomationState {
+        AutomationState::new(TempDir::new().unwrap().path().to_path_buf())
+    }
+
+    /// With the kill switch on, a failure never promises a retry: no
+    /// `next_retry_at`, `next_retry_secs` stays `None`, and the error says
+    /// what to do instead.
+    #[test]
+    fn kill_switch_never_schedules_a_retry() {
+        let mut s = state();
+        s.auto_relaunch_disabled = true;
+        let now = std::time::Instant::now();
+        record_launch_outcome(&mut s, &Err("handshake timed out".into()), now);
+        assert_eq!(s.next_retry_at, None);
+        assert_eq!(s.next_retry_secs(now), None);
+        assert!(s.last_error.as_deref().unwrap().contains(AUTO_RELAUNCH_KILL_SWITCH));
+        assert!(s.last_error.as_deref().unwrap().contains("automate restart"));
+
+        // Even an armed retry (a close event arms one) is hidden and refused.
+        s.next_retry_at = Some(now);
+        assert_eq!(s.next_retry_secs(now), None);
+        let snap = RetrySnapshot {
+            generation_matches: true,
+            session_alive: true,
+            enabled: true,
+            relaunch_in_flight: false,
+            handshake_done: false,
+            agent_starting: false,
+            next_retry_at: Some(now),
+            last_input_age: None,
+            auto_relaunch_disabled: true,
+        };
+        assert_eq!(
+            should_retry(&snap, now),
+            Err("automatic relaunch disabled by AGENT_RDP_NO_AUTO_RELAUNCH"),
+            "the kill switch is reported before any 'not due' verdict"
+        );
+    }
+
+    /// The schedule around the give-up threshold, and what a close event
+    /// does afterwards: it re-arms once, and the next failure gives up
+    /// again immediately.
+    #[test]
+    fn give_up_then_close_then_give_up_again() {
+        let mut s = state();
+        let t0 = std::time::Instant::now();
+        for _ in 0..(MAX_LAUNCH_FAILURES - 1) {
+            record_launch_outcome(&mut s, &Err("x".into()), t0);
+        }
+        assert_eq!(s.launch_failures, 5);
+        assert_eq!(s.next_retry_at, Some(t0 + Duration::from_secs(300)), "capped backoff");
+
+        record_launch_outcome(&mut s, &Err("x".into()), t0);
+        assert_eq!(s.next_retry_at, None, "sixth failure gives up");
+
+        // A close event (the supervisor's close arm) arms an immediate retry.
+        s.next_retry_at = Some(t0);
+        record_launch_outcome(&mut s, &Err("x".into()), t0);
+        assert_eq!(s.next_retry_at, None, "still past the threshold");
+        assert!(s.last_error.as_deref().unwrap().contains("gave up after 7"));
+    }
+
+    /// The bootstrap's own keystrokes are not operator input: the mark is
+    /// restored, so the retry gate measures operator activity only.
+    #[test]
+    fn launch_keystrokes_do_not_count_as_operator_input() {
+        // The restore call sits in `launch_agent`, around the typing.
+        let src = include_str!("bootstrap.rs");
+        let mark_at = src.find("let input_mark = rdp.input_activity_mark();").unwrap();
+        let type_at = src.find("self.type_launch_command(rdp, ps_command).await").unwrap();
+        let restore_at = src.find("rdp.restore_input_activity(input_mark);").unwrap();
+        assert!(mark_at < type_at && type_at < restore_at);
+    }
+
+    /// PowerShell side: the disk tier never falls back to TEMP, streamed
+    /// launches say so, and only launched keyed runs persist their failure.
+    #[test]
+    fn journal_persistence_edges_in_the_agent() {
+        assert!(!LIB_ACTIONS.contains("$root = $env:TEMP"));
+        assert!(LIB_ACTIONS.contains("LOCALAPPDATA is not set"));
+        assert!(LIB_ACTIONS.contains("$launch.streamed = $true"));
+        assert!(LIB_ACTIONS.contains("$script:LastRunLaunched = $true"));
+        assert!(LIB_ACTIONS.contains("$script:LastRunLaunched = $false"));
+        assert!(AGENT_SCRIPT.contains("$persist = $keyed -and ($success -or [bool]$script:LastRunLaunched)"));
+        assert!(AGENT_SCRIPT.contains("-Persist:$persist"));
+        // A corrupt entry is removed so the next execution can be recorded.
+        assert!(LIB_ACTIONS.contains("Discarding unreadable journal entry"));
+        assert!(LIB_ACTIONS.contains("Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue"));
+        // An unparseable --shell path is treated as non-default, not as a crash.
+        let shell_fn = LIB_ACTIONS.find("function Test-DefaultShell").unwrap();
+        assert!(LIB_ACTIONS[shell_fn..shell_fn + 600].contains("} catch {"));
     }
 }

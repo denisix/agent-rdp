@@ -63,15 +63,32 @@ other command then saw the connection drop mid-request). Only
 daemon is the one exception (always replaced). Every kill is recorded in
 `transcript.jsonl`.
 
-**Automation self-heal.** The DVC `close()` callback notifies a per-session
-supervisor (spawned by `connect` from `AutomationState::closed_rx`,
-scoped by `session_generation`, ended when `cleanup()` drops the DVC state)
-that relaunches the agent while the RDP session is alive - bounded to 3 per
-10 minutes, serialized with `automate restart` through `relaunch_in_flight`.
-IronRDP fires `close()` on ordinary disconnects too, which is why the
-supervisor is per session and generation-checked. `launch_and_wait` never
-holds `automation_state` across a handshake wait. The PS agent exits only on
-`DVC_FATAL:`-prefixed errors; every other read error is transient.
+**Automation self-heal.** A per-session supervisor (spawned by `connect`
+from `AutomationState::closed_rx`, scoped by `session_generation`, ended
+when `cleanup()` drops the DVC state) relaunches the agent when its DVC
+channel closes while the RDP session is alive, and retries a failed launch
+on a 30s tick with backoff (`retry_backoff`, give-up after
+`MAX_LAUNCH_FAILURES`). Invariants: **every launch goes through
+`launch_guarded`** (`connect`'s bootstrap included), which sets
+`relaunch_in_flight` and records the outcome; a retry is armed
+(`next_retry_at`) **only by a recorded failure or a close**, never by a
+bootstrap in progress, so a tick cannot double-launch under `connect`; and
+an automatic launch requires `RdpSession::last_input_age()` ≥
+`RETRY_INPUT_QUIET`, because it types Win+R and pastes into whatever has
+focus. `should_retry` is the pure decision and has a table test.
+`AGENT_RDP_NO_AUTO_RELAUNCH=1` disables it. IronRDP fires `close()` on
+ordinary disconnects too, which is why the supervisor is per session and
+generation-checked. `launch_and_wait` never holds `automation_state` across
+a handshake wait. `automate status` must keep answering while the agent is
+down (`offline_status`). The PS agent exits only on `DVC_FATAL:`-prefixed
+errors; every other read error is transient.
+
+**Idempotency journal.** Keyed `run` results are persisted by the PS agent
+under `%LOCALAPPDATA%\agent-rdp\journal` (write-once files, UTF-8 no BOM,
+never `%TEMP%` - per-session on RDS and wiped at logoff - and never the
+mapped drive). `agent.ps1` decides `$keyed`; `actions.ps1` owns the two
+tiers. Restored entries go through `ConvertTo-Hashtable` so the replay path
+(`-is [hashtable]`) treats them like live ones.
 
 **Version contract.** The daemon reports `CARGO_PKG_VERSION` in `Pong` and
 `SessionInfo`; the CLI (`session_manager.rs`) and the TS SDK (`daemon.ts`)
@@ -174,6 +191,7 @@ events.
 | `AGENT_RDP_SESSION` | Session name (default: "default") |
 | `AGENT_RDP_STREAM_PORT` | WebSocket streaming port (0 = disabled) |
 | `AGENT_RDP_MODELS_DIR` | OCR models directory (set by the npm wrapper; needed for standalone binary installs) |
+| `AGENT_RDP_NO_AUTO_RELAUNCH` | `1` disables the daemon's automatic relaunch of the automation agent |
 
 ## Release process
 

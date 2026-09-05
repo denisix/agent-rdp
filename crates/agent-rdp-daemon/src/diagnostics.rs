@@ -305,6 +305,10 @@ mod tests {
             replayed: false,
             early_exit: false,
             started_unix: None,
+            finished_unix: None,
+            command_line: None,
+            replayed_at_unix: None,
+            streamed: false,
         }));
         (Request::Automate(request), response)
     }

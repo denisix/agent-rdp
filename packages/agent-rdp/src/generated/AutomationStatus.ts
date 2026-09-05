@@ -52,4 +52,17 @@ last_rtt_ms?: number,
  * invalidate on reconnect, so this should inform that decision rather
  * than triggering an automatic one).
  */
-consecutive_failures: number, };
+consecutive_failures: number, 
+/**
+ * Why the agent is down, when it is: the last bootstrap or relaunch
+ * failure, as recorded by the daemon. Cleared when a launch succeeds.
+ * Present even while the agent is unreachable, because `status` is
+ * answered from the daemon's own state in that case.
+ */
+last_error?: string, 
+/**
+ * Seconds until the daemon's supervisor next tries to relaunch the
+ * agent on its own (only while the agent is down and a retry is
+ * scheduled; retries wait for the session to be idle first).
+ */
+next_retry_secs?: number, };

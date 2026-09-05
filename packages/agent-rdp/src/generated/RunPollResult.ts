@@ -23,4 +23,9 @@ exited: boolean,
 /**
  * Exit code, present once `exited` is true.
  */
-exit_code?: number, };
+exit_code?: number, 
+/**
+ * When the process exited, in Unix seconds by the remote clock
+ * (present once `exited` is true). See `RunResult::finished_unix`.
+ */
+finished_unix?: number, };

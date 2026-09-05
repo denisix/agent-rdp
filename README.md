@@ -323,8 +323,8 @@ agent-rdp automate run-poll <pid>                     # drain output; repeat unt
 agent-rdp automate run "Add-Content C:\log.txt x" --wait --idempotency-key step-07
                                             # a retry with the same key replays, never re-runs
 
-agent-rdp automate status                   # uptime, last DVC round-trip, failure count
-agent-rdp automate restart                  # relaunch the agent, keeping the RDP session
+agent-rdp automate status                   # health: RTT, failures, relaunches; works while the agent is down
+agent-rdp automate restart                  # relaunch the agent now, keeping the RDP session
 ```
 
 **Selectors:** `@e5` (snapshot ref), `#SaveButton` (automation ID), `.Edit`
@@ -352,10 +352,34 @@ so explicitly, since those are always safe to retry.
 **Retrying `run` safely.** Give a mutating `run` an `--idempotency-key`. A
 retry that reuses the key — after `indeterminate`, an IPC timeout or
 `daemon_unresponsive` — gets the recorded result of the first execution back
-(`replayed: true`) instead of running the command again; reusing a key for a
-*different* command is refused (`idempotency_key_reused`). The journal is
-per agent process (last 64 results) and empty after a reconnect, so after
-`connect` verify the side effect instead of retrying blindly.
+(`replayed: true`, with `replayed_at_unix`) instead of running the command
+again; reusing a key for a *different* command is refused
+(`idempotency_key_reused`). Keyed results are journaled on the remote host
+under `%LOCALAPPDATA%\agent-rdp\journal` (7 days / 256 keys, per Windows
+account), so a replay survives a reconnect, an agent relaunch and a logoff.
+A different host or profile (an RDS farm, a temporary profile) starts empty —
+verify the side effect there instead of retrying blindly. A retry with a
+longer `--process-timeout` still replays — including a run that timed out
+after starting (it may have had effects; verify, then use a new key). A parse
+error or a launch that never started is not persisted, so a retry executes.
+
+**What did it actually run?** Every `run` reply carries `command_line`: the
+exact text the agent handed to the child shell (the command, then each
+argument as a single-quoted literal). A command that does not parse as
+Windows PowerShell is refused before anything launches (`parse_error`, with
+line and column) and the error ends with that same command line — so a `$_`
+your local shell expanded away, or a `1,2` argument re-tokenised, is visible
+rather than guessed at. Waited runs also report `started_unix` and
+`finished_unix` on the remote clock, print `(no stdout captured: the command
+printed nothing)` when that is the case, and `(detached: output is not captured)` for a
+launch without `--wait`/`--stream`.
+
+**If the agent fails to start**, `connect` says so and the daemon keeps
+retrying in the background (backoff 60s → 5 min, only once no input has been
+sent for 2 minutes, at most 3 relaunch attempts per 10 minutes — each up to 3
+typed launches — giving up after 6 consecutive failures). `automate status` answers while the agent is down with
+`last_error` and `next_retry_secs`; `automate restart` retries at once;
+`AGENT_RDP_NO_AUTO_RELAUNCH=1` disables the automatic retries.
 
 **`run` exit codes mean something, and errors arrive as text.** The child
 runs with `$ErrorActionPreference='Stop'` inside a `try/catch` the agent adds:
@@ -494,6 +518,7 @@ Add `--json` to any command:
 | `AGENT_RDP_STREAM_PORT` | WebSocket streaming port (0 = disabled) |
 | `AGENT_RDP_MODELS_DIR` | OCR models directory (set automatically by the npm wrapper; needed for standalone binary installs) |
 | `AGENT_RDP_DIAGNOSTICS` | Set to `0` to disable the request transcript and failure captures |
+| `AGENT_RDP_NO_AUTO_RELAUNCH` | Set to `1` before `connect` to stop the daemon relaunching the automation agent on its own (`automate restart` still works) |
 
 ## Node.js API
 

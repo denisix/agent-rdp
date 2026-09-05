@@ -523,6 +523,8 @@ async fn process_request(
                 height,
                 pid: std::process::id(),
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                // Filled in by the CLI; the daemon does not know it.
+                cli_version: None,
                 uptime_secs: start_time.elapsed().as_secs(),
                 last_frame_age_ms,
                 // Filled in by `handle_client`, which owns the drop state.

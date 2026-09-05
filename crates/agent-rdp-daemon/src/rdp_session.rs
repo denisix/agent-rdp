@@ -139,6 +139,19 @@ pub struct RdpSession {
     task_handle: tokio::task::JoinHandle<()>,
     /// Shared with the RDPDR backend: when the remote last read a script.
     script_activity: Arc<std::sync::atomic::AtomicU64>,
+    /// When this daemon last drove the session itself (input events or a
+    /// clipboard write), as Unix milliseconds; 0 if never. The relaunch
+    /// supervisor waits for this to go quiet before typing into the
+    /// session on its own.
+    input_activity: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Unix milliseconds now, for the activity stamps.
+fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// What the daemon learns when a session's frame processor stops without
@@ -484,21 +497,45 @@ impl RdpSession {
             command_tx,
             task_handle,
             script_activity,
+            input_activity: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
     /// How long ago the remote last opened a `.ps1` on a mapped drive, or
     /// `None` if it never did. See `MultiDriveBackend::script_activity`.
     pub fn last_script_open_age(&self) -> Option<std::time::Duration> {
-        let at_ms = self.script_activity.load(std::sync::atomic::Ordering::Relaxed);
+        Self::age_of(self.script_activity.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// How long ago this daemon last sent input or set the clipboard, or
+    /// `None` if it never did in this session.
+    pub fn last_input_age(&self) -> Option<std::time::Duration> {
+        Self::age_of(self.input_activity.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn stamp_input_activity(&self) {
+        self.input_activity
+            .store(unix_millis_now(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The current input-activity mark, to hand back to
+    /// `restore_input_activity` after input that is *not* an operator's -
+    /// the automation bootstrap types Win+R and pastes, and must not count
+    /// as "someone is driving the session" against its own retry gate.
+    pub fn input_activity_mark(&self) -> u64 {
+        self.input_activity.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Undo the stamps made since `mark` was taken.
+    pub fn restore_input_activity(&self, mark: u64) {
+        self.input_activity.store(mark, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn age_of(at_ms: u64) -> Option<std::time::Duration> {
         if at_ms == 0 {
             return None;
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        Some(std::time::Duration::from_millis(now_ms.saturating_sub(at_ms)))
+        Some(std::time::Duration::from_millis(unix_millis_now().saturating_sub(at_ms)))
     }
 
     /// Perform TLS upgrade on the stream.
@@ -652,6 +689,7 @@ impl RdpSession {
     /// Send input events to the remote desktop.
     pub async fn send_input(&self, events: Vec<FastPathInputEvent>) -> Result<(), RdpError> {
         debug!("Sending {} input events to frame processor", events.len());
+        self.stamp_input_activity();
         self.send_command(SessionCommand::SendInput(events), "input").await
     }
 
@@ -721,6 +759,7 @@ impl RdpSession {
 
     /// Set clipboard text (will be available when remote pastes).
     pub async fn clipboard_set(&self, text: String) -> Result<(), RdpError> {
+        self.stamp_input_activity();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.send_command(SessionCommand::ClipboardSet { text, response_tx }, "clipboard set")
             .await?;

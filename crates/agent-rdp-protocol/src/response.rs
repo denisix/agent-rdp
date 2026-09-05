@@ -321,6 +321,13 @@ pub struct SessionInfo {
     #[serde(default)]
     pub daemon_version: String,
 
+    /// Version of the CLI that produced this output, filled in by the CLI
+    /// itself (the daemon leaves it unset). Lets one `session info` show
+    /// both sides of the version contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cli_version: Option<String>,
+
     /// Time since daemon started (seconds).
     #[ts(type = "number")]
     pub uptime_secs: u64,
@@ -595,5 +602,17 @@ mod tests {
 
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"type\":\"screenshot\""));
+    }
+
+    /// `cli_version` is filled by the CLI, absent from the daemon's JSON,
+    /// and tolerated by an older CLI reading a newer daemon.
+    #[test]
+    fn session_info_cli_version_is_optional() {
+        let json = r#"{"name":"s","state":"disconnected","pid":1,"uptime_secs":2}"#;
+        let info: SessionInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.cli_version, None);
+        assert!(!serde_json::to_string(&info).unwrap().contains("cli_version"));
+        let with = SessionInfo { cli_version: Some("0.7.15".into()), ..info };
+        assert!(serde_json::to_string(&with).unwrap().contains("\"cli_version\":\"0.7.15\""));
     }
 }

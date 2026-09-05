@@ -146,8 +146,13 @@ stream: boolean,
  * journaled result of the first execution back (`RunResult.replayed`)
  * instead of running the command a second time - the difference
  * between "retry after a lost reply" and "Add-Content applied
- * twice". 1-64 chars of `[A-Za-z0-9._:-]`. The journal lives in the
- * agent process (last 64 results) and is empty after a reconnect.
+ * twice". 1-64 chars of `[A-Za-z0-9._:-]`. Keyed results are
+ * journaled on the remote host (`%LOCALAPPDATA%\agent-rdp\journal`,
+ * 7 days / 256 keys, per Windows account), so a replay survives a
+ * reconnect and an agent relaunch. A different profile or host (a
+ * temporary profile, an RDS farm) starts empty - verify the side
+ * effect there. `timeout_ms` is not part of the key's fingerprint,
+ * so a retry with a longer `--process-timeout` still replays.
  */
 idempotency_key?: string, } | { "op": "run_poll", 
 /**

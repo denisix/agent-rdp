@@ -187,8 +187,13 @@ pub enum AutomateRequest {
         /// journaled result of the first execution back (`RunResult.replayed`)
         /// instead of running the command a second time - the difference
         /// between "retry after a lost reply" and "Add-Content applied
-        /// twice". 1-64 chars of `[A-Za-z0-9._:-]`. The journal lives in the
-        /// agent process (last 64 results) and is empty after a reconnect.
+        /// twice". 1-64 chars of `[A-Za-z0-9._:-]`. Keyed results are
+        /// journaled on the remote host (`%LOCALAPPDATA%\agent-rdp\journal`,
+        /// 7 days / 256 keys, per Windows account), so a replay survives a
+        /// reconnect and an agent relaunch. A different profile or host (a
+        /// temporary profile, an RDS farm) starts empty - verify the side
+        /// effect there. `timeout_ms` is not part of the key's fingerprint,
+        /// so a retry with a longer `--process-timeout` still replays.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         idempotency_key: Option<String>,
@@ -484,6 +489,19 @@ pub struct AutomationStatus {
     /// than triggering an automatic one).
     #[serde(default)]
     pub consecutive_failures: u32,
+    /// Why the agent is down, when it is: the last bootstrap or relaunch
+    /// failure, as recorded by the daemon. Cleared when a launch succeeds.
+    /// Present even while the agent is unreachable, because `status` is
+    /// answered from the daemon's own state in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub last_error: Option<String>,
+    /// Seconds until the daemon's supervisor next tries to relaunch the
+    /// agent on its own (only while the agent is down and a retry is
+    /// scheduled; retries wait for the session to be idle first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub next_retry_secs: Option<u64>,
 }
 
 /// Command run result.
@@ -523,6 +541,31 @@ pub struct RunResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub started_unix: Option<u64>,
+    /// When the process exited, in Unix seconds by the remote clock (waited
+    /// runs only). The freshness marker for `stdout`: a result whose
+    /// `finished_unix` is older than the caller's own step started is a
+    /// replay or a stale read, not this run's output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub finished_unix: Option<u64>,
+    /// The exact PowerShell source the agent handed to the child shell:
+    /// the command text followed by each argument as a single-quoted
+    /// literal. This is what a parse error refers to - compare it with what
+    /// you typed to see which layer (your local shell, the argument
+    /// quoting) changed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub command_line: Option<String>,
+    /// When `replayed`: the remote-clock time the original execution was
+    /// recorded, in Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub replayed_at_unix: Option<u64>,
+    /// The process was started with `stream: true`: its output is being
+    /// captured for `RunPoll`, as opposed to a plain detached launch where
+    /// nothing is captured.
+    #[serde(default)]
+    pub streamed: bool,
 }
 
 /// Incremental output from a process started with `Run { stream: true, .. }`.
@@ -543,6 +586,11 @@ pub struct RunPollResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub exit_code: Option<i32>,
+    /// When the process exited, in Unix seconds by the remote clock
+    /// (present once `exited` is true). See `RunResult::finished_unix`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub finished_unix: Option<u64>,
 }
 
 /// Click action result.
@@ -710,5 +758,43 @@ mod tests {
         let json = serde_json::to_string(&elem).unwrap();
         assert!(json.contains("\"role\":\"button\""));
         assert!(json.contains("\"ref\":1"));
+    }
+
+    /// New optional status fields default when absent and round-trip when present.
+    #[test]
+    fn automation_status_retry_fields_are_optional() {
+        let old: AutomationStatus = serde_json::from_str(r#"{"agent_running":false}"#).unwrap();
+        assert_eq!(old.last_error, None);
+        assert_eq!(old.next_retry_secs, None);
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("last_error"), "absent fields are not emitted: {}", json);
+
+        let full = AutomationStatus {
+            last_error: Some("handshake timed out".into()),
+            next_retry_secs: Some(42),
+            ..old
+        };
+        let back: AutomationStatus = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back.last_error.as_deref(), Some("handshake timed out"));
+        assert_eq!(back.next_retry_secs, Some(42));
+    }
+
+    /// `RunResult` from an older agent (no finished_unix/command_line) still
+    /// parses; the new fields round-trip.
+    #[test]
+    fn run_result_new_fields_are_optional() {
+        let old: RunResult = serde_json::from_str(r#"{"exit_code":0,"stdout":""}"#).unwrap();
+        assert_eq!(old.finished_unix, None);
+        assert_eq!(old.command_line, None);
+        assert_eq!(old.replayed_at_unix, None);
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("command_line"));
+        let full = RunResult { finished_unix: Some(5), command_line: Some("x".into()), replayed_at_unix: Some(3), ..old };
+        let back: RunResult = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back.finished_unix, Some(5));
+        assert_eq!(back.command_line.as_deref(), Some("x"));
+        assert_eq!(back.replayed_at_unix, Some(3));
+        let poll: RunPollResult = serde_json::from_str(r#"{"pid":1,"exited":true,"exit_code":0,"finished_unix":9}"#).unwrap();
+        assert_eq!(poll.finished_unix, Some(9));
     }
 }

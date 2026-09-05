@@ -80,7 +80,12 @@ async fn session_info(session: &str, output: &Output, timeout_ms: u64) -> anyhow
             std::process::exit(1);
         }
     };
-    let response = manager.send_with_retry(&mut client, &Request::SessionInfo, timeout_ms).await?;
+    let mut response = manager.send_with_retry(&mut client, &Request::SessionInfo, timeout_ms).await?;
+    // The daemon reports its own version; this side of the contract is
+    // ours to add, so one `session info` shows both.
+    if let Some(ResponseData::SessionInfo(ref mut info)) = response.data {
+        info.cli_version = Some(crate::session_manager::CLI_VERSION.to_string());
+    }
     output.print_response(&response);
 
     Ok(())

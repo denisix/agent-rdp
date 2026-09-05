@@ -96,7 +96,7 @@ Messages are JSON documents, one per DVC message (framing as above).
 ```json
 {
   "type": "handshake",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "agent_pid": 12345,
   "capabilities": ["snapshot", "click", "select", "toggle", ...]
 }
@@ -266,7 +266,7 @@ Commands use native Windows UI Automation patterns for reliable interaction:
 
 | Command | Purpose |
 |---------|---------|
-| `run` / `run_poll` | Launch a process; wait, or stream its output incrementally. The child script is assembled by `New-ChildScript`: a prelude (UTF-8 console output without BOM, guarded so a console-less child cannot die on it; `$ProgressPreference='SilentlyContinue'`; `$ErrorActionPreference='Stop'`; `$env:AGENT_RDP_AGENT_PID`), then the user script inside `try { … } catch { … }` whose catch prints the exception chain as plain text to stderr and exits 1, with `$LASTEXITCODE` preserved for native commands. Scripts with a `param` block or `using` statements (detected with the PowerShell parser) get the prelude only. `wait` takes precedence over `stream`. A detached launch reports `early_exit`/`exit_code` if the child is gone ~250ms after start. Streamed output is captured to files under `%TEMP%\agent-rdp-run` and read back by offset (a read failure is reported in-band and retried next poll); finished entries stay pollable for 10 minutes. Remaining CLIXML on stderr (parse errors, unwrapped scripts) is reduced by the daemon to the text of error/warning records, including `<Obj>` records' `ToString`. A `run` carrying `idempotency_key` uses it as the request id (see Indeterminate Results) |
+| `run` / `run_poll` | Launch a process; wait, or stream its output incrementally. The child script is assembled by `New-ChildScript`: a prelude (UTF-8 console output without BOM, guarded so a console-less child cannot die on it; `$ProgressPreference='SilentlyContinue'`; `$ErrorActionPreference='Stop'`; `$env:AGENT_RDP_AGENT_PID`), then the user script inside `try { … } catch { … }` whose catch prints the exception chain as plain text to stderr and exits 1, with `$LASTEXITCODE` preserved for native commands. Scripts with a `param` block or `using` statements (detected with the PowerShell parser, `Get-ChildScriptShape`) get the prelude only; a script with parse errors is refused before launch with `parse_error` (line/column per error) when the child shell is Windows PowerShell — the agent's own parser — and launched unwrapped for any other `shell`. Every reply carries `command_line` (the command plus each argument as a single-quoted literal, i.e. exactly what the child parses) and every error thrown by `Invoke-Run` ends with the same text. Waited runs add `finished_unix`; a finished stream poll adds it too. `wait` takes precedence over `stream`. A detached launch reports `early_exit`/`exit_code` if the child is gone ~250ms after start. Streamed output is captured to files under `%TEMP%\agent-rdp-run` and read back by offset (a read failure is reported in-band and retried next poll); finished entries stay pollable for 10 minutes. Remaining CLIXML on stderr (parse errors, unwrapped scripts) is reduced by the daemon to the text of error/warning records, including `<Obj>` records' `ToString`. A `run` carrying `idempotency_key` uses it as the request id (see Indeterminate Results) |
 | `file_write_chunk` | Append one base64 chunk to a remote file; verifies SHA-256 on the last chunk |
 | `file_read_chunk` | Read a byte range of a remote file as base64 |
 | `file_stat` | Existence, size, SHA-256, `modified_unix` (last write, UTC) and `now_unix` (the remote clock) of a remote path — the daemon derives the file's age from the two without assuming the hosts' clocks agree. Exposed as `agent-rdp file stat` |
@@ -310,15 +310,40 @@ sent is a reply the daemon times out on anyway.
 
 ### Relaunch Supervisor (Daemon)
 
-The DVC processor's `close()` callback notifies a per-session supervisor
-task (spawned by `connect`, bound to that session's generation and DVC
-state). If the RDP session is still alive and automation is enabled, it
-waits 5s and relaunches the agent through the same path as `automate
-restart`, at most 3 times per 10 minutes; the two are serialized by
-`relaunch_in_flight`. IronRDP also fires `close()` on an ordinary
-disconnect, which is why the supervisor is scoped to one session and exits
-when `cleanup()` drops the DVC state. `automate status` reports
-`relaunches`.
+A per-session supervisor task (spawned by `connect`, bound to that
+session's generation and DVC state) owns every automatic launch. It wakes
+on two things:
+
+- the DVC processor's `close()` callback (the agent process ended while
+  the RDP session is alive), which arms an immediate retry;
+- a 30s tick, which checks whether a scheduled retry is due.
+
+Every launch — `connect`'s bootstrap, `automate restart`, and the
+supervisor's — goes through `launch_guarded`, which sets
+`relaunch_in_flight` for its duration and records the outcome: success
+clears `last_error`; failure stores it, increments `launch_failures` and
+schedules `next_retry_at` with backoff (60s, 120s, 240s, then 300s), or
+gives up after `MAX_LAUNCH_FAILURES` (6) until a manual restart resets the
+count. A retry is armed **only** by a recorded failure or a close, never by
+a bootstrap in progress, so the tick cannot double a `connect` that is still
+waiting for its first handshake. The pure `should_retry` decision also
+requires: RDP session alive, automation enabled, no handshake, no agent
+visibly starting (`agent_is_starting`), the `RelaunchBudget` (3 attempts
+per 10 minutes, each attempt being one `launch_and_wait` of up to
+`LAUNCH_ATTEMPTS` typed launches; a refusal reschedules a minute out), and **no input sent by this
+daemon for `RETRY_INPUT_QUIET` (120s)** — a launch types Win+R and pastes
+into the focused window, which must not happen under an operator's
+`keyboard`/`mouse` sequence. `AGENT_RDP_NO_AUTO_RELAUNCH=1` in the daemon's
+environment disables automatic launches (captured into `AutomationState`
+at `initialize()`; `next_retry_secs` is then never reported). The
+bootstrap's own keystrokes do not count as input: `launch_agent` restores
+the pre-launch `input_activity` mark afterwards.
+
+IronRDP also fires `close()` on an ordinary disconnect, which is why the
+supervisor is scoped to one session and exits when `cleanup()` drops the
+DVC state. `automate status` reports `relaunches`, `last_error` and
+`next_retry_secs`, and is answered from daemon state alone
+(`offline_status`) while the agent cannot be reached.
 
 ### Indeterminate Results
 
@@ -340,8 +365,30 @@ the journaled result — with `replayed: true` added to the data — instead of
 executing again; a matching id with a different fingerprint is refused with
 `idempotency_key_reused`. The daemon's own ids are random, so this only fires
 for a caller-supplied `idempotency_key` on `run` (which becomes the request id
-verbatim; the daemon rejects a key that is still in flight). The journal lives
-in the agent process, so it is empty after a reconnect.
+verbatim; the daemon rejects a key that is still in flight). The fingerprint
+leaves out `timeout_ms`, so a retry with a longer budget is the same request.
+
+The journal has two tiers. Every result is kept in memory (64 entries,
+FIFO). A `run` that carried an `idempotency_key` (the dispatch loop's
+`$keyed`) is also written to disk if it succeeded or its child process was
+started (`$script:LastRunLaunched`; a parse error or a `Process.Start`
+failure had no side effect and is kept in memory only), because that is the one case where the id
+outlives the agent process: `%LOCALAPPDATA%\agent-rdp\journal\<sha256(id)>.json`
+(`Write-PersistedJournalEntry`), one JSON object with `id`, `success`,
+`data` (stdout/stderr capped at 512K characters each, `journal_truncated`
+when cut),
+`error`, `fingerprint`, `at`, `at_unix`. Written UTF-8 without BOM via
+`[IO.File]::WriteAllText` to a temp file and `[IO.File]::Move`d into place
+— write-once, so the first execution's record wins over a racing writer.
+Pruned on write to 256 entries / 7 days. Lookups (`Get-JournalEntry
+-IncludeDisk`, `query_result`) fall through to disk and restore the object
+through `ConvertTo-Hashtable` (PowerShell 5.1 has no `-AsHashtable`), so a
+restored entry replays exactly like a live one: `replayed: true` plus
+`replayed_at_unix`, and a replayed *error* carries a "replayed from the
+journal … use a new key" suffix. An unreadable file is treated as unknown
+and the request executes. Not `%TEMP%`: on a session host that is
+per-logon and deleted at logoff. Per Windows account and per host — a
+temporary profile or another farm member starts empty.
 
 ### Error Codes
 
@@ -351,6 +398,7 @@ in the agent process, so it is empty after a reconnect.
 | `stale_ref` | @ref number not in current snapshot |
 | `command_failed` | UI Automation operation failed |
 | `idempotency_key_reused` | Request id already journaled for a different command; not executed |
+| `parse_error` (`command_failed` from the daemon's view) | `run` text does not parse as Windows PowerShell; nothing was launched. Message lists line/column per error and ends with the command line as assembled |
 | `timeout` | Operation exceeded timeout |
 | `channel_closed` | DVC channel was closed |
 | `unknown` | Unspecified error |
@@ -398,3 +446,7 @@ Relaunch Supervisor above).
    by the same frame-processor task that carries this DVC channel, so the agent
    would be waiting on a reply that cannot be produced until it stops waiting.
    Use the `file_*` commands instead.
+6. **Journal scope**: the persistent idempotency journal is per Windows
+   account and per host. A temporary profile (`C:\Users\TEMP`) is discarded
+   at logoff, and an RDS farm may place the next logon on another member;
+   both look like "unknown key" and the command executes again.

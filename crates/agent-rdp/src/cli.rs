@@ -577,8 +577,9 @@ pub enum AutomateAction {
         /// Idempotency key. Reuse the same key when retrying this exact
         /// command after a timeout or automation_indeterminate: the agent
         /// returns the recorded result instead of running it again.
-        /// 1-64 chars of [A-Za-z0-9._:-]; kept in the agent's 64-entry
-        /// journal, which is empty after a reconnect.
+        /// 1-64 chars of [A-Za-z0-9._:-]. Journaled on the remote host
+        /// (%LOCALAPPDATA%\agent-rdp\journal, 7 days / 256 keys), so the
+        /// replay survives reconnects and agent relaunches.
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },

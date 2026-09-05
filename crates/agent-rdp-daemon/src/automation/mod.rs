@@ -10,8 +10,9 @@ pub mod dvc_encode;
 mod dvc_ipc;
 
 pub use bootstrap::{
-    launch_and_wait_worst_case, relaunch_agent, spawn_relaunch_supervisor, AutomationBootstrap,
-    RelaunchBudget, LAUNCH_ATTEMPTS,
+    launch_and_wait_worst_case, launch_guarded, relaunch_agent, spawn_relaunch_supervisor,
+    AutomationBootstrap, RelaunchBudget, LAUNCH_ATTEMPTS, MAX_LAUNCH_FAILURES,
+    RETRY_INPUT_QUIET,
 };
 pub use dvc_channel::{
     new_shared_dvc_state, AutomationDvc, DvcCommandReceiver, DvcCommandSender, DvcHandshake,
@@ -51,8 +52,25 @@ pub struct AutomationState {
     /// A relaunch (`automate restart` or the supervisor) is running. Two at
     /// once would launch two agents and fight over the Run dialog.
     pub relaunch_in_flight: bool,
-    /// Relaunches performed by the supervisor since this session connected.
+    /// Successful relaunches (supervisor or `automate restart`) since this
+    /// session connected.
     pub relaunches: u32,
+    /// Why the agent is down: the last bootstrap/relaunch failure. Cleared
+    /// by a successful launch. Reported by `automate status` even while the
+    /// agent cannot be reached.
+    pub last_error: Option<String>,
+    /// When the supervisor may next try to relaunch on its own. Armed only
+    /// by a recorded failure - never by an in-progress bootstrap - so a
+    /// supervisor tick cannot launch a second agent under a `connect` that
+    /// is still waiting for the first.
+    pub next_retry_at: Option<std::time::Instant>,
+    /// Consecutive failed launches; drives the retry backoff and the
+    /// give-up threshold. Reset by success and by `automate restart`.
+    pub launch_failures: u32,
+    /// `AGENT_RDP_NO_AUTO_RELAUNCH` was set when this session initialized:
+    /// no retry is ever scheduled, and status says so instead of promising
+    /// one.
+    pub auto_relaunch_disabled: bool,
 }
 
 impl AutomationState {
@@ -73,7 +91,22 @@ impl AutomationState {
             closed_rx: None,
             relaunch_in_flight: false,
             relaunches: 0,
+            last_error: None,
+            next_retry_at: None,
+            launch_failures: 0,
+            auto_relaunch_disabled: false,
         }
+    }
+
+    /// Seconds until the next automatic relaunch attempt, if one is
+    /// scheduled and not yet due (0 when due). Never `Some` when automatic
+    /// relaunches are disabled.
+    pub fn next_retry_secs(&self, now: std::time::Instant) -> Option<u64> {
+        if self.auto_relaunch_disabled {
+            return None;
+        }
+        self.next_retry_at
+            .map(|at| at.saturating_duration_since(now).as_secs())
     }
 
     /// Get the path where the PowerShell script should be written.

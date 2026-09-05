@@ -424,27 +424,13 @@ export class RdpSession {
    */
   async getInfo(): Promise<SessionInfo> {
     const response = await this._send({ type: 'session_info' });
-    const data = response.data as unknown as {
-      type: 'session_info';
-      name: string;
-      state: SessionInfo['state'];
-      host?: string;
-      width?: number;
-      height?: number;
-      pid: number;
-      daemon_version?: string;
-      uptime_secs: number;
-    };
-
+    // The wire shape is the generated `SessionInfo` plus a `type` tag; pass
+    // every field through rather than hand-copying a subset (an earlier
+    // projection silently dropped `last_disconnect` and `last_frame_age_ms`).
+    const { type: _type, ...info } = response.data as unknown as SessionInfo & { type: 'session_info' };
     return {
-      name: data.name,
-      state: data.state,
-      host: data.host,
-      width: data.width,
-      height: data.height,
-      pid: data.pid,
-      daemon_version: data.daemon_version ?? '',
-      uptime_secs: data.uptime_secs,
+      ...info,
+      daemon_version: info.daemon_version ?? '',
     };
   }
 

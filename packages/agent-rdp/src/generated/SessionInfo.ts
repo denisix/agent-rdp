@@ -36,6 +36,12 @@ pid: number,
  */
 daemon_version: string, 
 /**
+ * Version of the CLI that produced this output, filled in by the CLI
+ * itself (the daemon leaves it unset). Lets one `session info` show
+ * both sides of the version contract.
+ */
+cli_version?: string, 
+/**
  * Time since daemon started (seconds).
  */
 uptime_secs: number, 
