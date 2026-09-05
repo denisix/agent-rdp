@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.15](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.14...agent-rdp-v0.7.15) (2026-09-05)
+
+
+### Features
+
+* persistent idempotency journal, honest run errors, self-recovering agent bootstrap ([cf9a6df](https://github.com/denisix/agent-rdp/commit/cf9a6df1860716546ad075f8b349e363c8cd9635))
+
 ## [0.7.14](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.13...agent-rdp-v0.7.14) (2026-09-03)
 
 
