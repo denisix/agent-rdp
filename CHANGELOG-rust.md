@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.16](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.15...agent-rdp-rust-v0.7.16) (2026-09-05)
+
+
+### Features
+
+* keep idle sessions alive, retry racing file pulls, report pending polls ([14c8667](https://github.com/denisix/agent-rdp/commit/14c8667a693d06f960a5f03d96142c6521505764))
+
 ## [0.7.15](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.14...agent-rdp-rust-v0.7.15) (2026-09-05)
 
 
