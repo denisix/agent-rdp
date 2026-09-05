@@ -635,8 +635,10 @@ fn annotate_not_connected(response: &mut Response, last_disconnect: &SharedLastD
     };
     error.message = format!(
         "{}. The RDP transport dropped {}s ago ({}); the daemon itself is alive - \
-         re-establish the session with `agent-rdp connect ...` (automation is relaunched \
-         automatically).",
+         re-establish the session with `agent-rdp connect ...`. Note that reconnecting \
+         relaunches the automation agent by typing Win+R on the remote desktop, which \
+         takes foreground from whatever is focused there - if other automation shares \
+         that desktop, expect it to notice.",
         error.message.trim_end_matches('.'),
         info.seconds_ago(),
         info.reason

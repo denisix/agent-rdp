@@ -71,6 +71,16 @@ pub struct AutomationState {
     /// no retry is ever scheduled, and status says so instead of promising
     /// one.
     pub auto_relaunch_disabled: bool,
+    /// Every successful launch this daemon process has done against the
+    /// current target, `connect`'s own bootstrap included. Deliberately
+    /// **not** reset by `initialize()`/`cleanup()`, unlike `relaunches`:
+    /// a counter that resets on every reconnect cannot answer "has the
+    /// agent been up all day, or was this session rebuilt an hour ago?".
+    /// Reset only when `connect` targets a different host:port, since one
+    /// counter spanning two machines would be worse than none.
+    pub total_launches: u32,
+    /// The `host:port` the launches above were counted against.
+    pub launch_target: Option<String>,
 }
 
 impl AutomationState {
@@ -95,6 +105,8 @@ impl AutomationState {
             next_retry_at: None,
             launch_failures: 0,
             auto_relaunch_disabled: false,
+            total_launches: 0,
+            launch_target: None,
         }
     }
 

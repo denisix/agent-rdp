@@ -73,9 +73,15 @@ pub async fn run(
     // socket read has to outlast the command's own budget - otherwise the
     // CLI gives up on a request the daemon and agent are still working on,
     // and the caller is left not knowing whether it applied.
-    let response = manager
+    let mut response = manager
         .send_with_retry(&mut client, &request, automate_timeout_ms(&request, timeout_ms))
         .await?;
+
+    // The daemon cannot know the CLI's version; filling it in here makes one
+    // `automate status` answer "which three versions am I running".
+    if let Some(ResponseData::AutomationStatus(status)) = response.data.as_mut() {
+        status.cli_version = Some(crate::session_manager::CLI_VERSION.to_string());
+    }
 
     if let Some(budget) = follow_budget {
         return follow_poll(&manager, &mut client, &request, response, budget, output, timeout_ms).await;
@@ -169,6 +175,7 @@ async fn follow_poll(
                     exited: true,
                     exit_code: result.exit_code,
                     finished_unix: result.finished_unix,
+                    pending: false,
                 };
                 output.print_response(&agent_rdp_protocol::Response::success(
                     ResponseData::RunPollResult(merged),
@@ -185,13 +192,21 @@ async fn follow_poll(
 
         if started.elapsed() >= budget {
             if output.is_json() {
+                let stdout_chunk = std::mem::take(&mut all_stdout);
+                let stderr_chunk = std::mem::take(&mut all_stderr);
+                // Same rule as a single poll, applied to the whole window: a
+                // follow that ran its budget without ever seeing a byte has
+                // to say so, or it hands back the very shape (`exited:false`
+                // plus empty chunks) that `pending` exists to disambiguate.
+                let pending = stdout_chunk.is_empty() && stderr_chunk.is_empty();
                 let merged = agent_rdp_protocol::RunPollResult {
                     pid: result.pid,
-                    stdout_chunk: std::mem::take(&mut all_stdout),
-                    stderr_chunk: std::mem::take(&mut all_stderr),
+                    stdout_chunk,
+                    stderr_chunk,
                     exited: false,
                     exit_code: None,
                     finished_unix: None,
+                    pending,
                 };
                 output.print_response(&agent_rdp_protocol::Response::success(
                     ResponseData::RunPollResult(merged),
@@ -870,5 +885,31 @@ mod shell_expansion_hint_tests {
         assert!(local_shell_expansion_hint("& { . .\\lib.ps1; Run }").is_none());
         assert!(local_shell_expansion_hint("& { ./run.sh }").is_none());
         assert!(local_shell_expansion_hint("& { ..\\up.ps1 }").is_none());
+    }
+}
+
+#[cfg(test)]
+mod follow_aggregate_tests {
+    /// `follow_poll`'s budget-expiry branch builds its JSON from the text
+    /// collected across the whole window, so `pending` has to be derived the
+    /// same way a single poll derives it. Hardcoding `false` here handed back
+    /// exactly the shape (`exited: false` + empty chunks) that `pending`
+    /// exists to disambiguate.
+    #[test]
+    fn a_follow_that_saw_nothing_still_reports_pending() {
+        let source = include_str!("automate.rs");
+        let expiry = source
+            .split("if started.elapsed() >= budget")
+            .nth(1)
+            .expect("the budget-expiry branch exists");
+        let branch = &expiry[..expiry.find("} else {").unwrap_or(expiry.len())];
+        assert!(
+            branch.contains("stdout_chunk.is_empty() && stderr_chunk.is_empty()"),
+            "pending must be computed from the aggregate, not hardcoded"
+        );
+        assert!(
+            !branch.contains("pending: false"),
+            "a silent follow window is pending, not 'not pending'"
+        );
     }
 }

@@ -523,6 +523,13 @@ pub enum ErrorCode {
     #[error("stale file")]
     StaleFile,
 
+    /// `file pull`: the remote file was rewritten between the hash and the
+    /// read, on every attempt. Distinct from `internal_error` so a caller
+    /// polling a file that its producer rewrites can retry rather than treat
+    /// it as a transfer bug.
+    #[error("file changed during transfer")]
+    FileChangedDuringTransfer,
+
     /// Clipboard operation failed.
     #[error("clipboard error")]
     ClipboardError,

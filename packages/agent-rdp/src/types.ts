@@ -82,6 +82,15 @@ export interface ConnectOptions {
   drives?: DriveMapping[];
   /** Enable Windows UI Automation. */
   enableWinAutomation?: boolean;
+  /**
+   * Seconds between keep-alive PDUs; 0 disables them (default: 45).
+   *
+   * An idle RDP session sends nothing in either direction, so a NAT or
+   * firewall on the path drops it after its own idle timeout - and
+   * recovering from that costs a reconnect, which relaunches the automation
+   * agent by typing Win+R on the remote desktop.
+   */
+  keepAliveSecs?: number;
 }
 
 /** Result of a successful connection. */

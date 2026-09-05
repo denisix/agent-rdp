@@ -21,6 +21,16 @@ capabilities: Array<string>,
  */
 version?: string, 
 /**
+ * Daemon version, so one `status` call answers "which three versions am
+ * I running" without a second, heavier `session info` round-trip.
+ */
+daemon_version?: string, 
+/**
+ * CLI version. The daemon leaves this `None`; the CLI fills it in from
+ * its own `CARGO_PKG_VERSION` before printing, like `SessionInfo` does.
+ */
+cli_version?: string, 
+/**
  * Path of the agent's own log file on the remote machine, when the
  * agent reports one. `agent-rdp diagnose` pulls it into the bundle.
  */
@@ -32,6 +42,16 @@ log_path?: string,
  * the remote log via `agent-rdp diagnose`.
  */
 relaunches: number, 
+/**
+ * Every successful agent launch this daemon process has performed against
+ * the current target, `connect`'s own bootstrap included - unlike
+ * `relaunches`, which counts only self-heal/manual restarts and resets on
+ * every `connect`. This is what distinguishes "the agent has been up all
+ * day" (stays 1) from "the session was rebuilt an hour ago" (grows),
+ * which `relaunches` alone cannot answer. Resets when a `connect`
+ * targets a different host:port.
+ */
+total_launches: number, 
 /**
  * Seconds since the current agent's DVC handshake completed. Distinct
  * from `agent_running`: an agent can be "running" per the PS-reported

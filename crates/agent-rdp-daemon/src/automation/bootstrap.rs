@@ -104,6 +104,10 @@ pub fn record_launch_outcome(
             state.last_error = None;
             state.next_retry_at = None;
             state.launch_failures = 0;
+            // Counts `connect`'s bootstrap too, which `relaunches` does not:
+            // that launch types Win+R and pastes on the remote desktop, so it
+            // needs to be visible somewhere.
+            state.total_launches = state.total_launches.saturating_add(1);
         }
         Err(reason) => {
             state.launch_failures = state.launch_failures.saturating_add(1);
@@ -1153,5 +1157,81 @@ mod retry_edge_tests {
         // An unparseable --shell path is treated as non-default, not as a crash.
         let shell_fn = LIB_ACTIONS.find("function Test-DefaultShell").unwrap();
         assert!(LIB_ACTIONS[shell_fn..shell_fn + 600].contains("} catch {"));
+    }
+}
+
+#[cfg(test)]
+mod keep_alive_and_launch_count_tests {
+    use super::*;
+
+    fn state() -> AutomationState {
+        AutomationState::new(std::path::PathBuf::from("/tmp/agent-rdp-test"))
+    }
+
+    /// Every successful launch counts, `connect`'s bootstrap included -
+    /// that one types Win+R on the remote desktop and was previously
+    /// invisible, because only `relaunch_agent` touched `relaunches`.
+    #[test]
+    fn every_successful_launch_counts_including_the_bootstrap() {
+        let mut st = state();
+        let now = std::time::Instant::now();
+        assert_eq!(st.total_launches, 0);
+
+        record_launch_outcome(&mut st, &Ok(()), now);
+        assert_eq!(st.total_launches, 1);
+        assert_eq!(st.relaunches, 0, "the bootstrap is not a *re*launch");
+
+        record_launch_outcome(&mut st, &Err("no handshake".into()), now);
+        assert_eq!(st.total_launches, 1, "a failed launch does not count");
+
+        record_launch_outcome(&mut st, &Ok(()), now);
+        assert_eq!(st.total_launches, 2);
+    }
+
+    /// `relaunches` is zeroed by every `connect`; `total_launches` is not,
+    /// which is the whole point - otherwise nothing distinguishes "up all
+    /// day" from "the session was rebuilt an hour ago".
+    #[test]
+    fn a_reconnect_resets_relaunches_but_not_total_launches() {
+        let source = include_str!("bootstrap.rs");
+        let initialize = source
+            .split("pub async fn initialize")
+            .nth(1)
+            .expect("initialize exists");
+        let body = &initialize[..initialize.find("\n    }").unwrap_or(initialize.len())];
+        assert!(body.contains("state.relaunches = 0"));
+        assert!(
+            !body.contains("total_launches"),
+            "initialize() must not reset total_launches"
+        );
+
+        let cleanup = source.split("pub async fn cleanup").nth(1).expect("cleanup exists");
+        let cleanup_body = &cleanup[..cleanup.find("\n    }").unwrap_or(cleanup.len())];
+        assert!(
+            !cleanup_body.contains("total_launches"),
+            "cleanup() must not reset total_launches either"
+        );
+    }
+
+    /// The keep-alive must stay a Refresh Rect PDU. A synchronize input
+    /// event is the tempting "simpler" rewrite and would silently switch
+    /// Num Lock off on the remote desktop on every tick.
+    #[test]
+    fn keep_alive_never_sends_an_input_event() {
+        let source = include_str!("../rdp_session.rs");
+        let arm = source
+            .split("// Keep the connection alive while idle")
+            .nth(1)
+            .expect("keep-alive arm exists");
+        let arm = &arm[..arm.find("// Handle incoming commands").unwrap_or(arm.len())];
+        assert!(arm.contains("RefreshRectangle"), "keep-alive sends Refresh Rect");
+        assert!(
+            !arm.contains("SyncEvent") && !arm.contains("FastPathInputEvent"),
+            "a keep-alive must never be an input event: it would rewrite the \
+             remote lock-key state every tick"
+        );
+        // Sending on a keep-alive tick must not stamp input activity, or the
+        // supervisor's idle gate would never open.
+        assert!(!arm.contains("stamp_input_activity"));
     }
 }

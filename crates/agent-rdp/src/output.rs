@@ -237,7 +237,13 @@ impl Output {
                     println!("Agent PID: {}", pid);
                 }
                 if let Some(ref version) = status.version {
-                    println!("Version: {}", version);
+                    println!("Agent version: {}", version);
+                }
+                if let Some(ref version) = status.daemon_version {
+                    println!("Daemon version: {}", version);
+                }
+                if let Some(ref version) = status.cli_version {
+                    println!("CLI version: {}", version);
                 }
                 if !status.capabilities.is_empty() {
                     println!("Capabilities: {}", status.capabilities.join(", "));
@@ -257,7 +263,15 @@ impl Output {
                     );
                 }
                 if status.relaunches > 0 {
-                    println!("Relaunches this session: {}", status.relaunches);
+                    println!("Relaunches since connect: {}", status.relaunches);
+                }
+                if status.total_launches > 0 {
+                    // `relaunches` resets on every connect, so on its own it
+                    // cannot tell "up all day" from "rebuilt an hour ago".
+                    println!(
+                        "Agent launches against this host: {} (includes each connect's bootstrap)",
+                        status.total_launches
+                    );
                 }
                 if let Some(ref err) = status.last_error {
                     println!("Last launch error: {}", err);
@@ -350,6 +364,13 @@ impl Output {
                             .exit_code
                             .map(|c| format!(" (code {})", c))
                             .unwrap_or_default()
+                    );
+                } else if result.pending {
+                    // Printing nothing here is indistinguishable from a poll
+                    // that never reached the agent.
+                    eprintln!(
+                        "Process {} is running; no output since the last poll",
+                        result.pid
                     );
                 }
             }

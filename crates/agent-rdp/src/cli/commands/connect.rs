@@ -52,6 +52,7 @@ pub async fn run(
         stream_bind,
         // CLI enables the viewer HTML when streaming is enabled
         serve_viewer: stream_port > 0,
+        keep_alive_secs: args.keep_alive_secs,
         ..Default::default()
     });
 

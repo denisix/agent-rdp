@@ -307,6 +307,7 @@ export class RdpSession {
    * @param options.height Desktop height (default: 800)
    * @param options.drives Drives to map
    * @param options.enableWinAutomation Enable Windows UI Automation
+   * @param options.keepAliveSecs Seconds between keep-alive PDUs (default: 45, 0 disables)
    */
   async connect(options: ConnectOptions): Promise<ConnectResult> {
     // Ensure daemon is running and connect
@@ -329,6 +330,7 @@ export class RdpSession {
       stream_quality: this.streamQuality,
       // Serve the HTML viewer whenever streaming is on, matching the CLI.
       serve_viewer: this.streamPort > 0,
+      keep_alive_secs: options.keepAliveSecs ?? 45,
     };
 
     const response = await this._send(request);

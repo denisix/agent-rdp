@@ -65,4 +65,14 @@ stream_quality: number,
  * Serve the embedded HTML viewer on the streaming port (default: false).
  * When false, only WebSocket connections are accepted.
  */
-serve_viewer: boolean, };
+serve_viewer: boolean, 
+/**
+ * Seconds between keep-alive PDUs; 0 disables them (default: 45).
+ *
+ * An idle RDP session sends nothing in either direction - RDP only ships
+ * screen deltas - so a NAT or middlebox on the path drops the connection
+ * after its own idle timeout (observed in the field at ~285s). TCP
+ * keepalive alone did not prevent it. Each tick sends a Refresh Rect PDU,
+ * which is real wire traffic with no input, focus or lock-key semantics.
+ */
+keep_alive_secs: number, };

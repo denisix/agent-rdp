@@ -3,4 +3,4 @@
 /**
  * Error codes for structured error handling.
  */
-export type ErrorCode = "not_connected" | "already_connected" | "connection_failed" | "authentication_failed" | "timeout" | "invalid_request" | "not_supported" | "internal_error" | "session_not_found" | "ipc_error" | "daemon_not_running" | "daemon_unresponsive" | "daemon_version_mismatch" | "stale_file" | "clipboard_error" | "drive_error" | "automation_not_enabled" | "automation_error" | "automation_indeterminate" | "element_not_found" | "stale_ref" | "command_failed";
+export type ErrorCode = "not_connected" | "already_connected" | "connection_failed" | "authentication_failed" | "timeout" | "invalid_request" | "not_supported" | "internal_error" | "session_not_found" | "ipc_error" | "daemon_not_running" | "daemon_unresponsive" | "daemon_version_mismatch" | "stale_file" | "file_changed_during_transfer" | "clipboard_error" | "drive_error" | "automation_not_enabled" | "automation_error" | "automation_indeterminate" | "element_not_found" | "stale_ref" | "command_failed";

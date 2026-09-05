@@ -63,6 +63,31 @@ other command then saw the connection drop mid-request). Only
 daemon is the one exception (always replaced). Every kill is recorded in
 `transcript.jsonl`.
 
+**Keep-alive.** `run_frame_processor`'s `select!` has a timer arm that sends a
+Refresh Rect PDU every `ConnectRequest::keep_alive_secs` (default 45, `0`
+disables, `connect --keep-alive-secs`). RDP ships only screen deltas, so an
+idle session puts nothing on the wire and a NAT/middlebox on the path drops it
+(~285s in the field); OS-level TCP keepalive did not prevent that. The payload
+must stay a Refresh Rect: a `SyncEvent` input PDU would also be traffic, but it
+makes the server adopt the lock-key state it carries, silently switching Num
+Lock off on the remote desktop every tick. The tick also must not run through
+`send_input` - that stamps `input_activity`, and a 45s tick would pin
+`last_input_age()` under the supervisor's 120s `RETRY_INPUT_QUIET` gate
+forever, disabling automatic relaunch. Sending from inside the frame processor
+avoids that by construction. Keep the encode/write out of any lock guard, like
+the arms around it.
+
+**Reconnect is not free for the remote desktop.** `connect` with automation
+enabled relaunches the agent via Win+R/paste/Enter - a real foreground event on
+a shared desktop. It is not avoidable by checking whether the old agent is
+alive first: a dead transport invalidates the remote channel handle, and those
+Win32 errors are in `dvc.ps1`'s `DvcFatalWin32Errors`, so the agent has already
+exited. Fewer forced reconnects (keep-alive) is the mitigation; say so in docs
+rather than promising a "safe reconnect". `relaunches` never counted these
+bootstrap launches (only `relaunch_agent` increments it) - `total_launches`,
+incremented in `record_launch_outcome` and reset only when `connect` targets a
+different `host:port`, is what makes them visible.
+
 **Automation self-heal.** A per-session supervisor (spawned by `connect`
 from `AutomationState::closed_rx`, scoped by `session_generation`, ended
 when `cleanup()` drops the DVC state) relaunches the agent when its DVC
@@ -131,7 +156,13 @@ are easy to break:
 
 **`handlers/*.rs`** — one module per command type, each returning a `Response`.
 `file_transfer.rs` moves files in chunks over the automation DVC channel with
-SHA-256 verification on both ends.
+SHA-256 verification on both ends. A pull's hash (`FileStat`) and its bytes
+(`FileReadChunk`) are separate remote opens, so a file being rewritten can
+change in between; `pull_once` is one whole attempt and `handle_pull` runs up
+to `PULL_ATTEMPTS` of them (exponential backoff) for files under
+`PULL_RETRY_MAX_BYTES`, then reports `file_changed_during_transfer`. Each
+attempt re-stats, so `--max-age` describes the bytes actually delivered; the
+local file is written once, after verification.
 
 **`automation/*.rs`** — Windows UI Automation via a PowerShell agent injected
 into the remote session, over a Dynamic Virtual Channel. Scripts under
@@ -192,6 +223,9 @@ events.
 | `AGENT_RDP_STREAM_PORT` | WebSocket streaming port (0 = disabled) |
 | `AGENT_RDP_MODELS_DIR` | OCR models directory (set by the npm wrapper; needed for standalone binary installs) |
 | `AGENT_RDP_NO_AUTO_RELAUNCH` | `1` disables the daemon's automatic relaunch of the automation agent |
+
+`connect --keep-alive-secs <n>` (default 45, `0` disables) sets the keep-alive
+interval; there is no environment variable for it.
 
 ## Release process
 

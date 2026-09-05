@@ -389,6 +389,27 @@ impl SessionManager {
                                 _ => "unresponsive and --replace was given".to_string(),
                             };
                             warn!("Daemon (pid {}) {} - replacing it", pid, reason);
+                            // A version change between sessions is otherwise
+                            // invisible: the `warn!` above is filtered out at
+                            // the default log level, so the daemon silently
+                            // swapped underneath anyone not diffing versions
+                            // by hand. Stderr keeps `--json` stdout clean.
+                            if let DaemonHealth::VersionMismatch { daemon_version } = &health {
+                                // Phrased without assuming which side moved:
+                                // a rollback or a mixed install drifts the
+                                // other way, and "the CLI was upgraded" would
+                                // then be actively wrong.
+                                eprintln!(
+                                    "Note: the daemon for this session was {} and the CLI is {}; replacing the daemon so both are {}.",
+                                    if daemon_version.is_empty() {
+                                        "unversioned"
+                                    } else {
+                                        daemon_version
+                                    },
+                                    CLI_VERSION,
+                                    CLI_VERSION
+                                );
+                            }
                             agent_rdp_daemon::transcript::append_event(
                                 &self.session,
                                 serde_json::json!({

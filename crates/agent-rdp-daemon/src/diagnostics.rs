@@ -55,8 +55,9 @@ fn is_infrastructure_error(code: &ErrorCode) -> bool {
             | ErrorCode::DaemonUnresponsive
             | ErrorCode::DaemonVersionMismatch
             | ErrorCode::IpcError
-            // A stale file is a fact about the file, not the screen.
+            // Facts about the file, not the screen.
             | ErrorCode::StaleFile
+            | ErrorCode::FileChangedDuringTransfer
     )
 }
 

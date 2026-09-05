@@ -20,7 +20,7 @@ use agent_rdp_protocol::{
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::automation::{DvcIpc, SharedAutomationState};
 use crate::rdp_session::RdpSession;
@@ -45,6 +45,204 @@ const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Deadline for the final chunk, which also hashes the whole file remotely.
 const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How many times a pull re-reads a file that changed underneath it.
+const PULL_ATTEMPTS: u32 = 3;
+
+/// First retry delay for that; doubles per attempt (150ms, 300ms).
+const PULL_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Only files this small are re-read. A 128MB file retried three times
+/// could outlast the CLI's own budget for a `file` command; the failure
+/// this exists for is a small status file rewritten every few seconds.
+const PULL_RETRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// And only while the attempts have been quick. Size alone does not bound
+/// the time: a small file behind a stalled agent can still burn a full
+/// `CHUNK_TIMEOUT` per attempt, and three of those would outlast the budget
+/// the CLI allows the whole command.
+const PULL_RETRY_MAX_ELAPSED: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a pull whose hash did not match should be attempted again.
+///
+/// Pure so the loop's actual decision is testable: the orchestration in
+/// `handle_pull` is otherwise only reachable with a live agent.
+fn retry_pull(attempt: u32, size: u64, elapsed: std::time::Duration) -> bool {
+    attempt < PULL_ATTEMPTS && size <= PULL_RETRY_MAX_BYTES && elapsed < PULL_RETRY_MAX_ELAPSED
+}
+
+/// How long to wait before attempt `attempt + 1`.
+fn pull_backoff(attempt: u32) -> std::time::Duration {
+    PULL_RETRY_BASE * 2u32.pow(attempt.saturating_sub(1).min(8))
+}
+
+/// One `file pull` attempt: stat, read, verify.
+enum PullAttempt {
+    Ok {
+        data: Vec<u8>,
+        chunks: u64,
+        sha256: String,
+        freshness: Option<Freshness>,
+    },
+    /// The bytes did not match the hash taken moments earlier - the file was
+    /// rewritten mid-transfer. The only outcome worth retrying.
+    Changed {
+        remote: String,
+        local: String,
+        size: u64,
+    },
+    Failed(Response),
+}
+
+/// Stat the remote file, read it whole, and verify it against the hash from
+/// that same stat. Every attempt re-stats: the freshness check and the hash
+/// both have to describe the bytes this attempt actually delivered.
+async fn pull_once(ipc: &crate::automation::DvcIpc, params: &FilePullRequest) -> PullAttempt {
+    // Stat first: it tells us the size (so an oversized file is refused
+    // before transferring any of it) and the remote hash to verify against.
+    let stat = match ipc
+        .send_request_with_timeout(
+            &AutomateRequest::FileStat { path: params.remote_path.clone() },
+            VERIFY_TIMEOUT,
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(e) => {
+            return PullAttempt::Failed(Response::error(
+                ErrorCode::AutomationError,
+                format!("Cannot stat '{}': {}", params.remote_path, e),
+            ))
+        }
+    };
+
+    if !stat["exists"].as_bool().unwrap_or(false) {
+        return PullAttempt::Failed(Response::error(
+            ErrorCode::InvalidRequest,
+            format!("Remote file not found: {}", params.remote_path),
+        ));
+    }
+    if stat["is_directory"].as_bool().unwrap_or(false) {
+        return PullAttempt::Failed(Response::error(
+            ErrorCode::InvalidRequest,
+            format!("'{}' is a directory, not a file", params.remote_path),
+        ));
+    }
+
+    let total_size = stat["size"].as_u64().unwrap_or(0);
+    if total_size > MAX_TRANSFER_BYTES {
+        return PullAttempt::Failed(Response::error(
+            ErrorCode::InvalidRequest,
+            format!(
+                "'{}' is {} bytes; the transfer limit is {} bytes",
+                params.remote_path, total_size, MAX_TRANSFER_BYTES
+            ),
+        ));
+    }
+    let remote_sha256 = stat["sha256"].as_str().unwrap_or_default().to_string();
+
+    // Freshness, from the remote clock alone: both timestamps come from the
+    // same machine, so the age is right even when the two hosts' clocks
+    // disagree by hours. An agent predating the fields reports nothing.
+    let freshness = file_freshness(&stat);
+    if let (Some(max_age), Some(age)) = (params.max_age_secs, freshness.as_ref().map(|f| f.age_secs)) {
+        if age > max_age {
+            return PullAttempt::Failed(Response::error(
+                ErrorCode::StaleFile,
+                format!(
+                    "'{}' was last written {}s ago (at {}), older than --max-age {}s - the \
+                     command that was supposed to produce it did not write it. Nothing was \
+                     transferred.",
+                    params.remote_path,
+                    age,
+                    freshness.as_ref().map(|f| f.modified.clone()).unwrap_or_default(),
+                    max_age
+                ),
+            ));
+        }
+    } else if params.max_age_secs.is_some() {
+        return PullAttempt::Failed(Response::error(
+            ErrorCode::AutomationError,
+            "--max-age needs an automation agent that reports file times (1.5.0+); \
+             reconnect to redeploy the agent"
+                .to_string(),
+        ));
+    }
+
+    info!("Pulling {} ({} bytes)", params.remote_path, total_size);
+
+    let mut data: Vec<u8> = Vec::with_capacity(total_size as usize);
+    let mut chunks: u64 = 0;
+
+    while (data.len() as u64) < total_size {
+        let request = AutomateRequest::FileReadChunk {
+            path: params.remote_path.clone(),
+            offset: data.len() as u64,
+            length: CHUNK_BYTES as u64,
+        };
+
+        let value = match ipc.send_request_with_timeout(&request, CHUNK_TIMEOUT).await {
+            Ok(value) => value,
+            Err(e) => {
+                return PullAttempt::Failed(Response::error(
+                    ErrorCode::AutomationError,
+                    format!(
+                        "Transfer failed at offset {} of '{}': {}",
+                        data.len(),
+                        params.remote_path,
+                        e
+                    ),
+                ))
+            }
+        };
+
+        let encoded = value["data_b64"].as_str().unwrap_or_default();
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return PullAttempt::Failed(Response::error(
+                    ErrorCode::InternalError,
+                    format!("Agent returned an undecodable chunk: {}", e),
+                ))
+            }
+        };
+
+        chunks += 1;
+
+        // Guard against a chunk that returns nothing while bytes remain:
+        // without this the loop would spin forever on a file that shrank or
+        // an agent that stopped making progress.
+        if decoded.is_empty() {
+            if value["eof"].as_bool().unwrap_or(false) {
+                break;
+            }
+            return PullAttempt::Failed(Response::error(
+                ErrorCode::InternalError,
+                format!(
+                    "Transfer stalled at offset {} of '{}' (agent returned no data)",
+                    data.len(),
+                    params.remote_path
+                ),
+            ));
+        }
+
+        data.extend_from_slice(&decoded);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    let local_sha256 = hex_digest(hasher);
+
+    if !remote_sha256.is_empty() && remote_sha256 != local_sha256 {
+        return PullAttempt::Changed {
+            remote: remote_sha256,
+            local: local_sha256,
+            size: total_size,
+        };
+    }
+
+    PullAttempt::Ok { data, chunks, sha256: local_sha256, freshness }
+}
 
 /// Resolve the automation IPC, or explain why file transfer is unavailable.
 async fn ready_ipc(
@@ -204,150 +402,44 @@ pub async fn handle_pull(
         Err(response) => return response,
     };
 
-    // Stat first: it tells us the size (so an oversized file is refused
-    // before transferring any of it) and the remote hash to verify against.
-    let stat = match ipc
-        .send_request_with_timeout(
-            &AutomateRequest::FileStat { path: params.remote_path.clone() },
-            VERIFY_TIMEOUT,
-        )
-        .await
-    {
-        Ok(value) => value,
-        Err(e) => {
-            return Response::error(
-                ErrorCode::AutomationError,
-                format!("Cannot stat '{}': {}", params.remote_path, e),
-            )
+    // A file its producer rewrites (the common "poll a status file" case)
+    // can change between the stat that hashes it and the reads that fetch
+    // it - two independent remote opens. Retrying the pair usually lands
+    // both inside one generation of the file.
+    let mut attempt: u32 = 0;
+    let started = std::time::Instant::now();
+    let (data, chunks, local_sha256, freshness) = loop {
+        attempt += 1;
+        match pull_once(&ipc, &params).await {
+            PullAttempt::Ok { data, chunks, sha256, freshness } => {
+                break (data, chunks, sha256, freshness)
+            }
+            PullAttempt::Failed(response) => return response,
+            PullAttempt::Changed { remote, local, size } => {
+                // Re-reading a large file three times could outlast the CLI's
+                // own budget for the command, so only small files retry.
+                if !retry_pull(attempt, size, started.elapsed()) {
+                    return Response::error(
+                        ErrorCode::FileChangedDuringTransfer,
+                        format!(
+                            "'{}' changed while it was being transferred ({} attempt(s)): \
+                             remote hash {}, received {}. It is being rewritten faster than \
+                             it can be read - pull a snapshot copy instead.",
+                            params.remote_path, attempt, remote, local
+                        ),
+                    );
+                }
+                let backoff = pull_backoff(attempt);
+                warn!(
+                    "'{}' changed during transfer (attempt {}); retrying in {}ms",
+                    params.remote_path,
+                    attempt,
+                    backoff.as_millis()
+                );
+                tokio::time::sleep(backoff).await;
+            }
         }
     };
-
-    if !stat["exists"].as_bool().unwrap_or(false) {
-        return Response::error(
-            ErrorCode::InvalidRequest,
-            format!("Remote file not found: {}", params.remote_path),
-        );
-    }
-    if stat["is_directory"].as_bool().unwrap_or(false) {
-        return Response::error(
-            ErrorCode::InvalidRequest,
-            format!("'{}' is a directory, not a file", params.remote_path),
-        );
-    }
-
-    let total_size = stat["size"].as_u64().unwrap_or(0);
-    if total_size > MAX_TRANSFER_BYTES {
-        return Response::error(
-            ErrorCode::InvalidRequest,
-            format!(
-                "'{}' is {} bytes; the transfer limit is {} bytes",
-                params.remote_path, total_size, MAX_TRANSFER_BYTES
-            ),
-        );
-    }
-    let remote_sha256 = stat["sha256"].as_str().unwrap_or_default().to_string();
-
-    // Freshness, from the remote clock alone: both timestamps come from the
-    // same machine, so the age is right even when the two hosts' clocks
-    // disagree by hours. An agent predating the fields reports nothing.
-    let freshness = file_freshness(&stat);
-    if let (Some(max_age), Some(age)) = (params.max_age_secs, freshness.as_ref().map(|f| f.age_secs)) {
-        if age > max_age {
-            return Response::error(
-                ErrorCode::StaleFile,
-                format!(
-                    "'{}' was last written {}s ago (at {}), older than --max-age {}s - the \
-                     command that was supposed to produce it did not write it. Nothing was \
-                     transferred.",
-                    params.remote_path,
-                    age,
-                    freshness.as_ref().map(|f| f.modified.clone()).unwrap_or_default(),
-                    max_age
-                ),
-            );
-        }
-    } else if params.max_age_secs.is_some() {
-        return Response::error(
-            ErrorCode::AutomationError,
-            "--max-age needs an automation agent that reports file times (1.5.0+); \
-             reconnect to redeploy the agent"
-                .to_string(),
-        );
-    }
-
-    info!("Pulling {} ({} bytes)", params.remote_path, total_size);
-
-    let mut data: Vec<u8> = Vec::with_capacity(total_size as usize);
-    let mut chunks: u64 = 0;
-
-    while (data.len() as u64) < total_size {
-        let request = AutomateRequest::FileReadChunk {
-            path: params.remote_path.clone(),
-            offset: data.len() as u64,
-            length: CHUNK_BYTES as u64,
-        };
-
-        let value = match ipc.send_request_with_timeout(&request, CHUNK_TIMEOUT).await {
-            Ok(value) => value,
-            Err(e) => {
-                return Response::error(
-                    ErrorCode::AutomationError,
-                    format!(
-                        "Transfer failed at offset {} of '{}': {}",
-                        data.len(),
-                        params.remote_path,
-                        e
-                    ),
-                )
-            }
-        };
-
-        let encoded = value["data_b64"].as_str().unwrap_or_default();
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return Response::error(
-                    ErrorCode::InternalError,
-                    format!("Agent returned an undecodable chunk: {}", e),
-                )
-            }
-        };
-
-        chunks += 1;
-
-        // Guard against a chunk that returns nothing while bytes remain:
-        // without this the loop would spin forever on a file that shrank or
-        // an agent that stopped making progress.
-        if decoded.is_empty() {
-            if value["eof"].as_bool().unwrap_or(false) {
-                break;
-            }
-            return Response::error(
-                ErrorCode::InternalError,
-                format!(
-                    "Transfer stalled at offset {} of '{}' (agent returned no data)",
-                    data.len(),
-                    params.remote_path
-                ),
-            );
-        }
-
-        data.extend_from_slice(&decoded);
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    let local_sha256 = hex_digest(hasher);
-
-    if !remote_sha256.is_empty() && remote_sha256 != local_sha256 {
-        return Response::error(
-            ErrorCode::InternalError,
-            format!(
-                "Transfer verification failed for '{}': remote hash {}, received {}",
-                params.remote_path, remote_sha256, local_sha256
-            ),
-        );
-    }
 
     if let Some(parent) = std::path::Path::new(&params.local_path).parent() {
         if !parent.as_os_str().is_empty() {
@@ -519,5 +611,99 @@ mod tests {
         // to fit or the message is silently truncated.
         let encoded_len = (CHUNK_BYTES + 2) / 3 * 4;
         assert!(encoded_len < 900 * 1024, "encoded chunk is {} bytes", encoded_len);
+    }
+}
+
+#[cfg(test)]
+mod pull_retry_tests {
+    use super::*;
+
+    /// The retry exists for a file rewritten every few seconds; a 128MB file
+    /// re-read three times could outlast the CLI's own budget for the command.
+    #[test]
+    fn only_small_files_are_re_read() {
+        assert!(PULL_RETRY_MAX_BYTES < MAX_TRANSFER_BYTES);
+        assert!(PULL_RETRY_MAX_BYTES > CHUNK_BYTES as u64);
+    }
+
+    /// Backoff doubles, and the whole ladder stays short enough that three
+    /// attempts still feel like one command.
+    #[test]
+    fn backoff_doubles_and_stays_short() {
+        assert_eq!(pull_backoff(1), PULL_RETRY_BASE);
+        assert_eq!(pull_backoff(2), PULL_RETRY_BASE * 2);
+        let total: std::time::Duration = (1..PULL_ATTEMPTS).map(pull_backoff).sum();
+        assert!(total < std::time::Duration::from_secs(1), "{:?}", total);
+        // Never panics however far the caller counts.
+        assert!(pull_backoff(u32::MAX) > std::time::Duration::ZERO);
+        assert!(pull_backoff(0) > std::time::Duration::ZERO);
+    }
+
+    /// The loop's actual decision: retry a small file until the attempts run
+    /// out, never retry a big one.
+    #[test]
+    fn the_retry_loop_stops_where_it_should() {
+        let small = 1024;
+        let quick = std::time::Duration::ZERO;
+        assert!(retry_pull(1, small, quick), "a first mismatch is retried");
+        assert!(retry_pull(PULL_ATTEMPTS - 1, small, quick), "the last retry is allowed");
+        assert!(
+            !retry_pull(PULL_ATTEMPTS, small, quick),
+            "after the final attempt it must report, not loop"
+        );
+        // Sequence a whole run: exactly PULL_ATTEMPTS attempts happen.
+        let attempts = (1..).take_while(|a| retry_pull(*a, small, quick)).count() + 1;
+        assert_eq!(attempts as u32, PULL_ATTEMPTS);
+
+        assert!(
+            !retry_pull(1, PULL_RETRY_MAX_BYTES + 1, quick),
+            "a large file is never re-read: three passes could outlast the CLI budget"
+        );
+        assert!(
+            retry_pull(1, PULL_RETRY_MAX_BYTES, quick),
+            "the threshold itself still retries"
+        );
+    }
+
+    /// Size is not a time bound: a small file behind a stalled agent can
+    /// still spend a full chunk timeout per attempt.
+    #[test]
+    fn a_slow_attempt_is_not_retried_however_small_the_file() {
+        assert!(!retry_pull(1, 1024, PULL_RETRY_MAX_ELAPSED));
+        assert!(!retry_pull(1, 1024, CHUNK_TIMEOUT), "one stalled chunk already exceeds it");
+        assert!(retry_pull(1, 1024, PULL_RETRY_MAX_ELAPSED - std::time::Duration::from_millis(1)));
+        // The whole retry ladder must fit inside the bound it is gated on.
+        let sleeps: std::time::Duration = (1..PULL_ATTEMPTS).map(pull_backoff).sum();
+        assert!(sleeps < PULL_RETRY_MAX_ELAPSED);
+    }
+
+    /// A mid-transfer change must not read as a transfer bug: callers polling
+    /// a file its producer rewrites need to tell the two apart.
+    #[test]
+    fn a_changed_file_is_not_an_internal_error() {
+        let changed = PullAttempt::Changed {
+            remote: "aaa".into(),
+            local: "bbb".into(),
+            size: 10,
+        };
+        assert!(matches!(changed, PullAttempt::Changed { .. }));
+        assert_eq!(
+            serde_json::to_value(ErrorCode::FileChangedDuringTransfer).unwrap(),
+            serde_json::Value::String("file_changed_during_transfer".into())
+        );
+        assert_ne!(ErrorCode::FileChangedDuringTransfer, ErrorCode::InternalError);
+    }
+
+    /// Each attempt re-stats, so `--max-age` describes the bytes actually
+    /// delivered rather than the first attempt's.
+    #[test]
+    fn freshness_is_evaluated_per_attempt() {
+        let source = include_str!("file_transfer.rs");
+        let attempt_fn = source
+            .split("async fn pull_once")
+            .nth(1)
+            .expect("pull_once exists");
+        assert!(attempt_fn.contains("FileStat"), "each attempt re-stats");
+        assert!(attempt_fn.contains("max_age_secs"), "freshness lives inside the attempt");
     }
 }

@@ -28,4 +28,10 @@ exit_code?: number,
  * When the process exited, in Unix seconds by the remote clock
  * (present once `exited` is true). See `RunResult::finished_unix`.
  */
-finished_unix?: number, };
+finished_unix?: number, 
+/**
+ * The process is still running and produced nothing since the last poll.
+ * A polling loop needs this to tell "nothing yet" apart from a poll that
+ * never reached the agent - both look like empty output otherwise.
+ */
+pending: boolean, };

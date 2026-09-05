@@ -458,6 +458,16 @@ pub struct AutomationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub version: Option<String>,
+    /// Daemon version, so one `status` call answers "which three versions am
+    /// I running" without a second, heavier `session info` round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub daemon_version: Option<String>,
+    /// CLI version. The daemon leaves this `None`; the CLI fills it in from
+    /// its own `CARGO_PKG_VERSION` before printing, like `SessionInfo` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cli_version: Option<String>,
     /// Path of the agent's own log file on the remote machine, when the
     /// agent reports one. `agent-rdp diagnose` pulls it into the bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -469,6 +479,15 @@ pub struct AutomationStatus {
     /// the remote log via `agent-rdp diagnose`.
     #[serde(default)]
     pub relaunches: u32,
+    /// Every successful agent launch this daemon process has performed against
+    /// the current target, `connect`'s own bootstrap included - unlike
+    /// `relaunches`, which counts only self-heal/manual restarts and resets on
+    /// every `connect`. This is what distinguishes "the agent has been up all
+    /// day" (stays 1) from "the session was rebuilt an hour ago" (grows),
+    /// which `relaunches` alone cannot answer. Resets when a `connect`
+    /// targets a different host:port.
+    #[serde(default)]
+    pub total_launches: u32,
     /// Seconds since the current agent's DVC handshake completed. Distinct
     /// from `agent_running`: an agent can be "running" per the PS-reported
     /// fields yet the daemon-side DVC channel could have gone stale without
@@ -591,6 +610,11 @@ pub struct RunPollResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub finished_unix: Option<u64>,
+    /// The process is still running and produced nothing since the last poll.
+    /// A polling loop needs this to tell "nothing yet" apart from a poll that
+    /// never reached the agent - both look like empty output otherwise.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// Click action result.
@@ -796,5 +820,35 @@ mod tests {
         assert_eq!(back.replayed_at_unix, Some(3));
         let poll: RunPollResult = serde_json::from_str(r#"{"pid":1,"exited":true,"exit_code":0,"finished_unix":9}"#).unwrap();
         assert_eq!(poll.finished_unix, Some(9));
+    }
+}
+
+#[cfg(test)]
+mod qa_0_7_16_field_tests {
+    use super::*;
+
+    /// Old agents and old daemons do not send the new fields; deserializing
+    /// their replies must not fail.
+    #[test]
+    fn new_status_and_poll_fields_are_optional() {
+        let status: AutomationStatus = serde_json::from_str(r#"{"agent_running":true}"#).unwrap();
+        assert_eq!(status.total_launches, 0);
+        assert!(status.daemon_version.is_none());
+        assert!(status.cli_version.is_none());
+
+        let poll: RunPollResult =
+            serde_json::from_str(r#"{"pid":7,"exited":false}"#).unwrap();
+        assert!(!poll.pending);
+    }
+
+    /// Absent fields stay absent on the wire, so a `status` payload does not
+    /// grow three nulls for callers that diff it.
+    #[test]
+    fn unset_versions_are_not_serialized() {
+        let status: AutomationStatus = serde_json::from_str(r#"{"agent_running":false}"#).unwrap();
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("daemon_version"), "{json}");
+        assert!(!json.contains("cli_version"), "{json}");
+        assert!(json.contains("total_launches"), "a count of 0 is still an answer: {json}");
     }
 }

@@ -170,6 +170,16 @@ pub struct ConnectArgs {
     /// that is merely busy serving another command.
     #[arg(long)]
     pub replace: bool,
+
+    /// Seconds between keep-alive PDUs; 0 disables them.
+    ///
+    /// An idle RDP session sends nothing in either direction, so a NAT or
+    /// firewall on the path drops it after its own idle timeout - which then
+    /// costs a reconnect, and a reconnect relaunches the automation agent by
+    /// typing Win+R on the remote desktop. Keeping the session alive is much
+    /// cheaper than recovering it.
+    #[arg(long, default_value = "45", value_name = "SECONDS")]
+    pub keep_alive_secs: u64,
 }
 
 /// Screenshot command arguments.
@@ -584,7 +594,12 @@ pub enum AutomateAction {
         idempotency_key: Option<String>,
     },
 
-    /// Poll a process started with `run --stream` for output produced since the last poll
+    /// Poll a process started with `run --stream` for output since the last poll
+    ///
+    /// Works with the global --json, which adds `pending: true` when the
+    /// process is alive but has produced nothing yet - the field to check in
+    /// a scripted poll loop, since empty output on its own cannot be told
+    /// from a poll that never landed.
     RunPoll {
         /// Process ID returned by the initial `run --stream` call
         pid: u32,
@@ -592,8 +607,8 @@ pub enum AutomateAction {
         /// Keep polling (every 500ms) until the process exits or
         /// --follow-timeout elapses, printing output as it arrives and the
         /// exit code at the end. One command instead of a poll loop; a single
-        /// poll before the child has flushed prints nothing, which looked
-        /// like lost output.
+        /// poll before the child has flushed reports that the process is
+        /// running with nothing new yet.
         #[arg(long)]
         follow: bool,
 

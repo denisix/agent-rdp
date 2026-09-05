@@ -231,6 +231,15 @@ file can be told from yesterday's without reading it; `--max-age <secs>`
 refuses a stale one outright. The age is computed from the remote machine's
 own clock, so it is right even when the two hosts disagree on the time.
 
+A pull hashes the file and then reads it, so a file being rewritten underneath
+it (a status file its producer replaces every few seconds) can change in
+between. A file of 8MB or smaller gets up to 3 attempts (and only while they
+stay quick) before that is reported, as `file_changed_during_transfer` rather
+than a generic internal error. Note that
+Windows PowerShell writes UTF-8 *with* a BOM and `pull` returns the bytes
+verbatim, so a client-side parser needs to expect it (Python:
+`encoding="utf-8-sig"`).
+
 ### Locate (OCR)
 
 Finds text on screen with [ocrs](https://github.com/robertknight/ocrs). Use it
@@ -320,6 +329,7 @@ agent-rdp automate run "Get-Process" --wait --process-timeout 5000
 agent-rdp automate run "$PSVersionTable" --wait --shell pwsh.exe
 agent-rdp automate run "ping -t 127.0.0.1" --stream   # returns a pid immediately
 agent-rdp automate run-poll <pid>                     # drain output; repeat until exited
+agent-rdp automate run-poll <pid> --json              # `pending: true` = alive, nothing new yet
 agent-rdp automate run "Add-Content C:\log.txt x" --wait --idempotency-key step-07
                                             # a retry with the same key replays, never re-runs
 
@@ -437,6 +447,18 @@ dropped says so ("The RDP transport dropped Ns ago (<reason>); the daemon
 itself is alive"), and `session info` shows the last drop — that is a
 `connect`, not a daemon restart. Read-only requests that lose their connection
 mid-flight are retried once automatically; mutating ones never are.
+
+**Idle sessions are kept alive.** RDP only ships screen deltas, so a session
+nobody is driving sends nothing in either direction and a NAT or firewall on
+the path eventually drops it — seen in the field after as little as ~5 minutes
+of idling. The daemon sends a Refresh Rect PDU every 45s to keep the path warm
+(`connect --keep-alive-secs <n>`, `0` disables). It carries no input, focus or
+lock-key semantics, so it cannot disturb the remote desktop — which matters,
+because the *recovery* from a dropped session does: reconnecting relaunches the
+automation agent by typing Win+R there, taking foreground from whatever else is
+running. `automate status` reports `total_launches`, every agent launch against
+the host including each `connect`'s bootstrap, next to `relaunches`, which
+counts only self-heal restarts since the last connect.
 
 **The automation agent heals itself.** If its DVC channel closes while the
 RDP session is alive, the daemon relaunches it (at most 3 times per 10

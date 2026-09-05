@@ -19,6 +19,8 @@ use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::PerformanceFlags;
+use ironrdp::pdu::rdp::headers::ShareDataPdu;
+use ironrdp::pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageOutput};
 use ironrdp_dvc::DrdynvcClient;
@@ -83,6 +85,8 @@ pub struct RdpConfig {
     pub drives: Vec<DriveMapping>,
     /// Shared DVC state for automation (enables DVC channel if provided).
     pub automation_dvc_state: Option<SharedDvcState>,
+    /// Seconds between keep-alive PDUs; `None` disables them.
+    pub keep_alive: Option<std::time::Duration>,
 }
 
 use crate::automation::DvcCommandReceiver;
@@ -478,6 +482,7 @@ impl RdpSession {
 
         // Spawn background frame processor
         let shared_clone = Arc::clone(&shared);
+        let keep_alive = config.keep_alive;
         let task_handle = tokio::spawn(async move {
             run_frame_processor(
                 upgraded_framed,
@@ -488,6 +493,7 @@ impl RdpSession {
                 clipboard_backend_rx,
                 dvc_command_rx,
                 activation_factory,
+                keep_alive,
             )
             .await;
         });
@@ -874,13 +880,87 @@ async fn run_frame_processor(
     mut clipboard_backend_rx: mpsc::UnboundedReceiver<clipboard::BackendMessage>,
     mut dvc_command_rx: Option<DvcCommandReceiver>,
     activation_factory: ConnectionActivationFactory,
+    keep_alive: Option<std::time::Duration>,
 ) {
     info!("Frame processor started");
     let mut graceful_shutdown = false;
     let mut drop_reason = String::from("frame processor stopped");
 
+    // Warn on the transition into failure only: the read arm owns drop
+    // detection, so a keep-alive that cannot write is not itself fatal - but
+    // it must not log once per tick for the life of a dead socket either.
+    let mut keep_alive_failing = false;
+    let mut keep_alive_timer = keep_alive.map(|period| {
+        info!("Keep-alive enabled: every {}s", period.as_secs());
+        let mut timer = tokio::time::interval(period);
+        // A tick missed while the frame processor was busy (RDPDR I/O is
+        // serviced synchronously) should not fire immediately afterwards.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `interval`'s first tick completes immediately; `reset` pushes it out
+        // a full period so a fresh session sends nothing before it is idle.
+        timer.reset();
+        timer
+    });
+
     loop {
         tokio::select! {
+            // Keep the connection alive while idle. An RDP session at rest
+            // sends nothing in either direction, so a NAT or middlebox on the
+            // path drops it after its own idle timeout (~285s in the field);
+            // TCP keepalive alone did not prevent that.
+            _ = async {
+                match keep_alive_timer.as_mut() {
+                    Some(timer) => { timer.tick().await; }
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Sent without checking the server's `refresh_rect_support`
+                // capability: ironrdp's `ConnectionResult` does not retain the
+                // negotiated capability sets, so there is nothing to read it
+                // from. MS-RDPBCGR says a client should not send this unless
+                // the server advertised support; Windows RDS does, and a
+                // server that ignores it still sees the traffic, which is the
+                // point. `--keep-alive-secs 0` is the escape hatch if some
+                // server ever objects.
+                //
+                // A Refresh Rect PDU asks the server to repaint a region. It
+                // is the only cheap client-to-server PDU with no side effects
+                // on the remote desktop. A Synchronize input event would also
+                // work as traffic, but it makes the server adopt the lock-key
+                // state it carries, so it would silently switch Num Lock off
+                // on someone's desktop every tick.
+                let pdu = ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
+                    areas_to_refresh: vec![ironrdp::pdu::geometry::InclusiveRectangle {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    }],
+                });
+                let mut buf = ironrdp::core::WriteBuf::new();
+                match active_stage.encode_static(&mut buf, pdu) {
+                    Ok(_) => match framed.write_all(buf.filled()).await {
+                        Ok(()) => {
+                            if keep_alive_failing {
+                                info!("Keep-alive recovered");
+                                keep_alive_failing = false;
+                            }
+                            debug!("Keep-alive sent");
+                        }
+                        Err(e) => {
+                            if !keep_alive_failing {
+                                warn!(
+                                    "Keep-alive send failed: {} (the read arm reports the drop \
+                                     if the transport is gone)",
+                                    e
+                                );
+                                keep_alive_failing = true;
+                            }
+                        }
+                    },
+                    Err(e) => warn!("Failed to encode keep-alive: {}", e),
+                }
+            }
             // Handle incoming commands
             cmd = command_rx.recv() => {
                 match cmd {

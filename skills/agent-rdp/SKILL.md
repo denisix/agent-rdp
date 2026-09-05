@@ -6,7 +6,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.15. Check with `agent-rdp session info` (shows
+Tested against agent-rdp 0.7.16. Check with `agent-rdp session info` (shows
 both CLI and daemon versions, also in `--json` as `cli_version` /
 `daemon_version`) — a `daemon_version_mismatch` error means an older daemon
 survived an upgrade; run `connect` again to replace it.
@@ -150,6 +150,20 @@ load is normal), `consecutive_failures` (non-zero = degraded), `relaunches`
 `frame_age_ms`; a frame 30-60s old with a live channel is the server being
 slow to paint, not a dead session.
 
+**Pulling a file while something rewrites it.** `file pull` hashes the remote
+file and then reads it — two separate remote operations, so a file being
+replaced every few seconds can change in between. The pull now retries that
+pair (3 attempts, 150ms then 300ms apart) for files of 8MB or smaller, and
+only then fails, with `file_changed_during_transfer` rather than a generic
+`internal_error`.
+Cheaper still: have the producer write to a temp name and copy a snapshot,
+then pull the snapshot.
+
+**Files the remote wrote may carry a UTF-8 BOM.** Windows PowerShell 5.1
+writes UTF-8 *with* BOM, and `file pull` returns bytes verbatim (as it
+should), so client-side parsers need to expect it — Python wants
+`encoding="utf-8-sig"`, or `json.load` fails on the first character.
+
 **Freshness.** Every waited `run` reports `started_unix` and
 `finished_unix` (remote clock), `file stat`/`file pull` report `modified_unix`
 and `age_secs` on the same clock, and `file pull --max-age` refuses a stale
@@ -161,11 +175,13 @@ captured)`. In JSON, `stdout: ""` is "ran, printed nothing" and a missing
 This is the detached mode — use it instead of hand-rolled WMI
 `Win32_Process.Create` + out-file polling. `--follow` prints output as it
 arrives and the exit code at the end; a single plain poll issued before the
-child has flushed prints nothing (not lost, just not yet written — poll
-again). Output is captured to files on the remote side, so nothing is lost if
-the process exits between polls; the final poll returns the tail plus
-`exited: true`, and a repeat poll within 10 minutes returns `exited: true`
-again with empty chunks rather than an error. `--wait --stream` waits. Put
+child has flushed reports that the process is running with no output yet
+(`pending: true` in `--json`, which is a global flag and works on `run-poll`
+like everywhere else) — not lost, just not written yet. Output is captured to
+files on the remote side, so nothing is lost if the process exits between
+polls; the final poll returns the tail plus `exited: true`, and a repeat poll
+within 10 minutes returns `exited: true` again with empty chunks rather than
+an error. `--wait --stream` waits. Put
 agent-rdp options *before* the command: anything after it (or after `--`)
 goes to the remote shell, and a `--wait` there is refused rather than
 silently launching detached. If you redirect inside the command instead
@@ -236,6 +252,20 @@ its timeout covers that. A third verdict, `daemon_version_mismatch`, means
 the daemon is from a different agent-rdp version than the CLI (it outlived an
 upgrade): run `connect` again, which replaces it — every other command refuses
 rather than silently driving old code.
+
+**Reconnecting is not free for the remote desktop.** With automation enabled,
+`connect` relaunches the Windows agent by typing Win+R and pasting into the Run
+dialog — a real foreground change on a shared desktop. If someone else's
+automation is driving that session, it can lose focus mid-action at the moment
+you reconnect. This is unavoidable once the previous agent is gone: a dropped
+transport invalidates its DVC channel, and the agent exits. So the fix is not
+to reconnect less carefully — it is to not need the reconnect. Idle sessions
+are now kept alive automatically (`connect --keep-alive-secs`, default 45s, 0
+disables); before that, an idle session died to a NAT timeout in as little as
+~5 minutes and every one of those cost a Win+R. `automate status` reports
+`total_launches` — every agent launch against this host, `connect`'s bootstrap
+included — next to `relaunches`, which only counts self-heal restarts since the
+last connect and resets on each one.
 
 **Never use `connect` as a health check or a retry reflex.** `connect` is a
 session action: it tears down and rebuilds the RDP session (and, before

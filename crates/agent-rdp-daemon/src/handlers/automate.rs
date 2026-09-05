@@ -78,6 +78,9 @@ pub async fn handle_restart(
                     consecutive_failures: 0,
                     last_error: None,
                     next_retry_secs: None,
+                    total_launches: 0,
+                    daemon_version: None,
+                    cli_version: None,
                 };
                 fill_daemon_fields(&mut fallback, &state);
                 (dvc_ipc.cloned(), fallback)
@@ -130,6 +133,9 @@ fn offline_status(state: &crate::automation::AutomationState) -> Response {
             .unwrap_or(0),
         last_error,
         next_retry_secs: state.next_retry_secs(std::time::Instant::now()),
+        total_launches: state.total_launches,
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        cli_version: None,
     }))
 }
 
@@ -139,6 +145,8 @@ fn fill_daemon_fields(status: &mut AutomationStatus, state: &crate::automation::
     status.relaunches = state.relaunches;
     status.last_error = state.last_error.clone();
     status.next_retry_secs = state.next_retry_secs(std::time::Instant::now());
+    status.total_launches = state.total_launches;
+    status.daemon_version = Some(env!("CARGO_PKG_VERSION").to_string());
 }
 
 /// A `status` round trip to the agent, with the daemon's DVC bookkeeping
@@ -781,6 +789,10 @@ fn parse_run_poll_response(data: serde_json::Value) -> anyhow::Result<RunPollRes
     let exited = data["exited"].as_bool().unwrap_or(false);
     let exit_code = data["exit_code"].as_i64().map(|v| v as i32);
     let finished_unix = data["finished_unix"].as_u64();
+    // Nothing new, and the process is still alive. Without this a polling
+    // loop cannot tell "not yet" from a poll that never landed - both are
+    // empty output.
+    let pending = !exited && stdout_chunk.is_empty() && stderr_chunk.is_empty();
 
     Ok(RunPollResult {
         pid,
@@ -789,6 +801,7 @@ fn parse_run_poll_response(data: serde_json::Value) -> anyhow::Result<RunPollRes
         exited,
         exit_code,
         finished_unix,
+        pending,
     })
 }
 
@@ -1002,6 +1015,9 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
         consecutive_failures: 0,
         last_error: None,
         next_retry_secs: None,
+        total_launches: 0,
+        daemon_version: None,
+        cli_version: None,
     })
 }
 
@@ -1138,5 +1154,78 @@ mod offline_status_without_ipc_tests {
         let Some(ResponseData::AutomationStatus(status)) = response.data else { panic!() };
         assert!(status.last_error.unwrap().contains("DVC IPC not initialized"));
         assert_eq!(status.consecutive_failures, 0);
+    }
+}
+
+#[cfg(test)]
+mod pending_and_version_tests {
+    use super::*;
+
+    fn poll(stdout: &str, stderr: &str, exited: bool) -> RunPollResult {
+        let mut value = serde_json::json!({
+            "pid": 4242,
+            "stdout_chunk": stdout,
+            "stderr_chunk": stderr,
+            "exited": exited,
+        });
+        if exited {
+            value["exit_code"] = serde_json::json!(0);
+            value["finished_unix"] = serde_json::json!(1_760_000_000u64);
+        }
+        parse_run_poll_response(value).expect("parses")
+    }
+
+    /// The reported bug: a poll before the process flushed anything printed
+    /// nothing at all, which in a scripted loop is indistinguishable from a
+    /// poll that never landed.
+    #[test]
+    fn a_silent_running_process_is_reported_as_pending() {
+        let result = poll("", "", false);
+        assert!(result.pending);
+        assert!(!result.exited);
+    }
+
+    #[test]
+    fn output_or_exit_is_never_pending() {
+        assert!(!poll("building...", "", false).pending, "stdout arrived");
+        assert!(!poll("", "warning", false).pending, "stderr arrived");
+        assert!(!poll("", "", true).pending, "exited, so not waiting on it");
+        assert!(!poll("done", "", true).pending);
+    }
+
+    /// A poll that never reached the agent fails the request outright, so a
+    /// caller can tell the two apart without guessing.
+    #[test]
+    fn a_malformed_poll_is_an_error_not_a_pending_result() {
+        assert!(parse_run_poll_response(serde_json::json!({"exited": false})).is_err());
+    }
+
+    /// One `status` call should answer "which three versions am I running".
+    #[test]
+    fn status_carries_the_daemon_version_even_while_the_agent_is_down() {
+        let mut state = crate::automation::AutomationState::new(std::path::PathBuf::from("/tmp/x"));
+        state.total_launches = 3;
+
+        let response = offline_status(&state);
+        let Some(ResponseData::AutomationStatus(status)) = response.data else {
+            panic!("expected a status response");
+        };
+        assert!(!status.agent_running);
+        assert_eq!(status.daemon_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(status.total_launches, 3, "survives the agent being down");
+        assert!(status.cli_version.is_none(), "the daemon cannot know it; the CLI fills it in");
+    }
+
+    #[test]
+    fn daemon_fields_include_both_counters() {
+        let mut state = crate::automation::AutomationState::new(std::path::PathBuf::from("/tmp/x"));
+        state.relaunches = 2;
+        state.total_launches = 5;
+
+        let mut status = parse_status_response(serde_json::json!({"running": true})).unwrap();
+        fill_daemon_fields(&mut status, &state);
+        assert_eq!(status.relaunches, 2);
+        assert_eq!(status.total_launches, 5);
+        assert!(status.daemon_version.is_some());
     }
 }

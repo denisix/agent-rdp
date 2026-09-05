@@ -345,6 +345,26 @@ DVC state. `automate status` reports `relaunches`, `last_error` and
 `next_retry_secs`, and is answered from daemon state alone
 (`offline_status`) while the agent cannot be reached.
 
+`relaunches` counts only the supervisor's and `automate restart`'s launches,
+and `initialize()` zeroes it on every `connect` — so on its own it cannot
+distinguish "the agent has been up all day" from "the session was rebuilt an
+hour ago". `total_launches` (incremented in `record_launch_outcome`, so it
+covers `connect`'s bootstrap too, and deliberately *not* reset by
+`initialize()`/`cleanup()`) answers that. It resets only when a `connect`
+targets a different `host:port`, since one count spanning two machines would
+be worse than none. `status` also carries `daemon_version` and, filled in
+CLI-side, `cli_version`, so one call answers which three versions are running.
+
+Every launch types Win+R and pastes into the Run dialog, which takes
+foreground on the remote desktop. That is unavoidable once the previous agent
+is gone — a dead transport invalidates its channel handle, and the read error
+is in `DvcFatalWin32Errors`, so the agent exits on its own. The mitigation is
+to need fewer reconnects: the daemon keeps idle sessions alive with a Refresh
+Rect PDU every `keep_alive_secs` (default 45, `0` disables). Refresh Rect
+carries no input, focus or lock-key semantics. A Synchronize input event would
+also have kept the path warm, but it makes the server adopt the lock-key state
+it carries, which would switch Num Lock off on the remote desktop every tick.
+
 ### Indeterminate Results
 
 A lost reply is not a failed action: the agent may have applied it and only the
@@ -401,6 +421,7 @@ temporary profile or another farm member starts empty.
 | `parse_error` (`command_failed` from the daemon's view) | `run` text does not parse as Windows PowerShell; nothing was launched. Message lists line/column per error and ends with the command line as assembled |
 | `timeout` | Operation exceeded timeout |
 | `channel_closed` | DVC channel was closed |
+| `file_changed_during_transfer` | `file pull`: the file was rewritten between the hash and the read on every attempt (3 attempts, 150ms/300ms apart, for files under 8MB). Distinct from `internal_error` so a caller polling a file its producer rewrites can retry |
 | `unknown` | Unspecified error |
 
 ## Cleanup
@@ -450,3 +471,7 @@ Relaunch Supervisor above).
    account and per host. A temporary profile (`C:\Users\TEMP`) is discarded
    at logoff, and an RDS farm may place the next logon on another member;
    both look like "unknown key" and the command executes again.
+7. **Reconnect disturbs the desktop**: bringing automation back up after a
+   dropped transport types Win+R there, so any other automation sharing that
+   interactive session can lose foreground at that moment. Keep-alive exists
+   to make that rare; there is no way to relaunch the agent invisibly.

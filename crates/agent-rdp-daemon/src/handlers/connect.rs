@@ -135,6 +135,8 @@ pub async fn handle(
         height: params.height,
         drives,
         automation_dvc_state,
+        keep_alive: (params.keep_alive_secs > 0)
+            .then(|| std::time::Duration::from_secs(params.keep_alive_secs)),
     };
 
     // Attempt connection
@@ -229,6 +231,19 @@ pub async fn handle(
     let mut automation_ready = None;
     let mut automation_error = automation_init_error;
     if enable_automation {
+        // `total_launches` counts against one target, so pointing the same
+        // daemon at another machine starts the count over. Done here rather
+        // than before connecting: a `connect` that fails auth or TCP should
+        // not discard the count for the host still being served.
+        {
+            let target = format!("{}:{}", params.host, params.port);
+            let mut auto_state = automation_state.lock().await;
+            if auto_state.launch_target.as_deref() != Some(target.as_str()) {
+                auto_state.total_launches = 0;
+                auto_state.launch_target = Some(target);
+            }
+        }
+
         if automation_error.is_some() {
             // `initialize()` never produced a `dvc_ipc`, so there is nothing
             // for `launch_agent`/`wait_for_agent` to do but fail - launching

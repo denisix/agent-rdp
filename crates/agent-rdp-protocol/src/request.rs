@@ -161,10 +161,25 @@ pub struct ConnectRequest {
     /// When false, only WebSocket connections are accepted.
     #[serde(default)]
     pub serve_viewer: bool,
+
+    /// Seconds between keep-alive PDUs; 0 disables them (default: 45).
+    ///
+    /// An idle RDP session sends nothing in either direction - RDP only ships
+    /// screen deltas - so a NAT or middlebox on the path drops the connection
+    /// after its own idle timeout (observed in the field at ~285s). TCP
+    /// keepalive alone did not prevent it. Each tick sends a Refresh Rect PDU,
+    /// which is real wire traffic with no input, focus or lock-key semantics.
+    #[serde(default = "default_keep_alive_secs")]
+    #[ts(type = "number")]
+    pub keep_alive_secs: u64,
 }
 
 fn default_stream_bind() -> String {
     "127.0.0.1".to_string()
+}
+
+fn default_keep_alive_secs() -> u64 {
+    45
 }
 
 fn default_stream_fps() -> u32 {
@@ -192,6 +207,7 @@ impl Default for ConnectRequest {
             stream_fps: default_stream_fps(),
             stream_quality: default_stream_quality(),
             serve_viewer: false,
+            keep_alive_secs: default_keep_alive_secs(),
         }
     }
 }
@@ -804,5 +820,31 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"action\":\"press\""));
         assert!(json.contains("ctrl+c"));
+    }
+}
+
+#[cfg(test)]
+mod keep_alive_field_tests {
+    use super::*;
+
+    /// A request from an older CLI has no `keep_alive_secs`; it must land on
+    /// the protective default rather than 0 (which disables keep-alive).
+    #[test]
+    fn a_missing_keep_alive_defaults_to_on() {
+        let request: ConnectRequest = serde_json::from_str(
+            r#"{"host":"h","port":3389,"username":"u","password":"p","width":1280,"height":800}"#,
+        )
+        .unwrap();
+        assert_eq!(request.keep_alive_secs, 45);
+        assert_eq!(ConnectRequest::default().keep_alive_secs, 45);
+    }
+
+    #[test]
+    fn zero_is_preserved_as_disabled() {
+        let request: ConnectRequest = serde_json::from_str(
+            r#"{"host":"h","port":3389,"username":"u","password":"p","width":1,"height":1,"keep_alive_secs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(request.keep_alive_secs, 0);
     }
 }
