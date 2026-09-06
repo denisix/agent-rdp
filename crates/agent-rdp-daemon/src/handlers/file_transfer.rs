@@ -903,7 +903,10 @@ mod push_integrity_tests {
 
     #[test]
     fn a_relative_remote_path_is_refused() {
-        let err = check_paths("/tmp/x", "out\\report.json").unwrap_err();
+        // A local path this platform calls absolute, so the remote check is
+        // the one that fires (`/tmp/x` is relative by Windows's rules).
+        let local = std::env::temp_dir().join("x");
+        let err = check_paths(&local.to_string_lossy(), "out\\report.json").unwrap_err();
         let info = err.error.unwrap();
         assert_eq!(info.code, ErrorCode::InvalidRequest);
         assert!(info.message.contains("C:"), "the message shows what a good path looks like");

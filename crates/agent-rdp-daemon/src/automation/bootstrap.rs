@@ -1653,11 +1653,18 @@ mod survivor_tests {
     /// the outer catch.
     #[test]
     fn a_requested_shutdown_wins_over_a_fatal_looking_send_failure() {
+        // Single-line anchors only: a Windows checkout of the script has CRLF
+        // line endings, so a pattern spanning a line break never matches there.
         let outer_catch = AGENT_SCRIPT.find("# Only an explicitly fatal transport error ends the agent")
             .expect("the outer catch's fatal check is documented");
-        let shutdown_check = AGENT_SCRIPT.find("if ($script:ShutdownRequested) {\n                # Asked to exit")
+        let shutdown_check = AGENT_SCRIPT.find("# Asked to exit, and then failed to tell the daemon so")
             .expect("the outer catch checks for a requested shutdown");
         assert!(shutdown_check < outer_catch, "shutdown must be checked before the fatal-prefix test");
+        // And that comment sits inside a ShutdownRequested check, not elsewhere.
+        let guard = AGENT_SCRIPT[..shutdown_check]
+            .rfind("if ($script:ShutdownRequested) {")
+            .expect("the comment belongs to a ShutdownRequested check");
+        assert!(shutdown_check - guard < 120, "the check and its comment are adjacent");
     }
 }
 
