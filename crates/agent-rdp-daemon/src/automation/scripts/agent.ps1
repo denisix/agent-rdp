@@ -2,8 +2,11 @@
 # agent-rdp Windows UI Automation Agent
 # Communicates via Dynamic Virtual Channel (DVC) with the Rust daemon
 
-# BasePath kept for reference/logging (RDPDR drive still mapped for future file transfer)
+# BasePath kept for reference/logging (RDPDR drive still mapped for future file transfer).
+# BuildId is only ever read back out as $BuildId in a cmdlet argument
+# (-BuildId $BuildId below), which this rule does not recognise as a use.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'BasePath')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'BuildId')]
 param(
     [string]$BasePath = "\\TSCLIENT\agent-automation",
     # Hash of every script the launching daemon deployed, echoed back in the
