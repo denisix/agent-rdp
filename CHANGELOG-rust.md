@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.18](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.17...agent-rdp-rust-v0.7.18) (2026-09-06)
+
+
+### Bug Fixes
+
+* push overwrite, silent-server detection, and adoption bookkeeping ([bbd7764](https://github.com/denisix/agent-rdp/commit/bbd7764a3e63aec89a85f5c4cbc7b68f6c0e209d))
+
 ## [0.7.17](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.16...agent-rdp-rust-v0.7.17) (2026-09-06)
 
 
