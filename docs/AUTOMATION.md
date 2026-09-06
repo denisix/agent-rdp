@@ -510,3 +510,16 @@ Relaunch Supervisor above).
 8. **The survivor depends on the Windows session**: a policy that ends
    disconnected sessions after N minutes takes the agent with it, and the
    next connect launches a new one.
+9. **A launched agent with no client waits the full 10 minutes before
+   exiting**: previously it gave up after three tries (~6s). If the daemon
+   that launched it is gone for good (killed, or the CLI's watchdog ended the
+   connect before a handshake), the process sits on the desktop for the rest
+   of that window rather than exiting quickly - nothing else cleans it up.
+10. **Keep-alive silence is treated as death**: three keep-alive periods with
+   no inbound PDU at all (`KEEP_ALIVE_MISSED_LIMIT`) end the session, because
+   a server whose TCP stack still ACKs but whose RDP service is gone answers
+   nothing and trips no socket-level timeout. A server that never answers a
+   Refresh Rect on an idle desktop would be misjudged; `AGENT_RDP_NO_SILENCE_DROP=1`
+   disables the verdict while keeping the traffic, and `--keep-alive-secs 0`
+   disables both. Strikes are counted per send, so a local stall of any length
+   (RDPDR I/O blocks this loop) adds at most one.

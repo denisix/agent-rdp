@@ -357,6 +357,13 @@ fn automate_timeout_ms(request: &Request, base_timeout_ms: u64) -> u64 {
 
     let command_budget_ms = match automate {
         AutomateRequest::Run { wait: true, timeout_ms, .. } => *timeout_ms,
+        // A launch that only returns a pid still pays for a full PowerShell
+        // start, measured past 30s on a saturated host; the daemon's DVC
+        // deadline for it is `SPAWN_TIMEOUT`, and this budget must clear it or
+        // the CLI gives up on a spawn the agent is still completing.
+        AutomateRequest::Run { wait: false, .. } => {
+            agent_rdp_daemon::handlers::automate::SPAWN_TIMEOUT.as_millis() as u64
+        }
         AutomateRequest::WaitFor { timeout_ms, .. } => *timeout_ms,
         _ => 0,
     };
@@ -865,7 +872,14 @@ mod tests {
             stream: true,
             idempotency_key: None,
         });
-        assert_eq!(automate_timeout_ms(&detached, 30_000), 30_000);
+        // The process timeout is irrelevant (nothing waits for the process),
+        // but the spawn itself gets the daemon's spawn deadline plus the base.
+        let spawn_ms = agent_rdp_daemon::handlers::automate::SPAWN_TIMEOUT.as_millis() as u64;
+        assert_eq!(automate_timeout_ms(&detached, 30_000), 30_000 + spawn_ms);
+        assert!(
+            automate_timeout_ms(&detached, 30_000) > spawn_ms,
+            "the CLI must outlast the daemon's DVC deadline, or it decides the real limit"
+        );
     }
 
     #[test]

@@ -77,12 +77,19 @@ pub fn expected_agent_version() -> Option<String> {
 /// agent as `-BuildId` and echoed back in its handshake; `adopt_survivor`
 /// compares it, not the version string, before adopting.
 pub fn expected_build_id() -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for script in [AGENT_SCRIPT, LIB_TYPES, LIB_SNAPSHOT, LIB_SELECTORS, LIB_ACTIONS, LIB_DVC] {
-        hasher.update(script.as_bytes());
-    }
-    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+    // The inputs are compile-time constants, and this is consulted on every
+    // `automate` request (the late-handshake gate), so compute it once.
+    static BUILD_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BUILD_ID
+        .get_or_init(|| {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            for script in [AGENT_SCRIPT, LIB_TYPES, LIB_SNAPSHOT, LIB_SELECTORS, LIB_ACTIONS, LIB_DVC] {
+                hasher.update(script.as_bytes());
+            }
+            hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+        })
+        .clone()
 }
 
 /// Relaunch budget for the supervisor: a bounded number of relaunches per
@@ -225,9 +232,34 @@ pub async fn launch_guarded(
         .await;
 
     let mut state = automation_state.lock().await;
-    state.relaunch_in_flight = false;
-    record_launch_outcome(&mut state, &result, std::time::Instant::now());
+    finish_launch(&mut state, &result, std::time::Instant::now());
     result
+}
+
+/// The bookkeeping at the end of a guarded launch, split out so it can be
+/// tested against a state that changed underneath the launch.
+///
+/// A transport drop during the bootstrap runs the daemon's teardown
+/// concurrently with the still-blocked `launch_and_wait`; `cleanup()` resets
+/// this same state object to `enabled = false` but does not touch
+/// `relaunch_in_flight`. When the abandoned launch finally resolves, recording
+/// its outcome would count a launch against a session that no longer exists -
+/// and `total_launches` is deliberately kept across `initialize()`, so the
+/// next connect would inherit the miscount. The flag is still reset
+/// unconditionally: `initialize()` resets it too, so nothing depends on this,
+/// but a state that says a launch is in flight when none is helps nobody.
+///
+/// Known gap, not closed here: this has no session-generation check, so an
+/// abandoned launch from a *replaced* session that resolves after a newer
+/// session has started its own launch clears that newer session's flag. A
+/// real fix threads a generation through `launch_guarded`/`adopt_only`/
+/// `launch_and_wait` the way `retry_snapshot` already does for the
+/// supervisor - a larger change than this pass makes.
+fn finish_launch(state: &mut AutomationState, result: &Result<(), String>, now: std::time::Instant) {
+    state.relaunch_in_flight = false;
+    if state.enabled {
+        record_launch_outcome(state, result, now);
+    }
 }
 
 /// Adopt an agent that survived the last transport drop, without ever
@@ -258,6 +290,11 @@ pub async fn adopt_only(automation_state: &Arc<Mutex<AutomationState>>) -> bool 
 
     let mut state = automation_state.lock().await;
     state.relaunch_in_flight = false;
+    // "No survivor" is not a failure - it must not arm a supervisor retry,
+    // which would type Win+R on its own later - so only a success is ever
+    // recorded here. And, as in `finish_launch`, not against a state that a
+    // drop during the wait has already reset.
+    let adopted = adopted && state.enabled;
     if adopted {
         record_launch_outcome(&mut state, &Ok(()), std::time::Instant::now());
     }
@@ -275,7 +312,12 @@ pub async fn relaunch_agent(
 ) -> Result<(), String> {
     let result = launch_guarded(rdp_session, automation_state, false).await;
     if result.is_ok() {
-        automation_state.lock().await.relaunches += 1;
+        let mut state = automation_state.lock().await;
+        // Not for a launch whose session dropped underneath it - the same
+        // condition under which `finish_launch` recorded nothing.
+        if state.enabled {
+            state.relaunches += 1;
+        }
     }
     result
 }
@@ -790,6 +832,14 @@ impl AutomationBootstrap {
                 }
 
                 let mut state = automation_state.lock().await;
+                // The session can have dropped while this waited; `cleanup()`
+                // then reset the state. Adopting into a state that no longer
+                // has a session leaves `adopted = true` beside `enabled =
+                // false`, which the next `automate status` would report.
+                if !state.enabled {
+                    debug!("A survivor handshook, but the session is gone; not adopting");
+                    return Adoption::None;
+                }
                 Self::record_ready(&mut state);
                 state.adopted = true;
                 info!(
@@ -1595,5 +1645,284 @@ mod survivor_tests {
     #[test]
     fn a_streamed_run_does_not_open_a_window() {
         assert!(LIB_ACTIONS.contains("$startArgs.NoNewWindow = $true"));
+    }
+
+    /// The shutdown reply can itself fail to send; the agent must still exit
+    /// rather than treat that as an outage and re-enter the reconnect loop.
+    /// Precedence documented by position: the shutdown check comes first in
+    /// the outer catch.
+    #[test]
+    fn a_requested_shutdown_wins_over_a_fatal_looking_send_failure() {
+        let outer_catch = AGENT_SCRIPT.find("# Only an explicitly fatal transport error ends the agent")
+            .expect("the outer catch's fatal check is documented");
+        let shutdown_check = AGENT_SCRIPT.find("if ($script:ShutdownRequested) {\n                # Asked to exit")
+            .expect("the outer catch checks for a requested shutdown");
+        assert!(shutdown_check < outer_catch, "shutdown must be checked before the fatal-prefix test");
+    }
+}
+
+/// The survivor-adoption path, driven against real `SharedDvcState` and
+/// `AutomationState` values - the same types the daemon uses, with no live
+/// agent behind them. Nothing here reaches the filesystem or a socket.
+#[cfg(test)]
+mod adoption_tests {
+    use super::*;
+    use crate::automation::dvc_channel::DvcHandshake;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn handshake(build_id: Option<&str>) -> DvcHandshake {
+        DvcHandshake {
+            version: "1.8.0".into(),
+            agent_pid: 4242,
+            capabilities: vec!["run".into()],
+            build_id: build_id.map(str::to_string),
+        }
+    }
+
+    /// A state with automation enabled and the DVC plumbing wired to
+    /// `dvc_state`, the way `initialize()` leaves it - minus the files.
+    fn enabled_state(dvc_state: &SharedDvcState) -> Arc<Mutex<AutomationState>> {
+        let mut state = AutomationState::new(PathBuf::from("/nonexistent/agent-rdp-test"));
+        state.enabled = true;
+        state.dvc_state = Some(Arc::clone(dvc_state));
+        state.dvc_ipc = Some(DvcIpc::new(Arc::clone(dvc_state)));
+        Arc::new(Mutex::new(state))
+    }
+
+    fn open_channel_with(dvc_state: &SharedDvcState, hs: DvcHandshake) {
+        let mut s = dvc_state.lock();
+        s.channel_id = Some(1);
+        s.handshake = Some(hs);
+        s.handshake_at = Some(Instant::now());
+    }
+
+    #[test]
+    fn handshake_is_newer_truth_table() {
+        let dvc = new_shared_dvc_state();
+        let bootstrap_at = Instant::now();
+
+        // Nothing on the channel: never newer, baseline or not.
+        assert!(!AutomationBootstrap::handshake_is_newer(&dvc, None));
+        assert!(!AutomationBootstrap::handshake_is_newer(&dvc, Some(bootstrap_at)));
+
+        // A handshake with no baseline counts: a first launch or an adoption.
+        open_channel_with(&dvc, handshake(None));
+        assert!(AutomationBootstrap::handshake_is_newer(&dvc, None));
+
+        // The same handshake is not "newer" than a baseline taken after it -
+        // this is the stale agent a relaunch must not accept as its own.
+        let later = Instant::now() + Duration::from_secs(1);
+        assert!(!AutomationBootstrap::handshake_is_newer(&dvc, Some(later)));
+
+        // But it is newer than a baseline taken before it arrived.
+        let earlier = bootstrap_at - Duration::from_secs(1);
+        assert!(AutomationBootstrap::handshake_is_newer(&dvc, Some(earlier)));
+
+        // A handshake with no timestamp cannot be shown to be new.
+        dvc.lock().handshake_at = None;
+        assert!(!AutomationBootstrap::handshake_is_newer(&dvc, Some(earlier)));
+        assert!(AutomationBootstrap::handshake_is_newer(&dvc, None), "no baseline still accepts it");
+    }
+
+    #[tokio::test]
+    async fn a_current_survivor_is_adopted_on_the_first_poll() {
+        let dvc = new_shared_dvc_state();
+        open_channel_with(&dvc, handshake(Some(&expected_build_id())));
+        let state = enabled_state(&dvc);
+
+        let started = Instant::now();
+        let outcome = AutomationBootstrap::new(PathBuf::from("/x"))
+            .adopt_survivor(&dvc, &state)
+            .await;
+
+        assert!(matches!(outcome, Adoption::Adopted));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an agent that is already there must not cost the full SURVIVOR_WAIT"
+        );
+        let s = state.lock().await;
+        assert!(s.adopted);
+        assert!(s.agent_ready);
+        assert_eq!(s.agent_pid, Some(4242));
+    }
+
+    /// The one deliberately slow test in this batch: with nothing on the
+    /// channel, adoption gives up only after the whole window.
+    #[tokio::test]
+    async fn no_survivor_means_waiting_the_full_window_then_launching() {
+        let dvc = new_shared_dvc_state();
+        let state = enabled_state(&dvc);
+
+        let started = Instant::now();
+        let outcome = AutomationBootstrap::new(PathBuf::from("/x"))
+            .adopt_survivor(&dvc, &state)
+            .await;
+
+        assert!(matches!(outcome, Adoption::None));
+        assert!(started.elapsed() >= SURVIVOR_WAIT, "gave up early: {:?}", started.elapsed());
+        assert!(started.elapsed() < SURVIVOR_WAIT + Duration::from_secs(2));
+        assert!(!state.lock().await.adopted);
+    }
+
+    /// A survivor running different scripts is asked to leave, and if it
+    /// leaves promptly the daemon does not wait out the grace period.
+    #[tokio::test]
+    async fn a_stale_survivor_that_exits_is_not_adopted_and_costs_little() {
+        let dvc = new_shared_dvc_state();
+        open_channel_with(&dvc, handshake(Some("not-this-build")));
+        // No dvc_ipc: the shutdown request has nowhere to go, which is the
+        // "cannot even ask" case; the channel closing is what we watch for.
+        let mut raw = AutomationState::new(PathBuf::from("/x"));
+        raw.enabled = true;
+        raw.dvc_state = Some(Arc::clone(&dvc));
+        let state = Arc::new(Mutex::new(raw));
+
+        let closer = Arc::clone(&dvc);
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(300)).await;
+            let mut s = closer.lock();
+            s.handshake = None;
+            s.channel_id = None;
+        });
+
+        let started = Instant::now();
+        let outcome = AutomationBootstrap::new(PathBuf::from("/x"))
+            .adopt_survivor(&dvc, &state)
+            .await;
+
+        assert!(matches!(outcome, Adoption::None));
+        assert!(started.elapsed() < Duration::from_secs(3), "should return as soon as it left");
+        assert!(!state.lock().await.adopted);
+    }
+
+    /// The counter-example an adversarial review found: a stale survivor
+    /// that will *not* leave stays connected and ready-looking, with no
+    /// launch in flight. That state must never be reported as adopted.
+    #[tokio::test]
+    async fn a_stale_survivor_that_will_not_leave_is_still_not_adoptable() {
+        let dvc = new_shared_dvc_state();
+        open_channel_with(&dvc, handshake(Some("an-older-build")));
+        let mut raw = AutomationState::new(PathBuf::from("/x"));
+        raw.enabled = true;
+        raw.dvc_state = Some(Arc::clone(&dvc));
+        raw.dvc_ipc = Some(DvcIpc::new(Arc::clone(&dvc)));
+        let state = Arc::new(Mutex::new(raw));
+
+        let started = Instant::now();
+        let outcome = AutomationBootstrap::new(PathBuf::from("/x"))
+            .adopt_survivor(&dvc, &state)
+            .await;
+        assert!(matches!(outcome, Adoption::None));
+        assert!(started.elapsed() >= Duration::from_secs(5), "waited the grace period out");
+
+        // Exactly what `handlers::automate::handle` sees afterwards.
+        let s = state.lock().await;
+        let reachable = s.dvc_ipc.as_ref().map(|i| i.is_ready()).unwrap_or(false);
+        assert!(reachable, "the channel is still open - that is the whole problem");
+        assert!(!s.agent_ready);
+        assert!(!s.relaunch_in_flight);
+        let build_matches = dvc
+            .lock()
+            .handshake
+            .as_ref()
+            .and_then(|h| h.build_id.clone())
+            == Some(expected_build_id());
+        assert!(!build_matches);
+        assert!(
+            !crate::handlers::automate::should_sync_late_handshake(
+                reachable,
+                s.agent_ready,
+                s.relaunch_in_flight,
+                build_matches
+            ),
+            "a flight-flag-only gate would have adopted this rejected agent"
+        );
+    }
+
+    /// A survivor that handshakes after the session it would join has
+    /// already dropped must not be adopted into the cleaned-up state.
+    #[tokio::test]
+    async fn a_survivor_is_not_adopted_into_a_session_that_is_gone() {
+        let dvc = new_shared_dvc_state();
+        open_channel_with(&dvc, handshake(Some(&expected_build_id())));
+        let state = enabled_state(&dvc);
+        // What `cleanup()` leaves behind after a mid-wait transport drop.
+        state.lock().await.enabled = false;
+
+        let outcome = AutomationBootstrap::new(PathBuf::from("/x"))
+            .adopt_survivor(&dvc, &state)
+            .await;
+        assert!(matches!(outcome, Adoption::None));
+        let s = state.lock().await;
+        assert!(!s.adopted);
+        assert!(!s.agent_ready);
+    }
+
+    #[tokio::test]
+    async fn adopt_only_refuses_immediately_when_it_cannot_run() {
+        let dvc = new_shared_dvc_state();
+        open_channel_with(&dvc, handshake(Some(&expected_build_id())));
+
+        let disabled = enabled_state(&dvc);
+        disabled.lock().await.enabled = false;
+        let started = Instant::now();
+        assert!(!adopt_only(&disabled).await);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let busy = enabled_state(&dvc);
+        busy.lock().await.relaunch_in_flight = true;
+        let started = Instant::now();
+        assert!(!adopt_only(&busy).await);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(busy.lock().await.relaunch_in_flight, "must not clear a flag it did not set");
+    }
+
+    #[tokio::test]
+    async fn adopt_only_adopts_and_records_without_counting_a_launch() {
+        let dvc = new_shared_dvc_state();
+        open_channel_with(&dvc, handshake(Some(&expected_build_id())));
+        let state = enabled_state(&dvc);
+        {
+            let mut s = state.lock().await;
+            s.total_launches = 7;
+            s.last_error = Some("earlier failure".into());
+        }
+
+        assert!(adopt_only(&state).await);
+
+        let s = state.lock().await;
+        assert!(s.adopted);
+        assert!(s.agent_ready);
+        assert_eq!(s.agent_pid, Some(4242));
+        assert!(!s.relaunch_in_flight);
+        assert_eq!(s.total_launches, 7, "an adoption typed nothing on the desktop");
+        assert!(s.last_error.is_none());
+    }
+
+    /// The finalization a launch runs against a state that a transport drop
+    /// already cleaned up underneath it: the flag is released, but nothing
+    /// is recorded against a session that no longer exists.
+    #[test]
+    fn a_launch_that_outlived_its_session_records_nothing() {
+        let mut state = AutomationState::new(PathBuf::from("/x"));
+        state.enabled = false;
+        state.relaunch_in_flight = true;
+        state.total_launches = 3;
+        state.launch_failures = 2;
+
+        finish_launch(&mut state, &Ok(()), Instant::now());
+        assert!(!state.relaunch_in_flight);
+        assert_eq!(state.total_launches, 3, "must not count against the next host");
+        assert_eq!(state.launch_failures, 2, "must not clear bookkeeping it does not own");
+
+        finish_launch(&mut state, &Err("late".into()), Instant::now());
+        assert!(state.next_retry_at.is_none(), "must not arm a retry for a dead session");
+
+        // Against a live session it records normally.
+        state.enabled = true;
+        finish_launch(&mut state, &Ok(()), Instant::now());
+        assert_eq!(state.total_launches, 4);
+        assert_eq!(state.launch_failures, 0);
     }
 }

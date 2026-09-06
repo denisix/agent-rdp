@@ -71,6 +71,25 @@ fell back to the OS retransmission timeout (4-5 min, the field's `os error
 socket2's `all` feature), `TCP_RXT_CONNDROPTIME` = 0x80 (macOS, absent from
 `libc`), `TCP_MAXRT` (Windows, needs the `Win32_Networking_WinSock` feature).
 It fires only on data *we* sent going unacked, so a quiet server is unaffected.
+That is also its blind spot: a server whose TCP stack still ACKs while its RDP
+service is dead (the field's `ERROR_SEM_TIMEOUT` case, 18 minutes of silence)
+never trips it. The keep-alive arm therefore also checks `last_frame_at` after
+each successful send, and `keep_alive_unanswered` (pure, tested) declares the
+transport dead after `KEEP_ALIVE_MISSED_LIMIT` (3) periods with no inbound PDU
+at all - a Refresh Rect is a request the server answers with a repaint, so
+sustained silence is the one signal that separates idle from dead there.
+
+**PowerShell `$null` is not a .NET null.** Passing `$null` to a .NET method's
+`string` parameter hands it `""`, and `File.Replace` rejects `""` as a backup
+path with "The path is not of a legal form" - every `file push` overwrite
+failed deterministically while pushes to new paths worked. `[NullString]::Value`
+is the only real null; a content test pins it.
+
+**Timeout layers for a detached `run`.** `handlers::automate::SPAWN_TIMEOUT`
+(90s - a PowerShell start on a saturated host was measured past 30s) is the
+daemon's DVC deadline, and the CLI's IPC timeout and watchdog for
+`run` without `--wait` are both derived from that same constant, so the three
+layers cannot drift apart.
 
 **Keep-alive.** `run_frame_processor`'s `select!` has a timer arm that sends a
 Refresh Rect PDU every `ConnectRequest::keep_alive_secs` (default 45, `0`
@@ -260,6 +279,7 @@ events.
 | `AGENT_RDP_STREAM_PORT` | WebSocket streaming port (0 = disabled) |
 | `AGENT_RDP_MODELS_DIR` | OCR models directory (set by the npm wrapper; needed for standalone binary installs) |
 | `AGENT_RDP_NO_AUTO_RELAUNCH` | `1` disables the daemon's automatic relaunch of the automation agent |
+| `AGENT_RDP_NO_SILENCE_DROP` | `1` keeps the keep-alive traffic but disables the "server answered none of the last 3 refreshes" disconnect verdict |
 
 `connect --keep-alive-secs <n>` (default 45, `0` disables) sets the keep-alive
 interval; there is no environment variable for it.

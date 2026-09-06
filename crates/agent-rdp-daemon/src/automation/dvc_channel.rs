@@ -681,4 +681,55 @@ mod two_agent_tests {
         survivor.process(1, &handshake_bytes(100, "1.8.0")).unwrap();
         assert_eq!(state.lock().handshake.as_ref().unwrap().agent_pid, 100);
     }
+
+    /// A channel rejected while a primary existed becomes the primary if it
+    /// is the only one left by the time it identifies itself - otherwise a
+    /// reflexive shutdown would leave nothing connected at all.
+    #[test]
+    fn an_extra_is_promoted_once_the_primary_is_gone() {
+        let state = new_shared_dvc_state();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.lock().closed_notify = Some(tx);
+
+        let mut first = AutomationDvc::new(Arc::clone(&state));
+        let mut second = AutomationDvc::new(Arc::clone(&state));
+        first.start(1).unwrap();
+        second.start(2).unwrap();
+        first.process(1, &handshake_bytes(100, "1.8.0")).unwrap();
+        assert!(state.lock().extras.contains(&2));
+
+        // The primary leaves before the second agent has said who it is.
+        first.close(1);
+        assert!(state.lock().channel_id.is_none());
+        assert!(rx.try_recv().is_ok(), "the real agent leaving is reported");
+
+        let reply = second.process(2, &handshake_bytes(200, "1.8.0")).unwrap();
+        assert!(reply.is_empty(), "no shutdown for the only agent left");
+        let s = state.lock();
+        assert_eq!(s.channel_id, Some(2), "promoted");
+        assert!(!s.extras.contains(&2));
+        assert_eq!(s.handshake.as_ref().unwrap().agent_pid, 200);
+    }
+
+    /// A reply on a channel that never went through `start()` - nothing to
+    /// route it to, and nothing to panic over.
+    #[test]
+    fn a_response_on_an_unknown_channel_is_ignored() {
+        let state = new_shared_dvc_state();
+        let mut dvc = AutomationDvc::new(Arc::clone(&state));
+        let (tx, _rx) = oneshot::channel();
+        state.lock().pending.insert("real".to_string(), tx);
+
+        let stray = AutomationDvc::encode_message(&DvcProtocolMessage::Response {
+            id: "ghost".to_string(),
+            success: true,
+            data: None,
+            error: None,
+        })
+        .unwrap();
+        let out = dvc.process(42, &stray).unwrap();
+        assert!(out.is_empty());
+        assert!(state.lock().pending.contains_key("real"), "an unrelated pending request is untouched");
+        assert!(state.lock().channel_id.is_none(), "a stray reply does not open a channel");
+    }
 }

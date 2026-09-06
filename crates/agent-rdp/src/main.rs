@@ -226,6 +226,12 @@ fn watchdog_budget_ms(cli: &Cli) -> Option<u64> {
             cli::AutomateAction::Run { wait: true, process_timeout, .. } => {
                 process_timeout.unwrap_or(10_000)
             }
+            // A detached launch's IPC timeout is raised by the daemon's spawn
+            // deadline (a PowerShell start under load); the watchdog has to
+            // clear that too.
+            cli::AutomateAction::Run { wait: false, .. } => {
+                agent_rdp_daemon::handlers::automate::SPAWN_TIMEOUT.as_millis() as u64
+            }
             // `--follow` is a CLI-side loop of ordinary polls; only the
             // wall-clock budget grows, each poll keeps its own IPC timeout.
             cli::AutomateAction::RunPoll { follow: true, follow_timeout, .. } => {

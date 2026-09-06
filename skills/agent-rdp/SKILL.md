@@ -139,7 +139,8 @@ push` a `.ps1` and run it with `-File`. That path has no quoting layer at all.
 
 **Under CPU saturation** (seen at 100% CPU with 7 parallel 1C sessions on 2
 vCPU): the transport and the agent stay up since 0.7.14, but anything that
-*spawns a process* can take 30s+ instead of 1s. Give such commands
+*spawns a process* can take 30s+ instead of 1s. A `run` without `--wait`
+gets a 90s spawn budget on its own; for `--wait`, give such commands
 `--process-timeout 60000` or more (the IPC and watchdog budgets follow it);
 a process that overruns is killed and reported as `command_failed: Process
 timed out`, with the command line. Health check with `automate status
@@ -154,8 +155,12 @@ slow to paint, not a dead session.
 the remote agent, neither of which shares your working directory. The CLI and
 SDK make the local path absolute for you; a relative *remote* path is refused
 rather than written somewhere nobody looks. A push is staged beside the
-destination and swapped in only after its hash is checked on both ends, so a
-failed transfer leaves the previous file intact and `transfer_verification_failed`
+destination (`<path>.agent-rdp-<id>.part`, named in any error) and swapped in
+only after its hash is checked on both ends, so a failed transfer leaves the
+previous file intact; error text from the agent may be in the remote OS's
+language (it is a .NET message), with the exception type always in English.
+Stdout from `run` keeps Windows CRLF line endings; split on `\r?\n`.
+`transfer_verification_failed`
 means nothing was replaced.
 
 **Pulling a file while something rewrites it.** `file pull` hashes the remote
@@ -276,10 +281,13 @@ default 45s, 0 disables). `connect --defer-agent` skips the launch entirely: it
 still adopts a surviving agent, and otherwise leaves the agent down until you
 run `automate restart`.
 
-**A dead transport is noticed in about a minute.** The socket is configured to
-give up on unacknowledged data after 30s, so a black-holed path surfaces within
-roughly one keep-alive interval plus that — not the 4-5 minutes an OS
-retransmission timeout takes. Until it surfaces, `screenshot` keeps returning
+**A dead transport is noticed within a few minutes.** The socket gives up on
+unacknowledged data after 30s, so a black-holed path surfaces within roughly
+one keep-alive interval plus that. A server that still ACKs at the TCP level
+but no longer runs RDP (the `ERROR_SEM_TIMEOUT` drops) is caught differently:
+each keep-alive is a refresh request the server answers, and three unanswered
+in a row (~2.25 minutes by default) declare it dead — previously that case sat
+undetected for up to 18 minutes. Until it surfaces, `screenshot` keeps returning
 the last frame it has; `session info` reports the frame age against the
 keep-alive interval, and a frame much older than the interval on a live
 session usually points at the transport rather than an idle desktop.

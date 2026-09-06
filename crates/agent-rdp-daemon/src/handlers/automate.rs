@@ -13,6 +13,34 @@ use tracing::{debug, error, info, warn};
 use crate::automation::SharedAutomationState;
 use crate::rdp_session::RdpSession;
 
+/// Whether a ready channel that nothing recorded should be adopted as the
+/// current agent. Pure, so the gate can be tested on its own.
+///
+/// `relaunch_in_flight` excludes the window during an ordinary launch where
+/// the DVC layer has recorded the handshake but the launch's own poll loop
+/// has not yet called `record_ready`. `build_id_matches` is the part that
+/// carries real weight: a survivor the daemon rejected for running old
+/// scripts, and then could not evict, leaves a ready-looking channel with
+/// the flag already clear - and must not be reported as adopted.
+pub fn should_sync_late_handshake(
+    agent_reachable: bool,
+    agent_ready: bool,
+    relaunch_in_flight: bool,
+    build_id_matches: bool,
+) -> bool {
+    agent_reachable && !agent_ready && !relaunch_in_flight && build_id_matches
+}
+
+/// Record an agent that came up without going through a launch: nothing
+/// typed anything to bring it up, so it is an adoption.
+fn sync_late_handshake(state: &mut crate::automation::AutomationState, ipc: &crate::automation::DvcIpc) {
+    state.agent_ready = true;
+    state.agent_pid = ipc.agent_pid();
+    state.last_error = None;
+    state.next_retry_at = None;
+    state.adopted = true;
+}
+
 /// Ask a live agent to exit and wait briefly for its channel to close.
 ///
 /// Best-effort by design: an agent that will not leave is handled by the
@@ -238,15 +266,25 @@ pub async fn handle(
     // A channel can become ready with nobody having called `record_ready`:
     // `connect --defer-agent` waits only `SURVIVOR_WAIT` for a survivor, and
     // one reattaching after that window is fully usable but was never
-    // recorded. Every other path (a launch, `adopt_only`) awaits its own
-    // handshake and records it itself, so reaching here with the channel
-    // ready and nothing recorded can only be this case.
-    if agent_reachable && !state.agent_ready {
+    // recorded. Whether to trust it is decided by its build id, not by
+    // whether a launch is in flight: `adopt_only` also exits with the flag
+    // clear when it *rejected* a build-mismatched survivor that then failed
+    // to leave within `shutdown_stale_agent`'s grace period, and that agent's
+    // channel stays open and ready-looking. Only an agent running the scripts
+    // this daemon ships is one it would ever have adopted.
+    let build_id_matches = state
+        .dvc_state
+        .as_ref()
+        .and_then(|d| d.lock().handshake.as_ref().and_then(|h| h.build_id.clone()))
+        == Some(crate::automation::expected_build_id());
+    if should_sync_late_handshake(
+        agent_reachable,
+        state.agent_ready,
+        state.relaunch_in_flight,
+        build_id_matches,
+    ) {
         if let Some(ipc) = state.dvc_ipc.clone() {
-            state.agent_ready = true;
-            state.agent_pid = ipc.agent_pid();
-            state.last_error = None;
-            state.next_retry_at = None;
+            sync_late_handshake(&mut state, &ipc);
         }
     }
     if matches!(request, AutomateRequest::Status) && !agent_reachable {
@@ -436,8 +474,12 @@ fn request_timeout(request: &AutomateRequest, default: std::time::Duration) -> s
 }
 
 /// Transport deadline for a `run` that only starts a process. Covers a
-/// PowerShell start on a saturated host.
-const SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// PowerShell start on a saturated host: 30s was measured and exceeded in
+/// the field (a host at 100% CPU took past 30s to spawn), and the monitoring
+/// that drives those launches asked for budgets of at least 90s. The CLI's
+/// IPC timeout and watchdog for a detached `run` are derived from this same
+/// constant so the three layers cannot drift apart.
+pub const SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Append a "re-snapshot" hint when the agent's error text suggests the
 /// selector's ref is stale after a UI change - the ref is snapshot-scoped by
@@ -1310,5 +1352,60 @@ mod pending_and_version_tests {
         assert_eq!(status.relaunches, 2);
         assert_eq!(status.total_launches, 5);
         assert!(status.daemon_version.is_some());
+    }
+}
+
+#[cfg(test)]
+mod late_handshake_tests {
+    use super::*;
+    use crate::automation::dvc_channel::DvcHandshake;
+
+    #[test]
+    fn only_a_matching_unmanaged_ready_channel_is_synced() {
+        // The genuine case: a current survivor reattached after
+        // `connect --defer-agent` stopped waiting for one.
+        assert!(should_sync_late_handshake(true, false, false, true));
+
+        // Not reachable: nothing to sync.
+        assert!(!should_sync_late_handshake(false, false, false, true));
+        // Already recorded: nothing to do.
+        assert!(!should_sync_late_handshake(true, true, false, true));
+        // A launch in flight owns the outcome; do not step on it.
+        assert!(!should_sync_late_handshake(true, false, true, true));
+        // Reachable, unrecorded, nothing in flight - and the wrong scripts.
+        // This is a rejected survivor that refused to leave, and it is the
+        // case a flight-flag-only gate got wrong.
+        assert!(!should_sync_late_handshake(true, false, false, false));
+    }
+
+    #[test]
+    fn syncing_records_the_agent_as_adopted() {
+        let dvc = crate::automation::new_shared_dvc_state();
+        {
+            let mut s = dvc.lock();
+            s.channel_id = Some(9);
+            s.handshake = Some(DvcHandshake {
+                version: "1.8.0".into(),
+                agent_pid: 777,
+                capabilities: vec![],
+                build_id: Some(crate::automation::expected_build_id()),
+            });
+            s.handshake_at = Some(std::time::Instant::now());
+        }
+        let ipc = crate::automation::DvcIpc::new(dvc);
+
+        let mut state = crate::automation::AutomationState::new(std::path::PathBuf::from("/x"));
+        state.agent_ready = false;
+        state.adopted = false;
+        state.last_error = Some("launch deferred".into());
+        state.next_retry_at = Some(std::time::Instant::now());
+
+        sync_late_handshake(&mut state, &ipc);
+
+        assert!(state.agent_ready);
+        assert_eq!(state.agent_pid, Some(777));
+        assert!(state.last_error.is_none());
+        assert!(state.next_retry_at.is_none());
+        assert!(state.adopted, "it came up without anyone typing Win+R");
     }
 }

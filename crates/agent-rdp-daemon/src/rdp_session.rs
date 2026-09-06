@@ -204,6 +204,64 @@ pub const DISCONNECT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// declared dead. See `RdpSession::apply_tcp_unacked_timeout`.
 pub const UNACKED_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Consecutive keep-alive refreshes the server may leave unanswered before
+/// the transport is declared dead. Three, not one: a single missed repaint
+/// could be a busy server or a frame lost to a momentary stall, and a false
+/// positive here costs a reconnect.
+pub const KEEP_ALIVE_MISSED_LIMIT: u32 = 3;
+
+/// Counts keep-alive refreshes the server has left unanswered, in a row.
+///
+/// Strikes, not elapsed time, on purpose. The frame processor services RDPDR
+/// I/O synchronously, so a wedged file operation can stall this loop for
+/// minutes with the server perfectly healthy and its replies queued in the
+/// socket buffer. Measured as "time since the last inbound PDU", that stall
+/// looked like death the instant it ended - the overdue timer and the
+/// buffered read become ready together, `select!` picks one at random, and
+/// the timer arm saw a stale timestamp. Counted per send, a stall delivers at
+/// most one tick (`MissedTickBehavior::Delay`) and so at most one strike;
+/// the next send finds the drained replies and clears the count. Only a
+/// server that stays silent across `KEEP_ALIVE_MISSED_LIMIT` consecutive
+/// sends, each a full period apart, is declared dead.
+#[derive(Debug, Default)]
+pub struct KeepAliveWatch {
+    unanswered: u32,
+}
+
+impl KeepAliveWatch {
+    /// Record that a refresh was just sent. `answered_since_last_send` is
+    /// whether any PDU arrived after the *previous* send. Returns `true`
+    /// when the server has now been silent for `KEEP_ALIVE_MISSED_LIMIT`
+    /// sends in a row.
+    pub fn record_send(&mut self, answered_since_last_send: bool) -> bool {
+        if answered_since_last_send {
+            self.unanswered = 0;
+        } else {
+            self.unanswered = self.unanswered.saturating_add(1);
+        }
+        self.unanswered >= KEEP_ALIVE_MISSED_LIMIT
+    }
+
+    /// Consecutive unanswered sends so far.
+    pub fn unanswered(&self) -> u32 {
+        self.unanswered
+    }
+}
+
+/// Environment variable that keeps the keep-alive traffic but disables the
+/// "silent server is dead" verdict. The rule assumes a live server answers
+/// a Refresh Rect on an idle desktop with some PDU; if a server turns out not
+/// to, this keeps the NAT-idle protection without the false drops, which
+/// `--keep-alive-secs 0` would throw away together.
+pub const SILENCE_DROP_KILL_SWITCH: &str = "AGENT_RDP_NO_SILENCE_DROP";
+
+/// Whether the silence verdict is disabled by the environment.
+pub fn silence_drop_disabled() -> bool {
+    std::env::var_os(SILENCE_DROP_KILL_SWITCH)
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
 impl Drop for RdpSession {
     fn drop(&mut self) {
         // No-op for a task that already finished (the normal case after
@@ -1038,6 +1096,8 @@ async fn run_frame_processor(
     // detection, so a keep-alive that cannot write is not itself fatal - but
     // it must not log once per tick for the life of a dead socket either.
     let mut keep_alive_failing = false;
+    let mut keep_alive_watch = KeepAliveWatch::default();
+    let mut last_keep_alive_sent_at: Option<std::time::Instant> = None;
     let mut keep_alive_timer = keep_alive.map(|period| {
         info!("Keep-alive enabled: every {}s", period.as_secs());
         let mut timer = tokio::time::interval(period);
@@ -1094,6 +1154,43 @@ async fn run_frame_processor(
                                 keep_alive_failing = false;
                             }
                             debug!("Keep-alive sent");
+
+                            // A refresh is a request, and a live server answers it
+                            // with a repaint. A server whose TCP stack is still up
+                            // but whose RDP service is gone (the field's
+                            // ERROR_SEM_TIMEOUT case) keeps ACKing these writes, so
+                            // neither TCP keepalive nor the unacked-data bound ever
+                            // fires - the client sat blind for 18 minutes on a
+                            // transport that had answered nothing. Consecutive
+                            // unanswered refreshes are the one signal that separates
+                            // "idle" from "dead" here; see `KeepAliveWatch` for why
+                            // they are counted per send rather than timed.
+                            let now = std::time::Instant::now();
+                            let answered = match last_keep_alive_sent_at {
+                                Some(sent) => shared.read().last_frame_at > sent,
+                                None => true,
+                            };
+                            last_keep_alive_sent_at = Some(now);
+                            let dead = keep_alive_watch.record_send(answered);
+                            if dead && !silence_drop_disabled() {
+                                let inbound_age = shared.read().last_frame_at.elapsed();
+                                drop_reason = format!(
+                                    "the server answered none of the last {} keep-alive \
+                                     refresh requests (no data from it for {}s; its TCP stack \
+                                     acknowledged the sends, its RDP service did not respond)",
+                                    keep_alive_watch.unanswered(),
+                                    inbound_age.as_secs()
+                                );
+                                error!("{}", drop_reason);
+                                break;
+                            } else if dead {
+                                warn!(
+                                    "{} keep-alive refreshes unanswered; not dropping because {} \
+                                     is set",
+                                    keep_alive_watch.unanswered(),
+                                    SILENCE_DROP_KILL_SWITCH
+                                );
+                            }
                         }
                         Err(e) => {
                             if !keep_alive_failing {
@@ -1826,5 +1923,122 @@ mod tests {
         let events = unicode_key_events(&units);
         assert_eq!(events.len(), units.len() * 2);
         assert_eq!(codes(&events), units);
+    }
+}
+
+/// Liveness plumbing that needs no RDP server: the drop probe a `connect`
+/// holds across its bootstrap, the socket option that bounds a dead path,
+/// and the keep-alive verdict.
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn shared_state() -> Arc<RwLock<SharedState>> {
+        Arc::new(RwLock::new(SharedState {
+            image: DecodedImage::new(ironrdp_graphics::image_processing::PixelFormat::RgbA32, 1, 1),
+            host: "test".to_string(),
+            width: 1,
+            height: 1,
+            frame_generation: 0,
+            last_frame_at: std::time::Instant::now(),
+            drop_reason: None,
+            drives: Vec::new(),
+            clipboard: Arc::new(parking_lot::Mutex::new(clipboard::ClipboardState::default())),
+        }))
+    }
+
+    /// `connect` clones the probe before a bootstrap that can take minutes
+    /// and consults it afterwards: it has to be a live view of the session
+    /// state, not a snapshot taken when it was cloned.
+    #[test]
+    fn a_drop_probe_sees_a_drop_recorded_after_it_was_taken() {
+        let shared = shared_state();
+        let probe = DropProbe { shared: Arc::clone(&shared) };
+        assert!(probe.drop_reason().is_none());
+
+        shared.write().drop_reason = Some("failed to read from the RDP transport".to_string());
+
+        assert_eq!(
+            probe.drop_reason().as_deref(),
+            Some("failed to read from the RDP transport")
+        );
+        // And a clone of the probe is the same view, not a copy.
+        assert!(probe.clone().drop_reason().is_some());
+    }
+
+    /// Runs the real `setsockopt` on whatever OS executes the tests. CI's
+    /// `test` job runs on Linux and Windows, so this is the only execution the
+    /// Windows `TCP_MAXRT` arm gets before a deployment; there is no macOS
+    /// runner in that job, so the macOS arm is verified by compilation only.
+    #[tokio::test]
+    async fn the_unacked_data_bound_applies_to_a_real_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let _peer = listener.accept().await.unwrap();
+
+        RdpSession::apply_tcp_unacked_timeout(&stream, Duration::from_secs(5))
+            .expect("the platform's unacked-data option should apply to a live socket");
+        // The keepalive path it sits next to must keep working as well.
+        RdpSession::apply_tcp_keepalive(&stream).expect("keepalive applies to a live socket");
+    }
+
+    /// Three unanswered sends in a row, not one: a single missed repaint is
+    /// a busy server, three consecutive on a socket that still ACKs is a
+    /// dead service.
+    #[test]
+    fn the_server_gets_three_unanswered_sends_before_it_is_declared_dead() {
+        let mut watch = KeepAliveWatch::default();
+        assert!(!watch.record_send(true), "first send, nothing to compare against");
+        assert!(!watch.record_send(false));
+        assert!(!watch.record_send(false));
+        assert_eq!(watch.unanswered(), 2);
+        assert!(watch.record_send(false), "the third consecutive silence is death");
+        assert_eq!(watch.unanswered(), 3);
+    }
+
+    /// One answer anywhere resets the count: an idle desktop that answers
+    /// every refresh never accumulates strikes.
+    #[test]
+    fn any_answer_clears_the_strikes() {
+        let mut watch = KeepAliveWatch::default();
+        watch.record_send(false);
+        watch.record_send(false);
+        assert!(!watch.record_send(true));
+        assert_eq!(watch.unanswered(), 0);
+        assert!(!watch.record_send(false));
+        assert!(!watch.record_send(false));
+        assert!(watch.record_send(false));
+    }
+
+    /// The stall the counter exists for: the loop was blocked for longer than
+    /// the whole limit while the server was fine. Only one tick fires when it
+    /// resumes, so a single strike at most - and the drained replies clear it
+    /// on the next send, whichever arm `select!` happened to run first.
+    #[test]
+    fn a_long_local_stall_is_at_most_one_strike() {
+        let mut watch = KeepAliveWatch::default();
+        watch.record_send(true);
+        // Resume after a 10-minute stall: the timer fires once, and the
+        // replies to the pre-stall send are still in the socket buffer.
+        assert!(!watch.record_send(false), "one overdue tick is one strike, not death");
+        assert_eq!(watch.unanswered(), 1);
+        // The read arm drains the buffer; the next send sees an answer.
+        assert!(!watch.record_send(true));
+        assert_eq!(watch.unanswered(), 0);
+    }
+
+    #[test]
+    fn the_silence_kill_switch_reads_like_the_relaunch_one() {
+        // Same convention as AGENT_RDP_NO_AUTO_RELAUNCH: any non-empty value
+        // other than "0" disables. Checked through the parser only, since the
+        // process environment is shared with other tests.
+        let parse = |v: Option<&str>| v.map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+        assert!(!parse(None));
+        assert!(!parse(Some("")));
+        assert!(!parse(Some("0")));
+        assert!(parse(Some("1")));
+        assert!(parse(Some("yes")));
     }
 }

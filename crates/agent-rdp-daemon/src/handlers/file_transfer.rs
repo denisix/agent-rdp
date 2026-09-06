@@ -427,17 +427,37 @@ pub async fn handle_push(
             // "retrying may apply it twice" the DVC layer attaches to every
             // indeterminate outcome - for this command that warning is wrong
             // and sent callers off to build gzip+clipboard workarounds.
+                // Honest about what a retry can do. A lost reply leaves the
+                // outcome unknown - the swap may already have happened - so
+                // the caller should look before retrying. An error the agent
+                // raised on the final step is deterministic for this input,
+                // and callers rebuilt their workflows around a "re-run" hint
+                // that could not help with it. Anything else is retryable.
+                let indeterminate = e.downcast_ref::<crate::automation::DvcIndeterminate>().is_some();
+                let advice = if indeterminate {
+                    "The outcome is unknown (the reply was lost): the swap into place may or \
+                     may not have happened. Check the destination with `file stat` before \
+                     deciding whether to re-run."
+                } else if last {
+                    "The agent rejected the final step (verification or the swap into \
+                     place) - that is deterministic for this input, so re-running will \
+                     produce the same error; report it with the sidecar name above."
+                } else {
+                    "Re-running is safe: the transfer restarts from the first chunk."
+                };
                 return Response::error(
                     ErrorCode::AutomationError,
                     format!(
                         "Transfer failed on chunk {}/{} of '{}': {}. The destination was not \
-                         touched - the transfer is assembled beside it and only swapped in \
-                         once it verifies - so the previous file is still there. Re-run \
-                         `file push`.",
+                         replaced - the transfer is assembled in a sidecar \
+                         ('{}.agent-rdp-{}.part') and only swapped in once it verifies. {}",
                         index + 1,
                         total_chunks,
                         params.remote_path,
-                        e
+                        e,
+                        params.remote_path,
+                        transfer_id,
+                        advice
                     ),
                 );
             }
@@ -891,12 +911,51 @@ mod push_integrity_tests {
 
     #[test]
     fn absolute_windows_paths_are_recognised() {
-        for good in ["C:\\dir\\f.txt", "c:/dir/f.txt", "\\\\srv\\share\\f.txt", "//srv/share/f"] {
+        for good in [
+            "C:\\dir\\f.txt",
+            "c:/dir/f.txt",
+            "C:\\",
+            "D:/mixed\\separators/f.txt",
+            "\\\\srv\\share\\f.txt",
+            "//srv/share/f",
+        ] {
             assert!(is_absolute_windows_path(good), "{good} is absolute");
         }
-        for bad in ["dir\\f.txt", "./f.txt", "/usr/local/f", "C:", "C:f.txt", ""] {
+        for bad in ["dir\\f.txt", "./f.txt", "/usr/local/f", "C:", "C:f.txt", "", " ", "1:\\x"] {
             assert!(!is_absolute_windows_path(bad), "{bad} is not an absolute Windows path");
         }
+    }
+
+    #[test]
+    fn empty_paths_are_refused_on_both_sides() {
+        assert!(check_paths("", "C:\\f").is_err());
+        let absolute = std::env::temp_dir().join("f");
+        assert!(check_paths(&absolute.to_string_lossy(), "").is_err());
+    }
+
+    /// The agent's reply is untrusted input; a reply that is not even an
+    /// object must land in the "nothing to verify against" branch, not panic.
+    #[test]
+    fn a_non_object_reply_cannot_verify_a_push() {
+        for reply in [serde_json::Value::Null, serde_json::json!("ok"), serde_json::json!([1, 2])] {
+            let err = verify_push(Some(&reply), "abc", 4, "C:\\f").unwrap_err();
+            assert_eq!(err.error.unwrap().code, ErrorCode::TransferVerificationFailed);
+        }
+    }
+
+    /// The overwrite branch failed on every attempt in the field: PowerShell
+    /// hands a .NET `string` parameter "" for `$null`, and File.Replace
+    /// rejects "" as a backup path. Only [NullString]::Value is a real null.
+    #[test]
+    fn the_overwrite_passes_a_real_null_for_the_backup_path() {
+        let script = include_str!("../automation/scripts/lib/actions.ps1");
+        assert!(script.contains("[System.IO.File]::Replace($part, $path, [NullString]::Value)"));
+        assert!(
+            !script.contains("::Replace($part, $path, $null)"),
+            "`$null` becomes \"\" here and every overwrite fails"
+        );
+        // The failure text names the sidecar, so a report can be acted on.
+        assert!(script.contains("staged as '$part'"));
     }
 
     /// The daemon used to report the hash of the bytes it *sent* as though
@@ -943,7 +1002,7 @@ mod push_integrity_tests {
         let script = include_str!("../automation/scripts/lib/actions.ps1");
         assert!(script.contains(".agent-rdp-$tid.part"));
         assert!(
-            script.contains("[System.IO.File]::Replace($part, $path, $null)"),
+            script.contains("[System.IO.File]::Replace($part, $path, [NullString]::Value)"),
             "Move-Item is delete-then-move, and moves into a directory rather than failing"
         );
         assert!(

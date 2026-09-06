@@ -1215,20 +1215,35 @@ function Invoke-FileWriteChunk {
     # report success without anything having been verified.
     try {
         if (-not $Params.sha256) {
-            throw "Transfer of '$path' carried no expected hash, so it cannot be verified"
+            throw "Transfer of '$path' carried no expected hash, so it cannot be verified (staged as '$part')"
         }
         $hash = (Get-FileHash -LiteralPath $part -Algorithm SHA256).Hash.ToLower()
         if ($Params.sha256.ToLower() -ne $hash) {
-            throw "Transfer verification failed for '$path': expected $($Params.sha256), got $hash"
+            throw "Transfer verification failed for '$path': expected $($Params.sha256), got $hash (staged as '$part')"
         }
 
         # Replace rather than Move-Item: Move-Item is a delete followed by a
         # move, and onto an existing directory it would move the sidecar
         # inside it instead of failing.
+        #
+        # The backup argument must be a real .NET null, and `$null` is not
+        # one here: PowerShell converts `$null` to "" for a [string]
+        # parameter, and File.Replace then rejects "" as a path ("The path is
+        # not of a legal form") - which made every overwrite fail while a push
+        # to a new path (the Move branch) kept working. [NullString]::Value is
+        # the only way to hand a .NET string parameter an actual null.
         if (Test-Path -LiteralPath $path -PathType Leaf) {
-            [System.IO.File]::Replace($part, $path, $null)
+            try {
+                [System.IO.File]::Replace($part, $path, [NullString]::Value)
+            } catch {
+                throw "Could not replace '$path' with the verified transfer staged as '$part': $($_.Exception.GetType().Name): $($_.Exception.Message)"
+            }
         } else {
-            [System.IO.File]::Move($part, $path)
+            try {
+                [System.IO.File]::Move($part, $path)
+            } catch {
+                throw "Could not move the verified transfer staged as '$part' into place at '$path': $($_.Exception.GetType().Name): $($_.Exception.Message)"
+            }
         }
     } catch {
         try { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue } catch {}

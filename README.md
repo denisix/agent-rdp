@@ -126,8 +126,9 @@ adds `frame_seq` and `frame_hash` — two screenshots with the same value are
 guaranteed pixel-identical, which is how you confirm a frame actually changed
 after an action rather than hashing the saved file yourself. A large
 `frame_age_ms` usually just means an idle desktop, since RDP servers send
-nothing when nothing changes; a genuinely dead connection is detected within
-seconds by TCP keepalive and reported as disconnected.
+nothing when nothing changes; a genuinely dead connection is detected within a
+few minutes at most (see "A dead transport is detected" below) and reported as
+disconnected.
 
 > The CLI has no `screenshot --base64`. In Node, `rdp.screenshot({ path })`
 > writes to disk and returns `{ path, width, height }` — prefer it over the
@@ -455,11 +456,19 @@ of idling. The daemon sends a Refresh Rect PDU every 45s to keep the path warm
 (`connect --keep-alive-secs <n>`, `0` disables). It carries no input, focus or
 lock-key semantics, so it cannot disturb the remote desktop.
 
-**A dead transport is detected in about a minute.** The RDP socket is
-configured to give up on unacknowledged data after 30s, so a black-holed path
-(no RST/FIN, just silence) surfaces within roughly one keep-alive interval plus
-that. Before this it fell back to the OS retransmission timeout — four to five
-minutes during which `screenshot` kept succeeding against a stale frame.
+**A dead transport is detected in a few minutes at most.** Two rules, for two
+ways a transport dies. The RDP socket gives up on unacknowledged data after
+30s, so a black-holed path (no RST/FIN, just silence) surfaces within roughly
+one keep-alive interval plus that. And each keep-alive is a request the server
+answers with a repaint, so a server whose TCP stack still ACKs but whose RDP
+service is gone — the case where nothing at the TCP level ever fails — is
+declared dead after three unanswered refreshes in a row (about 2.25 minutes
+at the default interval). Before these, detection fell back to the OS
+retransmission timeout or to nothing at all: four to eighteen minutes during
+which `screenshot` kept succeeding against a stale frame. A server that never
+answers a Refresh Rect would trip the second rule; `AGENT_RDP_NO_SILENCE_DROP=1`
+keeps the traffic but disables that verdict, and `--keep-alive-secs 0` disables
+both.
 
 **The automation agent survives a reconnect.** When the transport drops, the
 agent keeps re-opening its channel for about 10 minutes rather than exiting, so
@@ -552,6 +561,7 @@ Add `--json` to any command:
 | `AGENT_RDP_MODELS_DIR` | OCR models directory (set automatically by the npm wrapper; needed for standalone binary installs) |
 | `AGENT_RDP_DIAGNOSTICS` | Set to `0` to disable the request transcript and failure captures |
 | `AGENT_RDP_NO_AUTO_RELAUNCH` | Set to `1` before `connect` to stop the daemon relaunching the automation agent on its own (`automate restart` still works) |
+| `AGENT_RDP_NO_SILENCE_DROP` | `1` keeps the keep-alive traffic but disables the "server answered none of the last 3 refreshes" disconnect verdict |
 
 ## Node.js API
 
