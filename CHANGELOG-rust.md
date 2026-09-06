@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.17](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.16...agent-rdp-rust-v0.7.17) (2026-09-06)
+
+
+### Features
+
+* honest connect state, fast drop detection, survivable agent, verified push ([ab9e6bf](https://github.com/denisix/agent-rdp/commit/ab9e6bfe6e7fdf725d220f7765f6157ab3bb8e8c))
+
+
+### Bug Fixes
+
+* suppress PSScriptAnalyzer false positive on -BuildId param ([ba15a96](https://github.com/denisix/agent-rdp/commit/ba15a9699b44e20abb1e954fd60e7aa3bb228df5))
+
 ## [0.7.16](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.15...agent-rdp-rust-v0.7.16) (2026-09-05)
 
 
