@@ -190,7 +190,17 @@ last: boolean,
 /**
  * Expected SHA-256 of the complete file, checked when `last`.
  */
-sha256?: string, } | { "op": "file_read_chunk", 
+sha256?: string, 
+/**
+ * Identifies the transfer this chunk belongs to.
+ *
+ * The agent writes chunks to a sidecar named after it and only
+ * replaces the destination once the whole file verifies, so a failed
+ * or overlapping transfer can no longer leave a torn file where a
+ * good one used to be. Defaulted rather than required: an agent from
+ * before 1.8.0 ignores it, and a daemon talking to one still works.
+ */
+transfer_id: string, } | { "op": "file_read_chunk", 
 /**
  * Source path on the remote machine.
  */
@@ -210,4 +220,4 @@ path: string, } | { "op": "query_result",
 /**
  * Id of the request to look up.
  */
-id: string, };
+id: string, } | { "op": "shutdown" };

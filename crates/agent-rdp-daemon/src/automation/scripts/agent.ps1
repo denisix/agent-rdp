@@ -5,13 +5,24 @@
 # BasePath kept for reference/logging (RDPDR drive still mapped for future file transfer)
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'BasePath')]
 param(
-    [string]$BasePath = "\\TSCLIENT\agent-automation"
+    [string]$BasePath = "\\TSCLIENT\agent-automation",
+    # Hash of every script the launching daemon deployed, echoed back in the
+    # handshake. Lets a later connect tell this agent apart from one left
+    # over from a daemon whose scripts have since changed, even when
+    # $script:Version did not move - library-only changes are exactly the
+    # case a version string alone would miss.
+    [string]$BuildId = ""
 )
 
 # ============ SETUP ============
 
 # Set window title for easy identification
 $Host.UI.RawUI.WindowTitle = "agent-rdp automation"
+
+# Every `run` child shares this console, so setting it once here means the
+# children inherit UTF-8 and their own prelude has nothing left to change.
+# The agent never writes to stdout itself; this is purely for what it starts.
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
 
 # Load UI Automation assemblies
 Add-Type -AssemblyName UIAutomationClient
@@ -21,10 +32,23 @@ Add-Type -AssemblyName System.Windows.Forms
 # Global state
 $script:RefMap = @{}  # ref number -> AutomationElement mapping
 $script:SnapshotId = $null
-$script:Version = "1.7.0"  # persistent idempotency journal; run: command_line, finished_unix, parse_error before launch
+$script:Version = "1.8.0"  # survives a transport drop and is adopted by the next connect; shutdown command
 # Local log path on Windows machine (RDPDR not used for logging anymore)
 $script:LocalLogPath = "$env:TEMP\agent-rdp-automation.log"
 $script:DvcHandle = [IntPtr]::Zero
+# Set by the `shutdown` command: tells the outer loop this exit was asked for
+# and must not be retried.
+$script:ShutdownRequested = $false
+# How long to keep trying to re-open the channel after it dies, measured from
+# the first failure. The client going away is the common case - a dropped
+# transport, or a laptop closing - and the same Windows session is still there
+# when it comes back. Staying alive across that window is what lets the next
+# connect adopt this agent instead of typing Win+R on the desktop.
+$script:ReconnectWindowSec = 600
+$script:ReconnectDelaySec = 3
+# Whether a client has connected since the last channel failure; resets the
+# reconnect window so it is measured per outage, not per process.
+$script:HandshakeSinceFailure = $false
 
 # ============ LOGGING ============
 
@@ -71,12 +95,16 @@ function Start-Agent {
         "context_menu", "focus", "get", "fill", "clear",
         "scroll", "window", "run", "run_poll", "wait_for", "status",
         "file_write_chunk", "file_read_chunk", "file_stat", "query_result",
-        "persistent_journal"
+        "persistent_journal", "shutdown", "survives_reconnect"
     )
 
     try {
-        Send-DvcHandshake -Handle $script:DvcHandle -Version $script:Version -Capabilities $capabilities
+        Send-DvcHandshake -Handle $script:DvcHandle -Version $script:Version -Capabilities $capabilities -BuildId $BuildId
         Write-Log "DVC handshake sent: version=$($script:Version)"
+        # A client took us: the reconnect window starts over from the next
+        # failure, so an agent that has served several sessions still gets a
+        # full window each time rather than a shrinking one.
+        $script:HandshakeSinceFailure = $true
     } catch {
         Write-Log "Failed to send handshake: $($_.Exception.Message)" "ERROR"
         throw
@@ -187,6 +215,13 @@ function Start-Agent {
                     "file_read_chunk"  { Invoke-FileReadChunk -Params $request.params }
                     "file_stat"        { Invoke-FileStat -Params $request.params }
                     "query_result"     { Get-JournaledResult -Params $request.params }
+                    "shutdown"         {
+                        # Answer first, exit after: the daemon waits for the
+                        # channel to close as its signal that the old agent
+                        # really is gone before launching a replacement.
+                        $script:ShutdownRequested = $true
+                        @{ stopping = $true }
+                    }
                     default        { throw "Unknown command: $($request.command)" }
                 }
                 Write-Log "Command succeeded: $($request.command)"
@@ -216,6 +251,10 @@ function Start-Agent {
             try {
                 Send-DvcResponse -Handle $script:DvcHandle -Id $request.id -Success $success -Data $responseData -ErrorInfo $responseError
                 Write-Log "Response sent for request $($request.id)"
+                if ($script:ShutdownRequested) {
+                    Write-Log "Shutdown requested; exiting after replying"
+                    return
+                }
             } catch {
                 Write-Log "Failed to send response: $($_.Exception.Message)" "ERROR"
                 # If we can't send response, channel may be dead
@@ -226,13 +265,22 @@ function Start-Agent {
             $errorMsg = $_.Exception.Message
             Write-Log "DVC error: $errorMsg" "ERROR"
 
+            if ($script:ShutdownRequested) {
+                # Asked to exit, and then failed to tell the daemon so (the
+                # send itself is what can throw here). Exiting is still the
+                # right call - staying up after a shutdown request, even on a
+                # failed reply, means never leaving when asked to.
+                Write-Log "Shutdown requested; exiting despite the send failure" "WARN"
+                return
+            }
+
             # Only an explicitly fatal transport error ends the agent. The
             # old substring test ("Win32 error" / "channel") also matched
             # every transient read error a CPU-starved host produces, so the
             # agent exited under load and the daemon reported channel_closed.
             if ($errorMsg.StartsWith($script:DvcFatalPrefix)) {
-                Write-Log "DVC channel is gone, exiting agent" "WARN"
-                break
+                Write-Log "DVC channel is gone" "WARN"
+                throw
             }
 
             # For other errors, try to continue
@@ -265,31 +313,51 @@ $exitHandler = {
 }
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $exitHandler | Out-Null
 
-# Run with retry logic
-$maxRetries = 3
-$retryCount = 0
+# Keep re-opening the channel while the client is away.
+#
+# The channel dies whenever the RDP transport does, and the agent used to give
+# up after three attempts two seconds apart - always losing the race against a
+# reconnect, so every reconnect had to launch a fresh agent by typing Win+R on
+# the remote desktop. The Windows session outlives the transport, so this
+# process can too: staying available for a few minutes turns the common
+# reconnect into one nobody sitting at that desktop notices.
+#
+# A session that is ended for real (logoff, or a policy that closes
+# disconnected sessions) takes this process with it regardless.
+$attempt = 0
+$firstFailure = $null
 
-while ($retryCount -lt $maxRetries) {
+while ($true) {
+    $attempt++
     try {
-        Write-Log "=== Agent process starting (PID: $PID, attempt: $($retryCount + 1)) ==="
+        Write-Log "=== Agent process starting (PID: $PID, attempt: $attempt) ==="
         Start-Agent
-        # If Start-Agent returns normally, exit cleanly
+        # Start-Agent returns only when a shutdown was requested.
         Write-Log "Agent exiting normally"
         Stop-Agent
         exit 0
     } catch {
-        $retryCount++
-        Write-Log "FATAL ERROR (attempt $retryCount/$maxRetries): $($_.Exception.Message)" "ERROR"
+        Write-Log "Channel error (attempt $attempt): $($_.Exception.Message)" "ERROR"
         Write-Log $_.ScriptStackTrace "ERROR"
 
         Stop-Agent
 
-        if ($retryCount -lt $maxRetries) {
-            Write-Log "Waiting before retry..."
-            Start-Sleep -Seconds 2
+        if ($script:HandshakeSinceFailure) {
+            $script:HandshakeSinceFailure = $false
+            $firstFailure = Get-Date
+        } elseif ($null -eq $firstFailure) {
+            $firstFailure = Get-Date
         }
+        $waited = ((Get-Date) - $firstFailure).TotalSeconds
+        if ($waited -ge $script:ReconnectWindowSec) {
+            Write-Log "No client for $([int]$waited)s; agent exiting" "WARN"
+            exit 1
+        }
+
+        # One line per attempt for ten minutes would bury the log.
+        if ($attempt % 10 -eq 0) {
+            Write-Log "Still waiting for a client ($([int]$waited)s of $($script:ReconnectWindowSec)s)"
+        }
+        Start-Sleep -Seconds $script:ReconnectDelaySec
     }
 }
-
-Write-Log "Max retries exceeded, agent exiting"
-exit 1

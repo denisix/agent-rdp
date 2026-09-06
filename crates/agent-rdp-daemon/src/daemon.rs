@@ -434,6 +434,9 @@ async fn handle_client(
         let is_shutdown = matches!(request, Request::Shutdown);
 
         let started = Instant::now();
+        // Taken before the request runs so a drop recorded *during* it can be
+        // told from the one it was recovering from.
+        let disconnect_before = last_disconnect.lock().unwrap().as_ref().map(|d| d.at);
         let mut response = process_request(
             request.clone(),
             &rdp_session,
@@ -452,7 +455,15 @@ async fn handle_client(
         // once, rather than at the two dozen sites that produce the code.
         annotate_not_connected(&mut response, &last_disconnect);
         if matches!(request, Request::Connect(_)) && response.success {
-            *last_disconnect.lock().unwrap() = None;
+            // Only if nothing dropped while this connect was running. A
+            // session that died during its own bootstrap records a drop here,
+            // and clearing that unconditionally erased the single piece of
+            // evidence explaining why the session went straight from
+            // "Connected" to "not connected".
+            let mut guard = last_disconnect.lock().unwrap();
+            if guard.as_ref().map(|d| d.at) == disconnect_before {
+                *guard = None;
+            }
         }
         if let Some(ResponseData::SessionInfo(ref mut info)) = response.data {
             info.last_disconnect = last_disconnect.lock().unwrap().as_ref().map(DisconnectInfo::to_protocol);
@@ -503,17 +514,25 @@ async fn process_request(
 
         Request::SessionInfo => {
             let session = rdp_session.lock().await;
-            let (state, host, width, height, last_frame_age_ms) = if let Some(ref rdp) = *session {
-                (
-                    ConnectionState::Connected,
-                    Some(rdp.host().to_string()),
-                    Some(rdp.width()),
-                    Some(rdp.height()),
-                    Some(rdp.last_frame_age().as_millis() as u64),
-                )
-            } else {
-                (ConnectionState::Disconnected, None, None, None, None)
-            };
+            // A session whose frame processor has stopped is reported as
+            // disconnected even while the slot still holds it: the teardown
+            // runs on its own task, and between the drop and that task
+            // finishing this would otherwise answer "Connected" for a session
+            // that is already gone.
+            let live = session.as_ref().filter(|rdp| rdp.drop_reason().is_none());
+            let (state, host, width, height, last_frame_age_ms, keep_alive_secs) =
+                if let Some(rdp) = live {
+                    (
+                        ConnectionState::Connected,
+                        Some(rdp.host().to_string()),
+                        Some(rdp.width()),
+                        Some(rdp.height()),
+                        Some(rdp.last_frame_age().as_millis() as u64),
+                        rdp.keep_alive().map(|d| d.as_secs()),
+                    )
+                } else {
+                    (ConnectionState::Disconnected, None, None, None, None, None)
+                };
 
             Response::success(ResponseData::SessionInfo(SessionInfo {
                 name: session_name.to_string(),
@@ -527,6 +546,7 @@ async fn process_request(
                 cli_version: None,
                 uptime_secs: start_time.elapsed().as_secs(),
                 last_frame_age_ms,
+                keep_alive_secs,
                 // Filled in by `handle_client`, which owns the drop state.
                 last_disconnect: None,
             }))
@@ -635,10 +655,10 @@ fn annotate_not_connected(response: &mut Response, last_disconnect: &SharedLastD
     };
     error.message = format!(
         "{}. The RDP transport dropped {}s ago ({}); the daemon itself is alive - \
-         re-establish the session with `agent-rdp connect ...`. Note that reconnecting \
-         relaunches the automation agent by typing Win+R on the remote desktop, which \
-         takes foreground from whatever is focused there - if other automation shares \
-         that desktop, expect it to notice.",
+         re-establish the session with `agent-rdp connect ...`. Reconnecting adopts the \
+         automation agent if it is still running on the remote machine (it keeps waiting \
+         for about 10 minutes), and only types Win+R to launch a new one if it is not - \
+         so a prompt reconnect is the one that leaves a shared desktop alone.",
         error.message.trim_end_matches('.'),
         info.seconds_ago(),
         info.reason
@@ -687,5 +707,57 @@ mod tests {
             assert!(is_stale_disconnect(stale, current), "generation {} should be stale", stale);
         }
         assert!(!is_stale_disconnect(current, current));
+    }
+}
+
+/// A `connect` whose session dies during its own automation bootstrap used to
+/// return success and then erase the evidence.
+#[cfg(test)]
+mod connect_honesty_tests {
+    /// The rule `handle_client` applies around a successful connect, as a
+    /// pure function of the two observations.
+    fn should_clear(before: Option<u64>, after: Option<u64>) -> bool {
+        before == after
+    }
+
+    #[test]
+    fn a_clean_connect_clears_the_previous_drop() {
+        // The drop it recovered from is history now.
+        assert!(should_clear(Some(100), Some(100)));
+        assert!(should_clear(None, None));
+    }
+
+    #[test]
+    fn a_drop_during_the_connect_is_kept() {
+        // Recorded while this very connect was running: clearing it left
+        // `session info` showing Disconnected with nothing to explain why,
+        // and stripped the annotation from every later `not_connected`.
+        assert!(!should_clear(None, Some(200)));
+        assert!(!should_clear(Some(100), Some(200)));
+    }
+
+    /// The two facts the CLI's warning used to state twice, once from each
+    /// side. The daemon owns the whole sentence now.
+    #[test]
+    fn the_retry_advice_is_written_once() {
+        let daemon = include_str!("handlers/connect.rs");
+        let cli = include_str!("../../agent-rdp/src/output.rs");
+        assert!(daemon.contains("Do not reconnect for this"));
+        assert!(
+            !cli.contains("Do not reconnect for this"),
+            "the CLI prints the daemon's message verbatim instead of wrapping it in its own copy"
+        );
+    }
+
+    /// Success is only reported for a session that is still alive.
+    #[test]
+    fn connect_rechecks_the_session_after_the_bootstrap() {
+        let handler = include_str!("handlers/connect.rs");
+        assert!(handler.contains("drop_probe"), "a handle that outlives the session slot");
+        assert!(handler.contains("the transport dropped again"));
+        assert!(
+            handler.contains("but the transport dropped immediately"),
+            "and before the session is stored, for one that died during the handshake"
+        );
     }
 }

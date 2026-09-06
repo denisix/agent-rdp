@@ -208,6 +208,7 @@ mod tests {
             stream_quality: 60,
             serve_viewer: false,
             keep_alive_secs: 45,
+            defer_agent: false,
         });
         let summary = summarize_request(&request);
         let text = summary.to_string();

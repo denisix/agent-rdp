@@ -63,6 +63,15 @@ other command then saw the connection drop mid-request). Only
 daemon is the one exception (always replaced). Every kill is recorded in
 `transcript.jsonl`.
 
+**Detecting a dead transport.** Keepalive probes are only sent on an *idle*
+socket, and the keep-alive tick means the socket is never idle - so detection
+fell back to the OS retransmission timeout (4-5 min, the field's `os error
+60`). `apply_tcp_unacked_timeout` bounds unacknowledged data at
+`UNACKED_DATA_TIMEOUT` (30s) per platform: `TCP_USER_TIMEOUT` (Linux, needs
+socket2's `all` feature), `TCP_RXT_CONNDROPTIME` = 0x80 (macOS, absent from
+`libc`), `TCP_MAXRT` (Windows, needs the `Win32_Networking_WinSock` feature).
+It fires only on data *we* sent going unacked, so a quiet server is unaffected.
+
 **Keep-alive.** `run_frame_processor`'s `select!` has a timer arm that sends a
 Refresh Rect PDU every `ConnectRequest::keep_alive_secs` (default 45, `0`
 disables, `connect --keep-alive-secs`). RDP ships only screen deltas, so an
@@ -77,16 +86,36 @@ forever, disabling automatic relaunch. Sending from inside the frame processor
 avoids that by construction. Keep the encode/write out of any lock guard, like
 the arms around it.
 
-**Reconnect is not free for the remote desktop.** `connect` with automation
-enabled relaunches the agent via Win+R/paste/Enter - a real foreground event on
-a shared desktop. It is not avoidable by checking whether the old agent is
-alive first: a dead transport invalidates the remote channel handle, and those
-Win32 errors are in `dvc.ps1`'s `DvcFatalWin32Errors`, so the agent has already
-exited. Fewer forced reconnects (keep-alive) is the mitigation; say so in docs
-rather than promising a "safe reconnect". `relaunches` never counted these
-bootstrap launches (only `relaunch_agent` increments it) - `total_launches`,
-incremented in `record_launch_outcome` and reset only when `connect` targets a
-different `host:port`, is what makes them visible.
+**The agent survives a reconnect; adopting it is the point.** A launch types
+Win+R/paste/Enter - a real foreground event on a shared desktop - so the agent
+now keeps re-opening its channel for `ReconnectWindowSec` (600s, per outage)
+instead of exiting, and `connect` polls `SURVIVOR_WAIT` (6s) for it before
+launching. Adoption sets `adopted` and does **not** increment `total_launches`
+(which counts launches that typed something; `relaunches` still counts only
+self-heal restarts since the last connect, and `record_launch_outcome` is where
+both are decided). Two agents can be alive at once, so `dvc_channel.rs` keeps
+the first channel opened and `shutdown`s any other, with an id-guarded
+`close()` - a rejected agent exiting must not clear the live one's handshake.
+`connect --defer-agent` adopts but never launches.
+
+**The DVC channel must be registered with `with_listener`.**
+`with_dynamic_channel` wraps the processor in ironrdp's `OnceListener`, whose
+`create()` is a `take`: the second channel open in one RDP session gets
+`NO_LISTENER`. From the IronRDP 0.17 upgrade until 0.7.17 that silently broke
+every in-session relaunch - the supervisor and `automate restart` waited out
+their handshake windows against a channel the client had already refused, and
+only a full reconnect (a fresh `DrdynvcClient`) recovered.
+
+**`connect` must not report success for a dead session.** The frame processor
+is spawned inside `RdpSession::connect`, so the session can die during
+`connect`'s own automation bootstrap (up to ~305s) - the drop carries the
+*current* generation, so it is not stale, and the daemon tears the session down
+while the handler is still running. `SharedState.drop_reason` is stamped at
+every processor exit; `connect` checks it before storing the session and again
+via `drop_probe()` after the bootstrap, and `session info` reports Disconnected
+whenever it is set. `handle_client` clears `last_disconnect` after a successful
+connect **only if it did not change during the request**, or the connect erases
+the record of the drop that just happened to it.
 
 **Automation self-heal.** A per-session supervisor (spawned by `connect`
 from `AutomationState::closed_rx`, scoped by `session_generation`, ended
@@ -155,8 +184,16 @@ are easy to break:
   and rapid reconnects stacked them up.
 
 **`handlers/*.rs`** — one module per command type, each returning a `Response`.
-`file_transfer.rs` moves files in chunks over the automation DVC channel with
-SHA-256 verification on both ends. A pull's hash (`FileStat`) and its bytes
+`file_transfer.rs` moves files in chunks over the automation DVC channel.
+Push verification is real now: the agent assembles chunks into a
+`<path>.agent-rdp-<transfer_id>.part` sidecar and only `File::Replace`s the
+destination once the hash matches, and `verify_push` compares the *agent's*
+reported hash and size against what was sent. Previously the daemon echoed the
+local hash as if confirmed, and the agent skipped its own check whenever the
+final chunk carried no hash - so a push could report success having written
+nothing of the sort. Both paths also reject non-absolute paths: the local one
+resolves against the daemon's working directory and the remote one against the
+agent's, neither of which is the caller's. A pull's hash (`FileStat`) and its bytes
 (`FileReadChunk`) are separate remote opens, so a file being rewritten can
 change in between; `pull_once` is one whole attempt and `handle_pull` runs up
 to `PULL_ATTEMPTS` of them (exponential backoff) for files under

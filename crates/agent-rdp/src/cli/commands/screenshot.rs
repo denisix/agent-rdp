@@ -11,6 +11,11 @@ use crate::cli::ScreenshotArgs;
 use crate::output::Output;
 use crate::session_manager::SessionManager;
 
+/// Frame age past which a screenshot is warned about. Comfortably above
+/// the default 45s keep-alive interval plus the ~30s the OS takes to
+/// declare a black-holed transport dead.
+const STALE_FRAME_WARN_MS: u64 = 120_000;
+
 pub async fn run(
     session: &str,
     args: ScreenshotArgs,
@@ -108,11 +113,15 @@ pub async fn run(
         // The frame itself is always the last one the background decoder
         // painted, even if the transport died since - a large, stale age is
         // the only signal that this frame might not reflect current state.
-        if frame_age_ms > 5000 {
+        // Threshold well past the keep-alive interval: a live server answers
+        // each keep-alive refresh, so an idle desktop no longer produces a
+        // frame age in the tens of seconds. At 5s this warned on every
+        // screenshot of a static desktop and taught callers to ignore it.
+        if frame_age_ms > STALE_FRAME_WARN_MS {
             eprintln!(
-                "Warning: this frame is {}s old. The desktop may simply be idle (RDP servers \
-                 send nothing when nothing changes), but if the connection has actually died \
-                 this is a stale frame - check `session info` for connection health.",
+                "Warning: no data from the server for {}s. With keep-alive on, a live server \
+                 answers each refresh, so this usually means the transport is dead rather than \
+                 the desktop idle - `session info` shows the drop once the OS reports it.",
                 frame_age_ms / 1000
             );
         }

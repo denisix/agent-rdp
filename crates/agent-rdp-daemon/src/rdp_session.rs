@@ -26,7 +26,7 @@ use ironrdp::session::{ActiveStage, ActiveStageOutput};
 use ironrdp_dvc::DrdynvcClient;
 use ironrdp_rdpdr::Rdpdr;
 
-use crate::automation::{AutomationDvc, SharedDvcState};
+use crate::automation::{AutomationDvcListener, SharedDvcState};
 use crate::rdpdr::MultiDriveBackend;
 use ironrdp_rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp_tokio::{FramedWrite, TokioFramed};
@@ -125,6 +125,12 @@ struct SharedState {
     /// transport died and nothing has noticed yet" (detection otherwise only
     /// happens reactively, when `read_pdu()` itself errors).
     last_frame_at: std::time::Instant,
+    /// Why the frame processor stopped, once it has. Set at every exit point
+    /// before the drop is notified, so a caller holding the session can tell
+    /// a live one from a corpse without waiting for the daemon's teardown to
+    /// run - `connect` uses it to avoid reporting success for a session that
+    /// died while the automation agent was starting.
+    drop_reason: Option<String>,
     /// Drives that were mapped at connect time.
     drives: Vec<DriveMapping>,
     /// Clipboard state for CLIPRDR.
@@ -148,6 +154,27 @@ pub struct RdpSession {
     /// supervisor waits for this to go quiet before typing into the
     /// session on its own.
     input_activity: Arc<std::sync::atomic::AtomicU64>,
+    /// The keep-alive interval this session was built with, for `session
+    /// info` - what a reported frame age has to be read against.
+    keep_alive: Option<std::time::Duration>,
+}
+
+/// A handle that outlives the session it watches.
+///
+/// `connect` has to re-check for a drop after work that gives up the session
+/// lock, by which point the daemon's teardown may already have replaced the
+/// slot with `None` - and "the session is gone" is exactly the case where the
+/// reason matters most.
+#[derive(Clone)]
+pub struct DropProbe {
+    shared: Arc<RwLock<SharedState>>,
+}
+
+impl DropProbe {
+    /// Why the watched session's frame processor stopped, if it has.
+    pub fn drop_reason(&self) -> Option<String> {
+        self.shared.read().drop_reason.clone()
+    }
 }
 
 /// Unix milliseconds now, for the activity stamps.
@@ -172,6 +199,10 @@ pub struct DisconnectEvent {
 /// How long `disconnect` waits for the frame processor to exit on its own
 /// before aborting it.
 pub const DISCONNECT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long data we sent may go unacknowledged before the connection is
+/// declared dead. See `RdpSession::apply_tcp_unacked_timeout`.
+pub const UNACKED_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Drop for RdpSession {
     fn drop(&mut self) {
@@ -224,6 +255,90 @@ impl RdpSession {
         #[cfg(not(any(target_os = "windows", target_os = "openbsd")))]
         let keepalive = keepalive.with_retries(4);
         sock_ref.set_tcp_keepalive(&keepalive)
+    }
+
+    /// Bound how long unacknowledged data may sit before the OS gives up.
+    ///
+    /// Keepalive alone stopped being enough when the keep-alive PDU arrived:
+    /// keepalive probes are only sent on an *idle* connection, and a session
+    /// that writes a Refresh Rect every 45s is never idle. A black-holed path
+    /// then falls back to the OS retransmission timeout - minutes (the
+    /// reported `os error 60` after 4-5 of them) during which every
+    /// screenshot keeps succeeding against a stale framebuffer.
+    ///
+    /// This is the option built for that case. It fires only when data *we*
+    /// sent goes unacknowledged for the whole window, so a server that is
+    /// merely quiet is unaffected; combined with the keep-alive the worst
+    /// case is one interval plus this timeout.
+    fn apply_tcp_unacked_timeout(
+        stream: &TcpStream,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            socket2::SockRef::from(stream).set_tcp_user_timeout(Some(timeout))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            // Not in `libc`: seconds to keep retransmitting before dropping
+            // the connection (`TCP_RXT_CONNDROPTIME`, netinet/tcp.h).
+            const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80;
+            let secs = timeout.as_secs() as libc::c_int;
+            // SAFETY: a live fd, a fixed option, and a correctly sized
+            // `c_int` payload.
+            let rc = unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    TCP_RXT_CONNDROPTIME,
+                    std::ptr::addr_of!(secs).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::{setsockopt, IPPROTO_TCP, TCP_MAXRT};
+            let secs = timeout.as_secs() as u32;
+            let bytes = secs.to_ne_bytes();
+            // SAFETY: a live socket, a fixed option, and a correctly sized
+            // DWORD payload.
+            let rc = unsafe {
+                setsockopt(
+                    stream.as_raw_socket() as _,
+                    IPPROTO_TCP,
+                    TCP_MAXRT as i32,
+                    bytes.as_ptr(),
+                    bytes.len() as i32,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "windows"
+        )))]
+        {
+            let _ = (stream, timeout);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no unacknowledged-data timeout on this platform",
+            ))
+        }
     }
 
     /// Establish a new RDP connection.
@@ -302,6 +417,13 @@ impl RdpSession {
         if let Err(e) = Self::apply_tcp_keepalive(&tcp_stream) {
             warn!("Failed to configure TCP keepalive (continuing without it): {}", e);
         }
+        if let Err(e) = Self::apply_tcp_unacked_timeout(&tcp_stream, UNACKED_DATA_TIMEOUT) {
+            warn!(
+                "Failed to bound the unacknowledged-data timeout (a dead transport may take \
+                 the OS's own retransmission timeout to notice): {}",
+                e
+            );
+        }
 
         // Create framed transport for initial connection
         let mut framed: TokioFramed<TcpStream> = TokioFramed::new(tcp_stream);
@@ -364,8 +486,13 @@ impl RdpSession {
                 state.command_tx = Some(command_tx);
             }
 
-            let automation_dvc = AutomationDvc::new(dvc_state);
-            let drdynvc = DrdynvcClient::new().with_dynamic_channel(automation_dvc);
+            // A listener, not a pre-registered channel: the agent may open
+            // the channel more than once in a single RDP session (it is
+            // relaunched after a crash, and it survives a transport drop to
+            // be adopted by the next connect). `with_dynamic_channel` hands
+            // the processor out once and refuses every later open.
+            let drdynvc =
+                DrdynvcClient::new().with_listener(AutomationDvcListener::new(dvc_state));
             connector.attach_static_channel(drdynvc);
             info!("Dynamic Virtual Channel enabled for automation");
             Some(command_rx)
@@ -473,6 +600,7 @@ impl RdpSession {
             height: desktop_height,
             frame_generation: 0,
             last_frame_at: std::time::Instant::now(),
+            drop_reason: None,
             drives: config.drives.clone(),
             clipboard: clipboard_state,
         }));
@@ -504,7 +632,27 @@ impl RdpSession {
             task_handle,
             script_activity,
             input_activity: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            keep_alive,
         })
+    }
+
+    /// Why this session's frame processor stopped, if it has. `None` while
+    /// the session is live.
+    pub fn drop_reason(&self) -> Option<String> {
+        self.shared.read().drop_reason.clone()
+    }
+
+    /// A handle that keeps answering `drop_reason` after this session has
+    /// been taken out of the daemon's slot.
+    pub fn drop_probe(&self) -> DropProbe {
+        DropProbe {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// The keep-alive interval this session was built with, if enabled.
+    pub fn keep_alive(&self) -> Option<std::time::Duration> {
+        self.keep_alive
     }
 
     /// How long ago the remote last opened a `.ps1` on a mapped drive, or
@@ -1172,7 +1320,15 @@ async fn run_frame_processor(
                             }
                         }
                         if should_terminate {
-                            // Server-initiated termination - notify daemon
+                            // Server-initiated termination - notify daemon.
+                            // Stamped on the shared state first: this arm
+                            // returns rather than breaking, so it never
+                            // reaches the bottom of the function, and a
+                            // `connect` still inside its automation bootstrap
+                            // has no other way to learn the session under it
+                            // just ended.
+                            shared.write().drop_reason =
+                                Some("server-initiated termination (disconnect PDU)".to_string());
                             if let Some((notify, generation)) = disconnect_notify {
                                 let _ = notify
                                     .send(DisconnectEvent {
@@ -1277,6 +1433,10 @@ async fn run_frame_processor(
     // The generation goes with it so the daemon can tell a drop for the
     // session it currently holds from one for a session already replaced.
     if !graceful_shutdown {
+        // Before the notification, so that a caller which sees the daemon's
+        // teardown has already seen the reason. A graceful shutdown leaves it
+        // unset: that session was asked to stop, it did not die.
+        shared.write().drop_reason = Some(drop_reason.clone());
         if let Some((notify, generation)) = disconnect_notify {
             info!(
                 "Notifying daemon of connection drop (generation {}): {}",

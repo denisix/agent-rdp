@@ -155,6 +155,20 @@ pub async fn handle(
     let width = rdp.width();
     let height = rdp.height();
 
+    // The frame processor is already running by the time `connect` returns,
+    // so the session can be dead before it is ever stored - a server that
+    // closes the connection right after logon does exactly that. Reporting
+    // "Connected" here is what left callers with a successful connect and a
+    // disconnected session.
+    if let Some(reason) = rdp.drop_reason() {
+        return Response::error(
+            ErrorCode::ConnectionFailed,
+            format!("Connected to {} but the transport dropped immediately: {}", host, reason),
+        );
+    }
+    let drop_probe = rdp.drop_probe();
+    let connected_at = std::time::Instant::now();
+
     // Store the session
     {
         let mut session = rdp_session.lock().await;
@@ -230,6 +244,7 @@ pub async fn handle(
     // Bootstrap automation if enabled (directory was already created before connection)
     let mut automation_ready = None;
     let mut automation_error = automation_init_error;
+    let mut automation_deferred = false;
     if enable_automation {
         // `total_launches` counts against one target, so pointing the same
         // daemon at another machine starts the count over. Done here rather
@@ -245,12 +260,34 @@ pub async fn handle(
         }
 
         if automation_error.is_some() {
-            // `initialize()` never produced a `dvc_ipc`, so there is nothing
-            // for `launch_agent`/`wait_for_agent` to do but fail - launching
-            // anyway would still open the remote Run dialog and paste a
-            // command referencing a drive that was never mapped, three times,
-            // for no benefit. Report the real reason immediately instead.
+            // `initialize()` never produced a `dvc_ipc` - checked first, and
+            // ahead of `defer_agent`, because there is nothing for
+            // `adopt_only` to attach to either. Reporting this as a deferred
+            // launch (as the order used to) hid the real reason and told the
+            // caller `automate restart` would fix it, when nothing short of
+            // reconnecting can.
             automation_ready = Some(false);
+        } else if params.defer_agent {
+            // The drive and the DVC channel are up, so an agent that outlived
+            // an earlier drop can still reattach on its own - only the Win+R
+            // is withheld. Try to adopt one anyway: that costs the remote
+            // desktop nothing, which is the whole point of the flag.
+            match crate::automation::adopt_only(automation_state).await {
+                true => automation_ready = Some(true),
+                false => {
+                    automation_deferred = true;
+                    let mut state = automation_state.lock().await;
+                    // Not a failure, so the supervisor must not arm a retry
+                    // and start typing on its own later.
+                    state.last_error = Some(
+                        "agent launch deferred by `connect --defer-agent`; `automate restart` \
+                         starts it (this types Win+R on the remote desktop)"
+                            .to_string(),
+                    );
+                    state.next_retry_at = None;
+                    state.launch_failures = 0;
+                }
+            }
         } else {
             info!("Bootstrapping Windows UI Automation...");
 
@@ -260,14 +297,21 @@ pub async fn handle(
             // unexplained "agent not ready". The guarded path marks the
             // bootstrap as in flight (so the supervisor cannot double it)
             // and, on failure, schedules the supervisor's retries.
-            match crate::automation::launch_guarded(rdp_session, automation_state).await {
+            // Adopts an agent that outlived the previous drop when there is
+            // one, which is the common case on a reconnect - that path types
+            // nothing on the remote desktop.
+            match crate::automation::launch_guarded(rdp_session, automation_state, true).await {
                 Ok(()) => automation_ready = Some(true),
                 Err(reason) => {
                     automation_ready = Some(false);
+                    // The whole sentence lives here, and `output.rs` prints
+                    // it verbatim. It used to be half here and half in the
+                    // CLI, which rendered the same advice twice.
                     automation_error = Some(format!(
-                        "{}. The daemon keeps retrying in the background once the session has \
-                         been idle for {}s (`automate status` shows last_error and \
-                         next_retry_secs); `automate restart` forces a retry now",
+                        "{}. Do not reconnect for this - the RDP session is up and the daemon \
+                         keeps retrying once the desktop has been idle for {}s (`automate \
+                         status` shows last_error and next_retry_secs); `automate restart` \
+                         forces a retry now; details in the session's daemon.log",
                         reason,
                         crate::automation::RETRY_INPUT_QUIET.as_secs()
                     ));
@@ -276,12 +320,32 @@ pub async fn handle(
         }
     }
 
+    // The bootstrap above can take minutes, all of it after the session was
+    // stored and none of it holding the session lock. A server that closes
+    // the connection in that window leaves the daemon tearing the session
+    // down while this handler is still on its way to reporting success.
+    if let Some(reason) = drop_probe.drop_reason() {
+        return Response::error(
+            ErrorCode::ConnectionFailed,
+            format!(
+                "Connected to {}, but the transport dropped again {}s later while the \
+                 automation agent was starting: {}. The daemon is alive; run `connect` again. \
+                 If this repeats, the server is ending the session right after logon - check \
+                 its session policy and event log.",
+                host,
+                connected_at.elapsed().as_secs(),
+                reason
+            ),
+        );
+    }
+
     Response::success(ResponseData::Connected {
         host,
         width,
         height,
         automation_ready,
         automation_error,
+        automation_deferred,
     })
 }
 

@@ -53,6 +53,14 @@ relaunches: number,
  */
 total_launches: number, 
 /**
+ * True when the current agent was adopted across a reconnect rather than
+ * launched: it outlived the transport drop and re-opened its channel, so
+ * no Win+R was typed on the remote desktop. The observable difference
+ * between a reconnect that disturbed a shared desktop and one that did
+ * not.
+ */
+adopted: boolean, 
+/**
  * Seconds since the current agent's DVC handshake completed. Distinct
  * from `agent_running`: an agent can be "running" per the PS-reported
  * fields yet the daemon-side DVC channel could have gone stale without

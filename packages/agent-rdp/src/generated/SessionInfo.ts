@@ -51,6 +51,14 @@ uptime_secs: number,
  */
 last_frame_age_ms?: number, 
 /**
+ * Keep-alive interval in seconds for the live session, `None` while
+ * disconnected or when keep-alive is off. What `last_frame_age_ms`
+ * should be read against: with keep-alive on, a live server answers each
+ * tick, so a frame age well past this interval means the transport is
+ * dead rather than the desktop idle.
+ */
+keep_alive_secs?: number, 
+/**
  * Present while disconnected after a transport drop: the RDP session
  * ended but the daemon did not. Distinguishes "reconnect the session"
  * from "the daemon is gone".

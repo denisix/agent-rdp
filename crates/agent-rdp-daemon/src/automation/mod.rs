@@ -10,13 +10,14 @@ pub mod dvc_encode;
 mod dvc_ipc;
 
 pub use bootstrap::{
-    launch_and_wait_worst_case, launch_guarded, relaunch_agent, spawn_relaunch_supervisor,
-    AutomationBootstrap, RelaunchBudget, LAUNCH_ATTEMPTS, MAX_LAUNCH_FAILURES,
-    RETRY_INPUT_QUIET,
+    adopt_only, connect_bootstrap_worst_case, expected_agent_version, expected_build_id,
+    launch_and_wait_worst_case,
+    launch_guarded, relaunch_agent, spawn_relaunch_supervisor, AutomationBootstrap,
+    RelaunchBudget, LAUNCH_ATTEMPTS, MAX_LAUNCH_FAILURES, RETRY_INPUT_QUIET, SURVIVOR_WAIT,
 };
 pub use dvc_channel::{
-    new_shared_dvc_state, AutomationDvc, DvcCommandReceiver, DvcCommandSender, DvcHandshake,
-    DvcSendCommand, SharedDvcState, CHANNEL_NAME,
+    new_shared_dvc_state, AutomationDvc, AutomationDvcListener, DvcCommandReceiver,
+    DvcCommandSender, DvcHandshake, DvcSendCommand, SharedDvcState, CHANNEL_NAME,
 };
 pub use dvc_encode::encode_dvc_data;
 pub use dvc_ipc::{DvcIndeterminate, DvcIpc};
@@ -81,6 +82,10 @@ pub struct AutomationState {
     pub total_launches: u32,
     /// The `host:port` the launches above were counted against.
     pub launch_target: Option<String>,
+    /// The current agent was adopted rather than launched: it outlived a
+    /// transport drop and re-opened its channel, so this reconnect typed
+    /// nothing on the remote desktop. Set on adoption, cleared by any launch.
+    pub adopted: bool,
 }
 
 impl AutomationState {
@@ -107,6 +112,7 @@ impl AutomationState {
             auto_relaunch_disabled: false,
             total_launches: 0,
             launch_target: None,
+            adopted: false,
         }
     }
 

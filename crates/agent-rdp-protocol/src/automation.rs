@@ -10,6 +10,12 @@ impl AutomateRequest {
     /// click or fill risks applying it twice. Used by the daemon's
     /// indeterminate-result text and by the CLI's automatic retry after a
     /// dropped IPC connection.
+    ///
+    /// `RunPoll` looks like a read and is not one: the agent advances its
+    /// stream offset when it answers, so the bytes it returned are gone. A
+    /// retry after a dropped reply therefore skips a chunk of output rather
+    /// than repeating it - silent loss, which is worse than the visible
+    /// failure of not retrying.
     pub fn is_read_only(&self) -> bool {
         matches!(
             self,
@@ -17,7 +23,6 @@ impl AutomateRequest {
                 | AutomateRequest::Get { .. }
                 | AutomateRequest::Status
                 | AutomateRequest::WaitFor { .. }
-                | AutomateRequest::RunPoll { .. }
                 | AutomateRequest::FileStat { .. }
                 | AutomateRequest::FileReadChunk { .. }
                 | AutomateRequest::QueryResult { .. }
@@ -238,6 +243,15 @@ pub enum AutomateRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         sha256: Option<String>,
+        /// Identifies the transfer this chunk belongs to.
+        ///
+        /// The agent writes chunks to a sidecar named after it and only
+        /// replaces the destination once the whole file verifies, so a failed
+        /// or overlapping transfer can no longer leave a torn file where a
+        /// good one used to be. Defaulted rather than required: an agent from
+        /// before 1.8.0 ignores it, and a daemon talking to one still works.
+        #[serde(default)]
+        transfer_id: String,
     },
 
     /// Read one chunk of a file from the remote machine.
@@ -267,6 +281,20 @@ pub enum AutomateRequest {
         /// Id of the request to look up.
         id: String,
     },
+
+    /// Ask the agent to exit.
+    ///
+    /// The agent otherwise outlives a transport drop on purpose (so a
+    /// reconnect can adopt it instead of typing Win+R on the desktop), which
+    /// means "replace the agent" needs a way to stop the old one first -
+    /// `automate restart` against a live agent, and the daemon rejecting a
+    /// second agent that opened the channel behind the one it already has.
+    ///
+    /// Internal: the daemon sends this itself in both cases above. A caller
+    /// can send it directly (nothing stops it), but doing so races the
+    /// daemon's own bookkeeping - `automate restart` is the supported way to
+    /// replace the agent.
+    Shutdown,
 }
 
 fn default_max_depth() -> u32 {
@@ -488,6 +516,13 @@ pub struct AutomationStatus {
     /// targets a different host:port.
     #[serde(default)]
     pub total_launches: u32,
+    /// True when the current agent was adopted across a reconnect rather than
+    /// launched: it outlived the transport drop and re-opened its channel, so
+    /// no Win+R was typed on the remote desktop. The observable difference
+    /// between a reconnect that disturbed a shared desktop and one that did
+    /// not.
+    #[serde(default)]
+    pub adopted: bool,
     /// Seconds since the current agent's DVC handshake completed. Distinct
     /// from `agent_running`: an agent can be "running" per the PS-reported
     /// fields yet the daemon-side DVC channel could have gone stale without
@@ -850,5 +885,47 @@ mod qa_0_7_16_field_tests {
         assert!(!json.contains("daemon_version"), "{json}");
         assert!(!json.contains("cli_version"), "{json}");
         assert!(json.contains("total_launches"), "a count of 0 is still an answer: {json}");
+    }
+}
+
+#[cfg(test)]
+mod qa_0_7_17_field_tests {
+    use super::*;
+
+    /// A poll consumes what it returns, so the CLI must not quietly re-issue
+    /// one after a dropped reply - the skipped chunk would never come back.
+    #[test]
+    fn a_poll_is_not_a_read() {
+        assert!(!AutomateRequest::RunPoll { pid: 1 }.is_read_only());
+        // The genuine reads it sits next to are unaffected.
+        assert!(AutomateRequest::Status.is_read_only());
+        assert!(AutomateRequest::FileStat { path: "C:\\x".into() }.is_read_only());
+    }
+
+    /// Stopping the agent changes the remote machine, so a lost reply must
+    /// not be retried automatically either.
+    #[test]
+    fn shutdown_is_not_a_read() {
+        assert!(!AutomateRequest::Shutdown.is_read_only());
+        // The agent dispatches on this tag, so the name is part of the wire
+        // contract, not an implementation detail.
+        let json = serde_json::to_string(&AutomateRequest::Shutdown).unwrap();
+        assert_eq!(json, r#"{"op":"shutdown"}"#);
+    }
+
+    /// An agent from before 1.8.0 never sends these, and a daemon reading an
+    /// older reply must still parse it.
+    #[test]
+    fn the_new_status_and_chunk_fields_are_optional() {
+        let status: AutomationStatus = serde_json::from_str(r#"{"agent_running":true}"#).unwrap();
+        assert!(!status.adopted, "an agent that never reported it was not adopted");
+
+        let chunk: AutomateRequest =
+            serde_json::from_str(r#"{"op":"file_write_chunk","path":"C:\\x","data_b64":""}"#)
+                .unwrap();
+        match chunk {
+            AutomateRequest::FileWriteChunk { transfer_id, .. } => assert!(transfer_id.is_empty()),
+            other => panic!("expected a write chunk, got {other:?}"),
+        }
     }
 }

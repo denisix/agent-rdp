@@ -353,6 +353,7 @@ mod codegen {
             AutomateRequest::FileReadChunk { .. } => "file_read_chunk",
             AutomateRequest::FileStat { .. } => "file_stat",
             AutomateRequest::QueryResult { .. } => "query_result",
+            AutomateRequest::Shutdown => "shutdown",
         }
         .to_string()
     }

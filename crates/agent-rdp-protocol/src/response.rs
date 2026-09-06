@@ -91,6 +91,11 @@ pub enum ResponseData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         automation_error: Option<String>,
+        /// True when `connect --defer-agent` skipped the agent launch. RDP is
+        /// up and no Win+R was typed; `automate restart` starts the agent
+        /// when the desktop is free.
+        #[serde(default)]
+        automation_deferred: bool,
     },
 
     /// Screenshot data.
@@ -338,6 +343,15 @@ pub struct SessionInfo {
     #[ts(optional, type = "number")]
     pub last_frame_age_ms: Option<u64>,
 
+    /// Keep-alive interval in seconds for the live session, `None` while
+    /// disconnected or when keep-alive is off. What `last_frame_age_ms`
+    /// should be read against: with keep-alive on, a live server answers each
+    /// tick, so a frame age well past this interval means the transport is
+    /// dead rather than the desktop idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub keep_alive_secs: Option<u64>,
+
     /// Present while disconnected after a transport drop: the RDP session
     /// ended but the daemon did not. Distinguishes "reconnect the session"
     /// from "the daemon is gone".
@@ -530,6 +544,13 @@ pub enum ErrorCode {
     #[error("file changed during transfer")]
     FileChangedDuringTransfer,
 
+    /// `file push`: the file the agent assembled does not match the bytes
+    /// that were sent. The destination is left untouched - the transfer is
+    /// staged in a sidecar and only swapped in once it verifies - so this
+    /// means the push did not happen, not that the remote file is corrupt.
+    #[error("transfer verification failed")]
+    TransferVerificationFailed,
+
     /// Clipboard operation failed.
     #[error("clipboard error")]
     ClipboardError,
@@ -574,6 +595,7 @@ mod tests {
         let resp = Response::success(ResponseData::Connected {
             automation_ready: None,
             automation_error: None,
+            automation_deferred: false,
             host: "192.168.1.100".to_string(),
             width: 1920,
             height: 1080,

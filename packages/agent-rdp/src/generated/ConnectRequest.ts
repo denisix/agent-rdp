@@ -75,4 +75,13 @@ serve_viewer: boolean,
  * keepalive alone did not prevent it. Each tick sends a Refresh Rect PDU,
  * which is real wire traffic with no input, focus or lock-key semantics.
  */
-keep_alive_secs: number, };
+keep_alive_secs: number, 
+/**
+ * Connect without launching the automation agent (default: false).
+ *
+ * The drive and the DVC channel are still set up, and an agent that
+ * survived an earlier drop is still adopted - only the Win+R launch is
+ * skipped. For a shared desktop where the caller wants to choose the
+ * moment the Run dialog appears; `automate restart` launches it.
+ */
+defer_agent: boolean, };

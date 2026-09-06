@@ -46,7 +46,13 @@ automation_ready?: boolean,
  * timed out" - both used to collapse into the same generic
  * "automation not enabled" message on the next `automate` call.
  */
-automation_error?: string, } | { "type": "screenshot", 
+automation_error?: string, 
+/**
+ * True when `connect --defer-agent` skipped the agent launch. RDP is
+ * up and no Win+R was typed; `automate restart` starts the agent
+ * when the desktop is free.
+ */
+automation_deferred: boolean, } | { "type": "screenshot", 
 /**
  * Image width.
  */

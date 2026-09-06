@@ -8,10 +8,46 @@ use agent_rdp_protocol::{
     WindowInfo,
 };
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::automation::SharedAutomationState;
 use crate::rdp_session::RdpSession;
+
+/// Ask a live agent to exit and wait briefly for its channel to close.
+///
+/// Best-effort by design: an agent that will not leave is handled by the
+/// channel layer, which keeps the first agent and tells the newcomer to exit.
+/// The point here is that the *newcomer* should be the survivor of that rule.
+async fn stop_running_agent(automation_state: &SharedAutomationState) {
+    let (ipc, dvc_state) = {
+        let state = automation_state.lock().await;
+        (state.dvc_ipc.clone(), state.dvc_state.clone())
+    };
+    let (Some(ipc), Some(dvc_state)) = (ipc, dvc_state) else {
+        return;
+    };
+    if !ipc.is_ready() {
+        return;
+    }
+
+    info!("Asking the running automation agent to exit before relaunching");
+    let _ = ipc
+        .send_request_with_timeout(
+            &AutomateRequest::Shutdown,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if dvc_state.lock().handshake.is_none() {
+            debug!("The previous automation agent exited");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    warn!("The previous automation agent did not exit within 5s; relaunching anyway");
+}
 
 /// Relaunch the UI Automation agent without a full RDP reconnect.
 ///
@@ -58,6 +94,13 @@ pub async fn handle_restart(
         state.next_retry_at = None;
     }
 
+    // Stop the agent that is still there before launching its replacement.
+    // The agent now outlives a transport drop on purpose, so "restart" has a
+    // live process to displace: without this the new agent would open a
+    // second channel, be rejected in favour of the old one, and `restart`
+    // would report success having changed nothing.
+    stop_running_agent(automation_state).await;
+
     // Shared with the relaunch supervisor; serialized by `relaunch_in_flight`
     // so a manual restart and an automatic one never drive the Run dialog
     // at the same time.
@@ -79,6 +122,7 @@ pub async fn handle_restart(
                     last_error: None,
                     next_retry_secs: None,
                     total_launches: 0,
+                    adopted: false,
                     daemon_version: None,
                     cli_version: None,
                 };
@@ -134,6 +178,7 @@ fn offline_status(state: &crate::automation::AutomationState) -> Response {
         last_error,
         next_retry_secs: state.next_retry_secs(std::time::Instant::now()),
         total_launches: state.total_launches,
+        adopted: state.adopted,
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         cli_version: None,
     }))
@@ -146,6 +191,7 @@ fn fill_daemon_fields(status: &mut AutomationStatus, state: &crate::automation::
     status.last_error = state.last_error.clone();
     status.next_retry_secs = state.next_retry_secs(std::time::Instant::now());
     status.total_launches = state.total_launches;
+    status.adopted = state.adopted;
     status.daemon_version = Some(env!("CARGO_PKG_VERSION").to_string());
 }
 
@@ -177,7 +223,7 @@ pub async fn handle(
     }
 
     // Check if automation is enabled and agent is ready
-    let state = automation_state.lock().await;
+    let mut state = automation_state.lock().await;
     if !state.enabled {
         return Response::error(
             ErrorCode::AutomationNotEnabled,
@@ -188,6 +234,21 @@ pub async fn handle(
     // `status` is the health check and must answer while the agent is
     // down; everything else needs the agent.
     let agent_reachable = state.dvc_ipc.as_ref().map(|ipc| ipc.is_ready()).unwrap_or(false);
+
+    // A channel can become ready with nobody having called `record_ready`:
+    // `connect --defer-agent` waits only `SURVIVOR_WAIT` for a survivor, and
+    // one reattaching after that window is fully usable but was never
+    // recorded. Every other path (a launch, `adopt_only`) awaits its own
+    // handshake and records it itself, so reaching here with the channel
+    // ready and nothing recorded can only be this case.
+    if agent_reachable && !state.agent_ready {
+        if let Some(ipc) = state.dvc_ipc.clone() {
+            state.agent_ready = true;
+            state.agent_pid = ipc.agent_pid();
+            state.last_error = None;
+            state.next_retry_at = None;
+        }
+    }
     if matches!(request, AutomateRequest::Status) && !agent_reachable {
         return offline_status(&state);
     }
@@ -361,9 +422,22 @@ fn request_timeout(request: &AutomateRequest, default: std::time::Duration) -> s
 
     match command_budget_ms {
         Some(ms) => std::time::Duration::from_millis(ms).saturating_add(default),
+        // A launch that only has to return a pid still pays for a whole
+        // `powershell.exe` start, and on a host at 100% CPU that has been
+        // measured past 20s - well past the 10s default. Blowing the deadline
+        // there is worse than waiting: the reply is lost, and the recovery
+        // path then spends three more round trips asking the agent what it
+        // did with a process that started perfectly well.
+        None if matches!(request, AutomateRequest::Run { wait: false, .. }) => {
+            SPAWN_TIMEOUT.max(default)
+        }
         None => default,
     }
 }
+
+/// Transport deadline for a `run` that only starts a process. Covers a
+/// PowerShell start on a saturated host.
+const SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Append a "re-snapshot" hint when the agent's error text suggests the
 /// selector's ref is stale after a UI change - the ref is snapshot-scoped by
@@ -475,11 +549,16 @@ mod is_read_only_tests {
     }
 
     #[test]
-    fn fire_and_forget_run_keeps_the_default() {
+    fn a_fire_and_forget_run_still_gets_time_to_spawn() {
         let default = std::time::Duration::from_secs(10);
-        // Without --wait the agent replies immediately, so the long
-        // process timeout is irrelevant to the transport deadline.
-        assert_eq!(request_timeout(&run_request(false, 240_000), default), default);
+        // The reply comes as soon as the process starts, so the command's own
+        // timeout is irrelevant here - but starting it means a whole
+        // PowerShell start, measured past 20s on a saturated host. At the 10s
+        // default the reply was lost and the result had to be recovered.
+        assert_eq!(request_timeout(&run_request(false, 240_000), default), SPAWN_TIMEOUT);
+        // Never shortens a caller who already asked for longer.
+        let generous = std::time::Duration::from_secs(90);
+        assert_eq!(request_timeout(&run_request(false, 240_000), generous), generous);
     }
 
     #[test]
@@ -558,6 +637,9 @@ fn convert_response(
                 }
             }
         }
+
+        // The agent answers and exits; there is no result to parse.
+        AutomateRequest::Shutdown => Response::ok(),
 
         AutomateRequest::Status => {
             match parse_status_response(data) {
@@ -1016,6 +1098,7 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
         last_error: None,
         next_retry_secs: None,
         total_launches: 0,
+        adopted: false,
         daemon_version: None,
         cli_version: None,
     })

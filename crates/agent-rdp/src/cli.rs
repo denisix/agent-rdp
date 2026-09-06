@@ -180,6 +180,15 @@ pub struct ConnectArgs {
     /// cheaper than recovering it.
     #[arg(long, default_value = "45", value_name = "SECONDS")]
     pub keep_alive_secs: u64,
+
+    /// Connect without launching the automation agent.
+    ///
+    /// An agent that survived an earlier drop is still adopted (that costs
+    /// the remote desktop nothing); only the Win+R launch is withheld, so
+    /// nothing appears on a shared desktop until you ask for it with
+    /// `automate restart`.
+    #[arg(long)]
+    pub defer_agent: bool,
 }
 
 /// Screenshot command arguments.
@@ -612,11 +621,11 @@ pub enum AutomateAction {
         #[arg(long)]
         follow: bool,
 
-        /// With --follow: how long to keep polling, in milliseconds
-        /// (default: 60000). On expiry the process keeps running and can be
+        /// How long to keep polling, in milliseconds (default: 60000).
+        /// Implies --follow. On expiry the process keeps running and can be
         /// polled again. Distinct from the global --timeout, which bounds
         /// each individual poll.
-        #[arg(long = "follow-timeout", value_name = "MS", requires = "follow")]
+        #[arg(long = "follow-timeout", value_name = "MS")]
         follow_timeout: Option<u64>,
     },
 

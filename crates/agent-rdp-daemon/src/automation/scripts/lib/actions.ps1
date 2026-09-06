@@ -636,8 +636,10 @@ function Start-RunChild {
     # console's OEM codepage (cp866 on a Russian-locale host), which is where
     # Cyrillic output came back as mojibake regardless of what the child sent.
     if ($Wait) {
-        $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
-        $startInfo.StandardErrorEncoding = [Text.Encoding]::UTF8
+        # `UTF8Encoding($false)`, not `[Text.Encoding]::UTF8`: the latter is
+        # the BOM-emitting instance, and it is what the child writes with.
+        $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+        $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     }
 
     $process = [System.Diagnostics.Process]::Start($startInfo)
@@ -698,13 +700,21 @@ function Get-UnixNow {
 # that killed the child before the user's script ran. No BOM: the old
 # `[Text.Encoding]::UTF8` wrote one into the first streamed chunk.
 #
+# Skipped when the console is already UTF-8, which it is once the agent sets
+# its own (children share it). Assigning to `Console.OutputEncoding` tears
+# down and rebuilds the host's stdout writer, and this line runs immediately
+# before the user's first statement - the narrow suspect for a report of a
+# waited run losing its first output line. Not a proven cause: nothing in the
+# capture path drops data, and the same symptom is what `Get-FileHash` on a
+# wildcard that matches nothing produces (no output, no error, exit 0).
+#
 # `$ErrorActionPreference='Stop'` is what makes the exit code mean something:
 # without it a cmdlet that fails non-terminatingly (Add-Content to a locked
 # file, Set-Content to a bad path) writes to the error stream and the process
 # still exits 0. A script that wants continue-on-error semantics sets the
 # preference back on its first line.
 $script:ChildPrelude = @'
-try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
+if ([Console]::OutputEncoding.CodePage -ne 65001) { try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {} }
 $ProgressPreference = 'SilentlyContinue'
 $ErrorActionPreference = 'Stop'
 '@
@@ -916,7 +926,15 @@ function Start-StreamedRun {
         RedirectStandardError  = $stderrPath
         PassThru               = $true
     }
-    if ($Hidden) { $startArgs.WindowStyle = "Hidden" }
+    # Without one of these, `Start-Process` creates a NEW console - a visible
+    # empty window on the remote desktop for every streamed run, which also
+    # takes foreground from whatever was in front. The waited path never had
+    # this because it uses ProcessStartInfo directly.
+    if ($Hidden) {
+        $startArgs.WindowStyle = "Hidden"
+    } else {
+        $startArgs.NoNewWindow = $true
+    }
 
     $process = Start-Process @startArgs
     $script:LastRunLaunched = $true
@@ -1145,16 +1163,37 @@ function Invoke-FileWriteChunk {
 
     $data = [Convert]::FromBase64String($Params.data_b64)
 
-    # first=true truncates, so a retried or restarted transfer cannot append
-    # onto a partial file left by an earlier attempt.
+    # Chunks land in a sidecar and the destination is replaced only once the
+    # whole file verifies. Writing in place meant the first chunk truncated
+    # the existing file, so a transfer that failed at chunk 2 - or two
+    # transfers overlapping on one path - destroyed a good file and reported
+    # a hash of whatever was left.
+    $tid = if ($Params.transfer_id) { $Params.transfer_id } else { "legacy" }
+    $part = "$path.agent-rdp-$tid.part"
+
     if ($Params.first) {
+        if (Test-Path -LiteralPath $path -PathType Container) {
+            throw "Cannot write '$path': it is a directory"
+        }
         $dir = Split-Path -Parent $path
         if ($dir -and -not (Test-Path -LiteralPath $dir)) {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
-        [System.IO.File]::WriteAllBytes($path, $data)
+        # Sidecars from transfers that died before finishing. Nothing else
+        # cleans them up, and they are named after a transfer that is over -
+        # except one still being written by an overlapping push to the same
+        # destination, which this transfer did not start and must not delete
+        # out from under it. An age cutoff is the cheap way to tell the two
+        # apart without tracking every transfer id in flight.
+        $leaf = Split-Path -Leaf $path
+        $searchDir = if ($dir) { $dir } else { "." }
+        $staleBefore = (Get-Date).AddMinutes(-10)
+        Get-ChildItem -LiteralPath $searchDir -Filter "$leaf.agent-rdp-*.part" -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $staleBefore } |
+            ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {} }
+        [System.IO.File]::WriteAllBytes($part, $data)
     } else {
-        $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
+        $stream = [System.IO.File]::Open($part, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
         try {
             $stream.Write($data, 0, $data.Length)
         } finally {
@@ -1164,19 +1203,44 @@ function Invoke-FileWriteChunk {
 
     $result = @{
         bytes_written = $data.Length
-        total_size = (Get-Item -LiteralPath $path).Length
     }
 
-    # Verify on the final chunk: a transfer that silently lost or duplicated
-    # a chunk is worse than one that fails, because the caller acts on a file
-    # it believes is correct.
-    if ($Params.last) {
-        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower()
-        $result.sha256 = $hash
-        if ($Params.sha256 -and $Params.sha256.ToLower() -ne $hash) {
+    if (-not $Params.last) {
+        $result.total_size = (Get-Item -LiteralPath $part).Length
+        return $result
+    }
+
+    # Final chunk: verify the assembled file, then put it in place. A hash is
+    # required - skipping the check when one is absent is how a transfer could
+    # report success without anything having been verified.
+    try {
+        if (-not $Params.sha256) {
+            throw "Transfer of '$path' carried no expected hash, so it cannot be verified"
+        }
+        $hash = (Get-FileHash -LiteralPath $part -Algorithm SHA256).Hash.ToLower()
+        if ($Params.sha256.ToLower() -ne $hash) {
             throw "Transfer verification failed for '$path': expected $($Params.sha256), got $hash"
         }
+
+        # Replace rather than Move-Item: Move-Item is a delete followed by a
+        # move, and onto an existing directory it would move the sidecar
+        # inside it instead of failing.
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            [System.IO.File]::Replace($part, $path, $null)
+        } else {
+            [System.IO.File]::Move($part, $path)
+        }
+    } catch {
+        try { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue } catch {}
+        throw
     }
+
+    # Hash what is actually at the destination now, not what the sidecar was:
+    # this is the number the daemon compares against the bytes it sent.
+    $item = Get-Item -LiteralPath $path
+    $result.sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower()
+    $result.total_size = $item.Length
+    $result.path = $item.FullName
 
     return $result
 }

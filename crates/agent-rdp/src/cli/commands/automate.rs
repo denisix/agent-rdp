@@ -50,10 +50,14 @@ pub async fn run(
 
     // `--follow` is a CLI-side loop over ordinary polls; remember the budget
     // before the action is consumed by the mapping.
+    // `--follow-timeout` implies `--follow`: asking how long to follow for
+    // and then being told the flag is missing is a pure papercut.
     let follow_budget = match &args.action {
-        AutomateAction::RunPoll { follow: true, follow_timeout, .. } => Some(
-            std::time::Duration::from_millis(follow_timeout.unwrap_or(DEFAULT_FOLLOW_TIMEOUT_MS)),
-        ),
+        AutomateAction::RunPoll { follow, follow_timeout, .. } if *follow || follow_timeout.is_some() => {
+            Some(std::time::Duration::from_millis(
+                follow_timeout.unwrap_or(DEFAULT_FOLLOW_TIMEOUT_MS),
+            ))
+        }
         _ => None,
     };
     if let AutomateAction::Run { wait: true, stream: true, .. } = &args.action {
@@ -223,7 +227,22 @@ async fn follow_poll(
         }
 
         tokio::time::sleep(FOLLOW_INTERVAL).await;
-        current = manager.send_with_retry(client, request, timeout_ms).await?;
+        // A poll consumes the output it returns, so a dropped reply takes
+        // that output with it - the daemon-side retry is deliberately off for
+        // this request. Stop and say so rather than silently resuming from
+        // after the missing chunk.
+        current = match manager.send_with_retry(client, request, timeout_ms).await {
+            Ok(response) => response,
+            Err(e) => {
+                eprintln!(
+                    "Stopped following process {}: the daemon connection dropped mid-poll ({}). \
+                     Output produced since the previous poll may have been lost; `automate \
+                     run-poll {}` resumes from what the agent has now.",
+                    result.pid, e, result.pid
+                );
+                return Err(e);
+            }
+        };
     }
 }
 

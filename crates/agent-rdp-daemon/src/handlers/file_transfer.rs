@@ -46,6 +46,54 @@ const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Deadline for the final chunk, which also hashes the whole file remotely.
 const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Reject a transfer whose paths cannot mean what the caller thinks.
+///
+/// Both sides resolve relative paths against a working directory that is not
+/// the caller's: the local one against the daemon's (inherited from whichever
+/// shell first started it, possibly days ago), the remote one against the
+/// agent's. Neither fails loudly - a stale same-named file in the daemon's
+/// directory pushes the wrong bytes and verifies them happily, and a relative
+/// remote path writes somewhere nobody looks while `file stat` on the
+/// intended path keeps showing the old file. The CLI and SDK make paths
+/// absolute before sending; this is the backstop for anything else.
+fn check_paths(local: &str, remote: &str) -> Result<(), Response> {
+    if !std::path::Path::new(local).is_absolute() {
+        return Err(Response::error(
+            ErrorCode::InvalidRequest,
+            format!(
+                "Local path '{}' must be absolute: it is resolved by the daemon, whose working \
+                 directory is not the one you ran this from.",
+                local
+            ),
+        ));
+    }
+    if !is_absolute_windows_path(remote) {
+        return Err(Response::error(
+            ErrorCode::InvalidRequest,
+            format!(
+                "Remote path '{}' must be absolute (like C:\\\\path\\\\file.txt or \
+                 \\\\\\\\server\\\\share\\\\file.txt): a relative path is resolved against the \
+                 automation agent's working directory, not any directory you chose.",
+                remote
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A drive-letter path (`C:\x`, `C:/x`) or a UNC path (`\\host\share`).
+fn is_absolute_windows_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    path.starts_with("\\\\") || path.starts_with("//")
+}
+
 /// How many times a pull re-reads a file that changed underneath it.
 const PULL_ATTEMPTS: u32 = 3;
 
@@ -299,6 +347,10 @@ pub async fn handle_push(
         Err(response) => return response,
     };
 
+    if let Err(response) = check_paths(&params.local_path, &params.remote_path) {
+        return response;
+    }
+
     let data = match tokio::fs::read(&params.local_path).await {
         Ok(data) => data,
         Err(e) => {
@@ -342,6 +394,11 @@ pub async fn handle_push(
         total_chunks
     );
 
+    // Names the sidecar the agent assembles into, so a failed or overlapping
+    // transfer cannot leave a torn file where a good one used to be.
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let mut final_reply = None;
+
     for (index, chunk) in chunks.iter().enumerate() {
         let last = index + 1 == total_chunks;
         let request = AutomateRequest::FileWriteChunk {
@@ -353,35 +410,61 @@ pub async fn handle_push(
             // assembled file and fails loudly rather than leaving a
             // silently-corrupt file behind.
             sha256: last.then(|| sha256.clone()),
+            transfer_id: transfer_id.clone(),
         };
 
         let timeout = if last { VERIFY_TIMEOUT } else { CHUNK_TIMEOUT };
-        if let Err(e) = ipc.send_request_with_timeout(&request, timeout).await {
+        match ipc.send_request_with_timeout(&request, timeout).await {
+            Ok(reply) => {
+                if last {
+                    final_reply = Some(reply);
+                }
+            }
+            Err(e) => {
             // A push is safe to repeat: chunk 0 carries `first: true`, which
             // truncates the remote file, so re-running starts from scratch
             // rather than appending. Say so instead of the generic
             // "retrying may apply it twice" the DVC layer attaches to every
             // indeterminate outcome - for this command that warning is wrong
             // and sent callers off to build gzip+clipboard workarounds.
-            return Response::error(
-                ErrorCode::AutomationError,
-                format!(
-                    "Transfer failed on chunk {}/{} of '{}': {}. The remote file is \
-                     incomplete; re-run `file push` - it restarts from the beginning \
-                     and overwrites, so a retry cannot apply the data twice.",
-                    index + 1,
-                    total_chunks,
-                    params.remote_path,
-                    e
-                ),
-            );
+                return Response::error(
+                    ErrorCode::AutomationError,
+                    format!(
+                        "Transfer failed on chunk {}/{} of '{}': {}. The destination was not \
+                         touched - the transfer is assembled beside it and only swapped in \
+                         once it verifies - so the previous file is still there. Re-run \
+                         `file push`.",
+                        index + 1,
+                        total_chunks,
+                        params.remote_path,
+                        e
+                    ),
+                );
+            }
         }
     }
 
-    info!("Pushed {} bytes to {}", data.len(), params.remote_path);
+    // What the agent says it ended up with, not what we sent. The two were
+    // never compared: the daemon reported the local hash as if the remote had
+    // confirmed it, so "SHA-verified on both ends" rested entirely on the
+    // agent choosing to fail - and it skips its own check whenever the final
+    // chunk arrives without a hash.
+    if let Err(response) = verify_push(final_reply.as_ref(), &sha256, data.len() as u64, &params.remote_path) {
+        return response;
+    }
+    // The agent resolves the path it actually wrote; report that rather than
+    // the string we sent.
+    let written_path = final_reply
+        .as_ref()
+        .and_then(|d| d.get("path"))
+        .and_then(|p| p.as_str())
+        .unwrap_or(&params.remote_path)
+        .to_string();
+
+    info!("Pushed {} bytes to {}", data.len(), written_path);
 
     Response::success(ResponseData::FileTransferResult(FileTransferResult {
-        path: params.remote_path,
+        path: written_path,
         bytes: data.len() as u64,
         sha256,
         chunks: total_chunks as u64,
@@ -389,6 +472,69 @@ pub async fn handle_push(
         modified_unix: None,
         age_secs: None,
     }))
+}
+
+/// Check the agent's report of the finished file against what was sent.
+///
+/// A current agent verifies before it replaces the destination, so a mismatch
+/// here should be unreachable against one - it would have refused instead of
+/// reporting success. This is the backstop for the case that check exists to
+/// close: a reply with no hash at all, which a current agent never sends and
+/// an older one might (`transfer_id` is `#[serde(default)]`, so a pre-1.8.0
+/// agent is still accepted for the earlier chunks; it wrote in place, so this
+/// is where the daemon's only remaining leverage over its outcome is).
+///
+/// The daemon has no way to see the remote disk directly, so these messages
+/// report the mismatch itself and let the caller `file stat` the path -
+/// they do not claim to know whether the destination was touched.
+fn verify_push(
+    reply: Option<&serde_json::Value>,
+    expected_sha: &str,
+    expected_bytes: u64,
+    remote_path: &str,
+) -> Result<(), Response> {
+    let remote_sha = reply
+        .and_then(|d| d.get("sha256"))
+        .and_then(|h| h.as_str())
+        .map(|h| h.to_ascii_lowercase());
+
+    let Some(remote_sha) = remote_sha else {
+        return Err(Response::error(
+            ErrorCode::TransferVerificationFailed,
+            format!(
+                "The agent did not report a hash for '{}', so the transfer could not be \
+                 confirmed. Check with `file stat` before trusting the destination.",
+                remote_path
+            ),
+        ));
+    };
+
+    if remote_sha != expected_sha.to_ascii_lowercase() {
+        return Err(Response::error(
+            ErrorCode::TransferVerificationFailed,
+            format!(
+                "'{}' hashed {} on the remote machine but {} was sent. A current agent refuses \
+                 to replace the destination on a mismatch like this, so seeing it at all means \
+                 something unexpected happened - check with `file stat`.",
+                remote_path, remote_sha, expected_sha
+            ),
+        ));
+    }
+
+    if let Some(size) = reply.and_then(|d| d.get("total_size")).and_then(|s| s.as_u64()) {
+        if size != expected_bytes {
+            return Err(Response::error(
+                ErrorCode::TransferVerificationFailed,
+                format!(
+                    "'{}' is {} bytes on the remote machine but {} were sent, despite a \
+                     matching hash - check with `file stat`.",
+                    remote_path, size, expected_bytes
+                ),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Pull a file from the remote machine.
@@ -401,6 +547,13 @@ pub async fn handle_pull(
         Ok(ipc) => ipc,
         Err(response) => return response,
     };
+
+    // Same trap as push, mirrored: the local path is where the daemon writes,
+    // so a relative one lands in the daemon's directory rather than the
+    // caller's.
+    if let Err(response) = check_paths(&params.local_path, &params.remote_path) {
+        return response;
+    }
 
     // A file its producer rewrites (the common "poll a status file" case)
     // can change between the stat that hashes it and the reads that fetch
@@ -705,5 +858,101 @@ mod pull_retry_tests {
             .expect("pull_once exists");
         assert!(attempt_fn.contains("FileStat"), "each attempt re-stats");
         assert!(attempt_fn.contains("max_age_secs"), "freshness lives inside the attempt");
+    }
+}
+
+#[cfg(test)]
+mod push_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_local_path_is_refused() {
+        // It would be read from the daemon's working directory, which is
+        // whatever shell started the daemon - possibly days ago. A stale
+        // same-named file there transfers and verifies perfectly.
+        let err = check_paths("report.json", "C:\\out\\report.json").unwrap_err();
+        assert_eq!(err.error.unwrap().code, ErrorCode::InvalidRequest);
+        // The daemon runs on any of Linux/macOS/Windows, and "absolute" means
+        // whatever `Path::is_absolute` says on that host - a Unix path is not
+        // absolute by Windows's rules, so this has to use a path this test's
+        // own platform actually treats as absolute.
+        let absolute = std::env::temp_dir().join("report.json");
+        assert!(absolute.is_absolute());
+        assert!(check_paths(&absolute.to_string_lossy(), "C:\\out\\report.json").is_ok());
+    }
+
+    #[test]
+    fn a_relative_remote_path_is_refused() {
+        let err = check_paths("/tmp/x", "out\\report.json").unwrap_err();
+        let info = err.error.unwrap();
+        assert_eq!(info.code, ErrorCode::InvalidRequest);
+        assert!(info.message.contains("C:"), "the message shows what a good path looks like");
+    }
+
+    #[test]
+    fn absolute_windows_paths_are_recognised() {
+        for good in ["C:\\dir\\f.txt", "c:/dir/f.txt", "\\\\srv\\share\\f.txt", "//srv/share/f"] {
+            assert!(is_absolute_windows_path(good), "{good} is absolute");
+        }
+        for bad in ["dir\\f.txt", "./f.txt", "/usr/local/f", "C:", "C:f.txt", ""] {
+            assert!(!is_absolute_windows_path(bad), "{bad} is not an absolute Windows path");
+        }
+    }
+
+    /// The daemon used to report the hash of the bytes it *sent* as though
+    /// the remote had confirmed it. The agent's own check was the only
+    /// verification, and it skipped itself whenever the final chunk arrived
+    /// without a hash.
+    #[test]
+    fn a_push_is_checked_against_what_the_agent_reports() {
+        let sha = "abc123";
+        let good = serde_json::json!({ "sha256": "ABC123", "total_size": 4, "path": "C:\\f" });
+        assert!(
+            verify_push(Some(&good), sha, 4, "C:\\f").is_ok(),
+            "case differences are not a mismatch"
+        );
+
+        let wrong_hash = serde_json::json!({ "sha256": "deadbeef", "total_size": 4 });
+        let err = verify_push(Some(&wrong_hash), sha, 4, "C:\\f").unwrap_err();
+        assert_eq!(err.error.unwrap().code, ErrorCode::TransferVerificationFailed);
+
+        let wrong_size = serde_json::json!({ "sha256": sha, "total_size": 9 });
+        assert!(verify_push(Some(&wrong_size), sha, 4, "C:\\f").is_err());
+    }
+
+    #[test]
+    fn an_unverifiable_push_is_a_failure_not_a_success() {
+        // No hash at all, and no reply at all: both used to pass silently.
+        let no_hash = serde_json::json!({ "total_size": 4 });
+        assert!(verify_push(Some(&no_hash), "abc", 4, "C:\\f").is_err());
+        assert!(verify_push(None, "abc", 4, "C:\\f").is_err());
+    }
+
+    #[test]
+    fn an_older_agent_without_a_size_still_verifies_by_hash() {
+        // Agent 1.7.0 reports `sha256` but no `total_size` for the final
+        // chunk; the hash alone is still a real check.
+        let old = serde_json::json!({ "sha256": "abc" });
+        assert!(verify_push(Some(&old), "abc", 4, "C:\\f").is_ok());
+    }
+
+    /// The remote write is staged and swapped in, so a transfer that fails
+    /// part-way leaves the previous file intact.
+    #[test]
+    fn the_remote_write_is_staged_before_it_replaces_anything() {
+        let script = include_str!("../automation/scripts/lib/actions.ps1");
+        assert!(script.contains(".agent-rdp-$tid.part"));
+        assert!(
+            script.contains("[System.IO.File]::Replace($part, $path, $null)"),
+            "Move-Item is delete-then-move, and moves into a directory rather than failing"
+        );
+        assert!(
+            script.contains("Cannot write '$path': it is a directory"),
+            "a directory destination must fail, not swallow the file"
+        );
+        assert!(
+            script.contains("carried no expected hash"),
+            "a missing hash is a failure, not a skipped check"
+        );
     }
 }

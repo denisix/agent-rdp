@@ -23,6 +23,7 @@
  */
 
 import * as fs from 'node:fs';
+import { resolve } from 'node:path';
 import { IpcClient } from './client.js';
 import { DaemonManager } from './daemon.js';
 import { AutomationController } from './automation.js';
@@ -227,22 +228,29 @@ export class DriveController {
 export class FileController {
   constructor(private rdp: RdpSession) {}
 
-  /** Copy a local file to the remote machine. */
+  /**
+   * Copy a local file to the remote machine.
+   *
+   * `remotePath` must be absolute (`C:\\dir\\file.txt`): the daemon rejects a
+   * relative one, which the agent would otherwise resolve against its own
+   * working directory. `localPath` is resolved against this process's
+   * directory before being sent, since the daemon's is a different one.
+   */
   async push(localPath: string, remotePath: string): Promise<FileTransferResult> {
     const response = await this.rdp._send({
       type: 'file_push',
-      local_path: localPath,
+      local_path: resolve(localPath),
       remote_path: remotePath,
     });
     return response.data as unknown as FileTransferResult;
   }
 
-  /** Copy a file from the remote machine. */
+  /** Copy a file from the remote machine. See `push` on path handling. */
   async pull(remotePath: string, localPath: string): Promise<FileTransferResult> {
     const response = await this.rdp._send({
       type: 'file_pull',
       remote_path: remotePath,
-      local_path: localPath,
+      local_path: resolve(localPath),
     });
     return response.data as unknown as FileTransferResult;
   }
@@ -308,6 +316,7 @@ export class RdpSession {
    * @param options.drives Drives to map
    * @param options.enableWinAutomation Enable Windows UI Automation
    * @param options.keepAliveSecs Seconds between keep-alive PDUs (default: 45, 0 disables)
+   * @param options.deferAgent Connect without launching the automation agent (default: false)
    */
   async connect(options: ConnectOptions): Promise<ConnectResult> {
     // Ensure daemon is running and connect
@@ -331,6 +340,7 @@ export class RdpSession {
       // Serve the HTML viewer whenever streaming is on, matching the CLI.
       serve_viewer: this.streamPort > 0,
       keep_alive_secs: options.keepAliveSecs ?? 45,
+      defer_agent: options.deferAgent ?? false,
     };
 
     const response = await this._send(request);

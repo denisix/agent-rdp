@@ -91,6 +91,14 @@ export interface ConnectOptions {
    * agent by typing Win+R on the remote desktop.
    */
   keepAliveSecs?: number;
+  /**
+   * Connect without launching the automation agent (default: false).
+   *
+   * An agent that survived an earlier drop is still adopted, which costs the
+   * remote desktop nothing; only the Win+R launch is withheld, so nothing
+   * appears on a shared desktop until `automation.restart()` asks for it.
+   */
+  deferAgent?: boolean;
 }
 
 /** Result of a successful connection. */

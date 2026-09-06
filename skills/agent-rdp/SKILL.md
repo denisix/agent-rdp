@@ -6,7 +6,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.16. Check with `agent-rdp session info` (shows
+Tested against agent-rdp 0.7.17. Check with `agent-rdp session info` (shows
 both CLI and daemon versions, also in `--json` as `cli_version` /
 `daemon_version`) — a `daemon_version_mismatch` error means an older daemon
 survived an upgrade; run `connect` again to replace it.
@@ -150,6 +150,14 @@ load is normal), `consecutive_failures` (non-zero = degraded), `relaunches`
 `frame_age_ms`; a frame 30-60s old with a live channel is the server being
 slow to paint, not a dead session.
 
+**`file push`/`pull` take absolute paths.** Both are executed by the daemon and
+the remote agent, neither of which shares your working directory. The CLI and
+SDK make the local path absolute for you; a relative *remote* path is refused
+rather than written somewhere nobody looks. A push is staged beside the
+destination and swapped in only after its hash is checked on both ends, so a
+failed transfer leaves the previous file intact and `transfer_verification_failed`
+means nothing was replaced.
+
 **Pulling a file while something rewrites it.** `file pull` hashes the remote
 file and then reads it — two separate remote operations, so a file being
 replaced every few seconds can change in between. The pull now retries that
@@ -253,19 +261,28 @@ the daemon is from a different agent-rdp version than the CLI (it outlived an
 upgrade): run `connect` again, which replaces it — every other command refuses
 rather than silently driving old code.
 
-**Reconnecting is not free for the remote desktop.** With automation enabled,
-`connect` relaunches the Windows agent by typing Win+R and pasting into the Run
-dialog — a real foreground change on a shared desktop. If someone else's
-automation is driving that session, it can lose focus mid-action at the moment
-you reconnect. This is unavoidable once the previous agent is gone: a dropped
-transport invalidates its DVC channel, and the agent exits. So the fix is not
-to reconnect less carefully — it is to not need the reconnect. Idle sessions
-are now kept alive automatically (`connect --keep-alive-secs`, default 45s, 0
-disables); before that, an idle session died to a NAT timeout in as little as
-~5 minutes and every one of those cost a Win+R. `automate status` reports
-`total_launches` — every agent launch against this host, `connect`'s bootstrap
-included — next to `relaunches`, which only counts self-heal restarts since the
-last connect and resets on each one.
+**Reconnecting usually leaves the remote desktop alone now.** The Windows agent
+outlives a transport drop: it keeps re-opening its channel for about 10 minutes,
+so a `connect` within that window adopts the running agent and types nothing.
+`automate status` shows `adopted: yes` when that happened, and `total_launches`
+counts the launches that did type Win+R (every agent launch against this host,
+`connect`'s bootstrap included) next to `relaunches`, which only counts
+self-heal restarts since the last connect. Launching still costs a real
+foreground change — Win+R, paste, Enter into the Run dialog — so if someone
+else's automation shares that desktop it will notice. Two ways to avoid it:
+reconnect promptly (a fast reconnect finds the agent still there), and keep
+sessions alive so the drop does not happen (`connect --keep-alive-secs`,
+default 45s, 0 disables). `connect --defer-agent` skips the launch entirely: it
+still adopts a surviving agent, and otherwise leaves the agent down until you
+run `automate restart`.
+
+**A dead transport is noticed in about a minute.** The socket is configured to
+give up on unacknowledged data after 30s, so a black-holed path surfaces within
+roughly one keep-alive interval plus that — not the 4-5 minutes an OS
+retransmission timeout takes. Until it surfaces, `screenshot` keeps returning
+the last frame it has; `session info` reports the frame age against the
+keep-alive interval, and a frame much older than the interval on a live
+session usually points at the transport rather than an idle desktop.
 
 **Never use `connect` as a health check or a retry reflex.** `connect` is a
 session action: it tears down and rebuilds the RDP session (and, before

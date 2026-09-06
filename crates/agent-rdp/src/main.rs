@@ -285,17 +285,22 @@ mod watchdog_tests {
     /// on it, or the shortest one silently decides the real limit.
     #[test]
     fn connect_and_restart_budgets_cover_the_bootstrap_worst_case() {
-        let worst_ms = agent_rdp_daemon::automation::launch_and_wait_worst_case().as_millis() as u64;
+        // Connect pays for the survivor wait as well; restart never does,
+        // because it is replacing the agent it would otherwise adopt.
+        let connect_worst_ms =
+            agent_rdp_daemon::automation::connect_bootstrap_worst_case().as_millis() as u64;
+        let restart_worst_ms =
+            agent_rdp_daemon::automation::launch_and_wait_worst_case().as_millis() as u64;
         assert!(
-            DEFAULT_CONNECT_TIMEOUT_MS > worst_ms + 10_000,
+            DEFAULT_CONNECT_TIMEOUT_MS > connect_worst_ms + 10_000,
             "connect budget {}ms does not clear the {}ms bootstrap worst case",
             DEFAULT_CONNECT_TIMEOUT_MS,
-            worst_ms
+            connect_worst_ms
         );
         assert!(
-            cli::commands::automate::RESTART_MIN_TIMEOUT_MS > worst_ms + 10_000,
+            cli::commands::automate::RESTART_MIN_TIMEOUT_MS > restart_worst_ms + 10_000,
             "restart budget does not clear the {}ms bootstrap worst case",
-            worst_ms
+            restart_worst_ms
         );
     }
 
@@ -322,10 +327,11 @@ mod watchdog_tests {
 /// is ~91s before any network latency. The previous 90s default sat exactly
 /// on that line and cold starts timed out with the daemon still legitimately
 /// working. Since then the handshake windows grew (25/45/75s, each extendable
-/// once on a host that is visibly still starting PowerShell), so the bootstrap
-/// worst case is `launch_and_wait_worst_case()` ≈ 305s; this clears it with
-/// room for the RDP handshake itself. A unit test keeps the two in step.
-const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 330_000;
+/// once on a host that is visibly still starting PowerShell), and connect
+/// additionally waits briefly for an agent that survived the last drop, so
+/// its worst case is `connect_bootstrap_worst_case()` ≈ 311s; this clears it
+/// with room for the RDP handshake itself. A unit test keeps the two in step.
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 340_000;
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     use output::Output;

@@ -156,6 +156,13 @@ function Open-DvcChannel {
     $script:DvcWtsHandle = $wtsHandle
     $script:DvcFileHandle = $duplicatedHandle
 
+    # A fresh channel starts with a clean slate. Without this the counters
+    # carried over from the channel that just died, so an agent that
+    # reconnected a few times hit its failure limits for reasons that were
+    # already resolved.
+    $script:DvcTransientFailures = 0
+    $script:DvcIdleReads = 0
+
     return $duplicatedHandle
 }
 
@@ -203,6 +210,16 @@ $script:DvcFatalPrefix = "DVC_FATAL:"
 # Consecutive transient read failures tolerated before giving up anyway.
 $script:DvcMaxTransientFailures = 20
 $script:DvcTransientFailures = 0
+
+# Consecutive empty reads. A live channel blocks in ReadFile until something
+# arrives, so these should be rare; a channel whose client has gone away can
+# instead return success with zero bytes forever, which the caller turns into
+# a tight loop burning a core on someone's desktop. Count them, slow down,
+# and eventually treat the channel as gone so the reconnect loop takes over.
+$script:DvcIdleReads = 0
+$script:DvcIdleReadsBeforeSleep = 3
+$script:DvcIdleReadSleepMs = 100
+$script:DvcMaxIdleReads = 100
 
 # One reusable read buffer. Each ReadFile returns at most one fragment
 # (CHANNEL_CHUNK_LENGTH = 1600 bytes of data plus the header), so a modest
@@ -252,6 +269,13 @@ function Read-DvcMessage {
 
         if ($bytesRead -eq 0) {
             if ($fragments -eq 0) {
+                $script:DvcIdleReads++
+                if ($script:DvcIdleReads -ge $script:DvcMaxIdleReads) {
+                    throw "$($script:DvcFatalPrefix) $($script:DvcIdleReads) consecutive empty reads (the client is gone)"
+                }
+                if ($script:DvcIdleReads -ge $script:DvcIdleReadsBeforeSleep) {
+                    Start-Sleep -Milliseconds $script:DvcIdleReadSleepMs
+                }
                 return $null
             }
             return Skip-DvcTransientFailure -What "0-byte read after $fragments fragment(s) of a $expectedLength-byte message" -Fragments $fragments
@@ -298,6 +322,7 @@ function Read-DvcMessage {
 
     # A complete message: the channel is healthy.
     $script:DvcTransientFailures = 0
+    $script:DvcIdleReads = 0
 
     $bytes = $accumulated.ToArray()
     if ($bytes.Length -eq 0) {
@@ -373,7 +398,8 @@ function Send-DvcHandshake {
     param(
         [IntPtr]$Handle,
         [string]$Version,
-        [string[]]$Capabilities
+        [string[]]$Capabilities,
+        [string]$BuildId = ""
     )
 
     $handshake = @{
@@ -381,6 +407,7 @@ function Send-DvcHandshake {
         version = $Version
         agent_pid = $PID
         capabilities = $Capabilities
+        build_id = $BuildId
     }
 
     Write-DvcMessage -Handle $Handle -Message $handshake

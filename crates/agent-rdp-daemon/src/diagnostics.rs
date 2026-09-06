@@ -58,6 +58,7 @@ fn is_infrastructure_error(code: &ErrorCode) -> bool {
             // Facts about the file, not the screen.
             | ErrorCode::StaleFile
             | ErrorCode::FileChangedDuringTransfer
+            | ErrorCode::TransferVerificationFailed
     )
 }
 

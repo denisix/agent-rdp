@@ -33,6 +33,58 @@ pub fn launch_and_wait_worst_case() -> Duration {
 /// Sleeps inside `launch_agent` (desktop settle, Run dialog, paste).
 const LAUNCH_FIXED_WAITS: Duration = Duration::from_millis(2000 + 300 + 2000 + 500);
 
+/// How long `connect` waits for an agent that outlived the previous
+/// transport drop to re-open its channel, before typing Win+R for a new one.
+///
+/// The agent retries its channel open every 3s, so this covers two attempts.
+/// Paid on every connect, including cold ones where no agent exists: 6s
+/// against the ~30s a launch costs, in exchange for not taking foreground on
+/// a desktop that may be shared. Deliberately not conditioned on this daemon
+/// having launched an agent before - a daemon replaced by `connect --replace`
+/// or by an upgrade starts with no memory at all, and that is exactly when a
+/// survivor is waiting.
+pub const SURVIVOR_WAIT: Duration = Duration::from_secs(6);
+
+/// How often the survivor wait re-checks for a handshake.
+const SURVIVOR_POLL: Duration = Duration::from_millis(250);
+
+/// Worst case for `connect`'s automation bootstrap: the survivor wait plus a
+/// full launch sequence. Distinct from `launch_and_wait_worst_case`, which
+/// stays the bound for `automate restart` (it never waits for a survivor).
+pub fn connect_bootstrap_worst_case() -> Duration {
+    SURVIVOR_WAIT + launch_and_wait_worst_case()
+}
+
+/// The agent version this daemon ships, parsed out of the embedded script.
+///
+/// An adopted agent is a *previous* daemon's process, so it can predate an
+/// upgrade. Comparing against the script we would deploy is what keeps a
+/// stale agent from being adopted into a daemon whose protocol has moved on.
+pub fn expected_agent_version() -> Option<String> {
+    let marker = "$script:Version = \"";
+    let start = AGENT_SCRIPT.find(marker)? + marker.len();
+    let rest = &AGENT_SCRIPT[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Hash of every embedded PowerShell file this daemon deploys.
+///
+/// `$script:Version` names `agent.ps1` alone, so a change to a library file
+/// with no version bump - this very release touched `actions.ps1` without
+/// touching the version string - would let a survivor running the old
+/// library be adopted as if nothing had changed. Passed to the launched
+/// agent as `-BuildId` and echoed back in its handshake; `adopt_survivor`
+/// compares it, not the version string, before adopting.
+pub fn expected_build_id() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for script in [AGENT_SCRIPT, LIB_TYPES, LIB_SNAPSHOT, LIB_SELECTORS, LIB_ACTIONS, LIB_DVC] {
+        hasher.update(script.as_bytes());
+    }
+    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 /// Relaunch budget for the supervisor: a bounded number of relaunches per
 /// window, so a remote host that kills the agent on every start does not
 /// keep the Run dialog busy forever.
@@ -57,6 +109,14 @@ impl RelaunchBudget {
         self.launches.push(now);
         true
     }
+}
+
+/// Outcome of the survivor wait at the head of `connect`'s bootstrap.
+enum Adoption {
+    /// An agent was already there and is now this daemon's agent.
+    Adopted,
+    /// Nothing usable was there; launch one.
+    None,
 }
 
 /// Consecutive failed launches after which the supervisor stops retrying
@@ -106,8 +166,11 @@ pub fn record_launch_outcome(
             state.launch_failures = 0;
             // Counts `connect`'s bootstrap too, which `relaunches` does not:
             // that launch types Win+R and pastes on the remote desktop, so it
-            // needs to be visible somewhere.
-            state.total_launches = state.total_launches.saturating_add(1);
+            // needs to be visible somewhere. An adopted agent is the one case
+            // that succeeded without typing anything, so it is not a launch.
+            if !state.adopted {
+                state.total_launches = state.total_launches.saturating_add(1);
+            }
         }
         Err(reason) => {
             state.launch_failures = state.launch_failures.saturating_add(1);
@@ -138,6 +201,7 @@ pub fn record_launch_outcome(
 pub async fn launch_guarded(
     rdp_session: &Arc<Mutex<Option<RdpSession>>>,
     automation_state: &Arc<Mutex<AutomationState>>,
+    adopt_first: bool,
 ) -> Result<(), String> {
     {
         let mut state = automation_state.lock().await;
@@ -150,10 +214,15 @@ pub async fn launch_guarded(
         state.relaunch_in_flight = true;
         state.agent_ready = false;
         state.agent_pid = None;
+        // Cleared up front: whatever comes out of this call, "adopted" must
+        // describe the agent that ends up connected, not an earlier one.
+        state.adopted = false;
     }
 
     let bootstrap = AutomationBootstrap::new(crate::get_session_dir(""));
-    let result = bootstrap.launch_and_wait(rdp_session, automation_state).await;
+    let result = bootstrap
+        .launch_and_wait(rdp_session, automation_state, adopt_first)
+        .await;
 
     let mut state = automation_state.lock().await;
     state.relaunch_in_flight = false;
@@ -161,13 +230,50 @@ pub async fn launch_guarded(
     result
 }
 
+/// Adopt an agent that survived the last transport drop, without ever
+/// launching one. Returns whether an agent is now connected.
+///
+/// This is `connect --defer-agent`: the caller wants the session up without
+/// anything appearing on the remote desktop, but a survivor costs nothing to
+/// take. Guarded like a launch so it cannot race one.
+pub async fn adopt_only(automation_state: &Arc<Mutex<AutomationState>>) -> bool {
+    let dvc_state = {
+        let mut state = automation_state.lock().await;
+        if !state.enabled || state.relaunch_in_flight {
+            return false;
+        }
+        state.relaunch_in_flight = true;
+        state.adopted = false;
+        state.dvc_state.clone()
+    };
+
+    let bootstrap = AutomationBootstrap::new(crate::get_session_dir(""));
+    let adopted = match dvc_state {
+        Some(dvc_state) => matches!(
+            bootstrap.adopt_survivor(&dvc_state, automation_state).await,
+            Adoption::Adopted
+        ),
+        None => false,
+    };
+
+    let mut state = automation_state.lock().await;
+    state.relaunch_in_flight = false;
+    if adopted {
+        record_launch_outcome(&mut state, &Ok(()), std::time::Instant::now());
+    }
+    adopted
+}
+
 /// Relaunch the agent on an already-initialized session (`automate restart`
 /// and the supervisor). Counts in `relaunches` on success.
+///
+/// Never adopts: a relaunch exists because the caller wants a *new* agent,
+/// and the one still holding the channel is what they are replacing.
 pub async fn relaunch_agent(
     rdp_session: &Arc<Mutex<Option<RdpSession>>>,
     automation_state: &Arc<Mutex<AutomationState>>,
 ) -> Result<(), String> {
-    let result = launch_guarded(rdp_session, automation_state).await;
+    let result = launch_guarded(rdp_session, automation_state, false).await;
     if result.is_ok() {
         automation_state.lock().await.relaunches += 1;
     }
@@ -485,10 +591,14 @@ impl AutomationBootstrap {
 
         // The command to run via Win+R
         // Uses the mapped drive path: \\TSCLIENT\<drive_name>\scripts\agent.ps1
+        // `-BuildId` is what a later connect's adoption check compares
+        // against - it has to come from this daemon's own launch, not from
+        // anything the agent could compute about itself.
         let ps_command = format!(
-            "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File \"\\\\TSCLIENT\\{}\\scripts\\agent.ps1\" -BasePath \"\\\\TSCLIENT\\{}\"",
+            "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File \"\\\\TSCLIENT\\{}\\scripts\\agent.ps1\" -BasePath \"\\\\TSCLIENT\\{}\" -BuildId \"{}\"",
             state.drive_name,
-            state.drive_name
+            state.drive_name,
+            expected_build_id()
         );
 
         debug!("PowerShell command: {}", ps_command);
@@ -537,11 +647,18 @@ impl AutomationBootstrap {
     /// The window is per attempt: PowerShell start-up on a CPU-starved host
     /// can take well over the old 25s, and three short windows burned the
     /// whole budget without ever giving one launch enough time.
+    ///
+    /// `baseline` is the handshake this launch is trying to *replace*, taken
+    /// before the launch. Without it, a launch whose whole point is to get rid
+    /// of a wedged agent returned immediately on that agent's own handshake:
+    /// `automate restart` typed Win+R, reported success, and left the old
+    /// agent in place while the new one was rejected as a second channel.
     pub async fn wait_for_handshake(
         &self,
         dvc_state: &SharedDvcState,
         window: Duration,
         rdp_session: &Arc<Mutex<Option<RdpSession>>>,
+        baseline: Option<std::time::Instant>,
     ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
         let mut delay = Duration::from_millis(500);
@@ -549,7 +666,7 @@ impl AutomationBootstrap {
         let mut extended = false;
 
         loop {
-            if dvc_state.lock().handshake.is_some() {
+            if Self::handshake_is_newer(dvc_state, baseline) {
                 return Ok(());
             }
 
@@ -579,10 +696,33 @@ impl AutomationBootstrap {
             delay = (delay * 3 / 2).min(max_delay);
         }
 
+        if baseline.is_some() && dvc_state.lock().handshake.is_some() {
+            anyhow::bail!(
+                "The previous automation agent is still holding the channel after {:?}; the \
+                 new one could not take over",
+                started.elapsed()
+            );
+        }
         anyhow::bail!(
             "Automation agent DVC handshake timed out after {:?}",
             started.elapsed()
         )
+    }
+
+    /// Whether the connected agent is one that handshook after `baseline`.
+    ///
+    /// With no baseline (a first launch, or an adoption) any handshake counts.
+    fn handshake_is_newer(dvc_state: &SharedDvcState, baseline: Option<std::time::Instant>) -> bool {
+        let state = dvc_state.lock();
+        if state.handshake.is_none() {
+            return false;
+        }
+        match (baseline, state.handshake_at) {
+            (None, _) => true,
+            (Some(baseline), Some(at)) => at > baseline,
+            // A handshake with no timestamp cannot be shown to be the new one.
+            (Some(_), None) => false,
+        }
     }
 
     /// Signals that an agent process is starting but has not handshaken.
@@ -607,6 +747,90 @@ impl AutomationBootstrap {
             2 => Duration::from_secs(45),
             _ => Duration::from_secs(75),
         }
+    }
+
+    /// Wait briefly for an agent that outlived the last transport drop.
+    ///
+    /// The agent keeps re-opening its channel for several minutes after the
+    /// client goes away, so the common reconnect finds one already there.
+    /// Adopting it is the difference between a reconnect nobody on the remote
+    /// desktop notices and one that takes foreground to type Win+R.
+    ///
+    /// A survivor from before an upgrade is told to exit instead: it is a
+    /// previous daemon's process, running a script this daemon no longer
+    /// ships.
+    async fn adopt_survivor(
+        &self,
+        dvc_state: &SharedDvcState,
+        automation_state: &Arc<Mutex<AutomationState>>,
+    ) -> Adoption {
+        let deadline = std::time::Instant::now() + SURVIVOR_WAIT;
+        loop {
+            let handshake = dvc_state.lock().handshake.clone();
+            if let Some(handshake) = handshake {
+                // Compared by build id, not `$script:Version`: a library file
+                // can change with no version bump (this very release touched
+                // `actions.ps1`), and adopting a survivor still running the
+                // old one would be the daemon/CLI version-mismatch problem
+                // recreated one layer down, silently, with no version-mismatch
+                // check to catch it. An agent with no build id predates the
+                // field and is always treated as stale.
+                let expected = expected_build_id();
+                if handshake.build_id.as_deref() != Some(expected.as_str()) {
+                    warn!(
+                        "An agent running different scripts than this daemon ships is still \
+                         running (agent version {}, build {:?}, expected build {}); asking it \
+                         to exit and launching a current one",
+                        handshake.version,
+                        handshake.build_id,
+                        expected
+                    );
+                    Self::shutdown_stale_agent(dvc_state, automation_state).await;
+                    return Adoption::None;
+                }
+
+                let mut state = automation_state.lock().await;
+                Self::record_ready(&mut state);
+                state.adopted = true;
+                info!(
+                    "Adopted the automation agent that survived the last drop (pid {}, version {}) \
+                     - no Win+R was typed on the remote desktop",
+                    handshake.agent_pid, handshake.version
+                );
+                return Adoption::Adopted;
+            }
+            if std::time::Instant::now() >= deadline {
+                debug!("No surviving automation agent within {:?}; launching", SURVIVOR_WAIT);
+                return Adoption::None;
+            }
+            sleep(SURVIVOR_POLL).await;
+        }
+    }
+
+    /// Ask an agent we are not adopting to exit, and wait briefly for it to
+    /// go. Best-effort: if it will not leave, the launch proceeds anyway and
+    /// the second agent is rejected when it opens its own channel.
+    async fn shutdown_stale_agent(
+        dvc_state: &SharedDvcState,
+        automation_state: &Arc<Mutex<AutomationState>>,
+    ) {
+        let ipc = automation_state.lock().await.dvc_ipc.clone();
+        if let Some(ipc) = ipc {
+            let _ = ipc
+                .send_request_with_timeout(
+                    &agent_rdp_protocol::AutomateRequest::Shutdown,
+                    Duration::from_secs(5),
+                )
+                .await;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if dvc_state.lock().handshake.is_none() {
+                return;
+            }
+            sleep(SURVIVOR_POLL).await;
+        }
+        warn!("The previous agent did not exit within 5s; launching anyway");
     }
 
     /// Record a completed handshake in the automation state.
@@ -639,6 +863,7 @@ impl AutomationBootstrap {
         &self,
         rdp_session: &Arc<Mutex<Option<RdpSession>>>,
         automation_state: &Arc<Mutex<AutomationState>>,
+        adopt_first: bool,
     ) -> Result<(), String> {
         let mut last_reason = String::new();
 
@@ -646,6 +871,22 @@ impl AutomationBootstrap {
             Some(state) => state,
             None => return Err("Automation DVC state not initialized".to_string()),
         };
+
+        if adopt_first {
+            match self.adopt_survivor(&dvc_state, automation_state).await {
+                Adoption::Adopted => return Ok(()),
+                Adoption::None => {}
+            }
+        }
+
+        // Whatever handshake is on the channel right now is the one this
+        // launch has to replace, not accept - `None` only when the channel
+        // is genuinely empty (a cold connect, or eviction above succeeded).
+        // A stale agent that `adopt_survivor`/`stop_running_agent` failed to
+        // evict is exactly the case this guards: without it, the wait below
+        // returned on that same stale handshake and reported success having
+        // replaced nothing.
+        let baseline = dvc_state.lock().handshake_at;
 
         for attempt in 1..=LAUNCH_ATTEMPTS {
             // Attempt 2+: if the previous launch is visibly still starting,
@@ -676,7 +917,7 @@ impl AutomationBootstrap {
 
             if launched {
                 let window = Self::handshake_window(attempt);
-                match self.wait_for_handshake(&dvc_state, window, rdp_session).await {
+                match self.wait_for_handshake(&dvc_state, window, rdp_session, baseline).await {
                     Ok(()) => {
                         let mut auto_state = automation_state.lock().await;
                         Self::record_ready(&mut auto_state);
@@ -727,6 +968,9 @@ impl AutomationBootstrap {
         state.last_error = None;
         state.next_retry_at = None;
         state.launch_failures = 0;
+        // The session that was adopted is over; a later `offline_status`
+        // must not keep reporting it.
+        state.adopted = false;
 
         Ok(())
     }
@@ -856,7 +1100,7 @@ mod tests {
         // Duplicate ids no longer inflate the FIFO.
         assert!(LIB_ACTIONS.contains("if (-not $script:ResultJournalOrder.Contains($Id))"));
         assert!(AGENT_SCRIPT.contains("\"persistent_journal\""));
-        assert!(AGENT_SCRIPT.contains("$script:Version = \"1.7.0\""));
+        assert!(AGENT_SCRIPT.contains("$script:Version = \"1.8.0\""));
     }
 
     #[test]
@@ -1233,5 +1477,123 @@ mod keep_alive_and_launch_count_tests {
         // Sending on a keep-alive tick must not stamp input activity, or the
         // supervisor's idle gate would never open.
         assert!(!arm.contains("stamp_input_activity"));
+    }
+}
+
+#[cfg(test)]
+mod survivor_tests {
+    use super::*;
+
+    /// Adoption is version-gated, so the version has to be readable from the
+    /// script this daemon actually ships.
+    #[test]
+    fn the_shipped_agent_version_is_readable() {
+        let version = expected_agent_version().expect("the script declares a version");
+        assert_eq!(version, "1.8.0");
+        assert!(
+            AGENT_SCRIPT.contains(&format!("$script:Version = \"{}\"", version)),
+            "parsed out of the script, not hardcoded twice"
+        );
+    }
+
+    /// The version string alone misses a library-only change - this cycle's
+    /// own `actions.ps1` edits carried no version bump. `expected_build_id`
+    /// is what a survivor is actually checked against.
+    #[test]
+    fn the_build_id_covers_every_embedded_script_not_just_the_version_string() {
+        let id = expected_build_id();
+        assert_eq!(id.len(), 64, "a hex sha256 digest");
+        assert_eq!(id, expected_build_id(), "deterministic across calls");
+
+        // Prove it actually reads the library files, not just agent.ps1: a
+        // hash over agent.ps1 alone would not catch this.
+        let agent_only = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(AGENT_SCRIPT.as_bytes());
+            h.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>()
+        };
+        assert_ne!(id, agent_only);
+    }
+
+    /// The launch command is where the running agent learns the build id it
+    /// will be asked to prove later - it has to come from the daemon that
+    /// launched it, not from anything the agent computes about itself.
+    #[test]
+    fn the_launch_command_carries_the_build_id() {
+        let src = include_str!("bootstrap.rs");
+        assert!(src.contains("-BuildId \\\"{}\\\""));
+        assert!(AGENT_SCRIPT.contains("[string]$BuildId"));
+        assert!(AGENT_SCRIPT.contains("-BuildId $BuildId"));
+        assert!(LIB_DVC.contains("build_id = $BuildId"));
+    }
+
+    /// Connect pays for the survivor wait; restart never does, and its budget
+    /// has less headroom - conflating the two would push restart over.
+    #[test]
+    fn connect_costs_the_survivor_wait_and_restart_does_not() {
+        let launch = launch_and_wait_worst_case();
+        let connect = connect_bootstrap_worst_case();
+        assert_eq!(connect, launch + SURVIVOR_WAIT);
+        assert!(connect > launch);
+        // Small enough that a cold connect, which pays it for nothing, does
+        // not notice against a ~30s launch.
+        assert!(SURVIVOR_WAIT <= Duration::from_secs(10));
+    }
+
+    /// An adopted agent was not launched: nothing was typed on the remote
+    /// desktop, so counting it as a launch would make the counter that exists
+    /// to answer "did this reconnect disturb the desktop?" say yes.
+    #[test]
+    fn adoption_is_not_counted_as_a_launch() {
+        let now = std::time::Instant::now();
+        let mut state = AutomationState::new(std::path::PathBuf::from("/tmp/x"));
+
+        state.adopted = false;
+        record_launch_outcome(&mut state, &Ok(()), now);
+        assert_eq!(state.total_launches, 1);
+
+        state.adopted = true;
+        record_launch_outcome(&mut state, &Ok(()), now);
+        assert_eq!(state.total_launches, 1, "an adoption typed nothing");
+
+        // It is still a success in every other respect.
+        assert!(state.last_error.is_none());
+        assert_eq!(state.launch_failures, 0);
+    }
+
+    /// The agent has to outlive a drop long enough for a reconnect to find
+    /// it, and must not spin while it waits.
+    #[test]
+    fn the_agent_waits_for_a_client_instead_of_exiting() {
+        assert!(AGENT_SCRIPT.contains("$script:ReconnectWindowSec = 600"));
+        assert!(AGENT_SCRIPT.contains("$script:ReconnectDelaySec = 3"));
+        // The old three-attempt loop lost the race against every reconnect.
+        assert!(!AGENT_SCRIPT.contains("$maxRetries = 3"));
+        // The window is per outage, not per process.
+        assert!(AGENT_SCRIPT.contains("$script:HandshakeSinceFailure"));
+        // A channel whose client is gone can read 0 bytes forever.
+        assert!(LIB_DVC.contains("$script:DvcMaxIdleReads"));
+        assert!(LIB_DVC.contains("$script:DvcIdleReadSleepMs"));
+    }
+
+    /// `shutdown` is how both the daemon and the channel layer stop an agent
+    /// they are not keeping; without the dispatch arm they wait for nothing.
+    #[test]
+    fn the_agent_can_be_asked_to_exit() {
+        assert!(AGENT_SCRIPT.contains("\"shutdown\""));
+        assert!(AGENT_SCRIPT.contains("$script:ShutdownRequested = $true"));
+        assert!(
+            AGENT_SCRIPT.contains("\"survives_reconnect\""),
+            "advertised so a daemon can tell an adoptable agent from an old one"
+        );
+    }
+
+    /// A streamed run used to open a visible console window on the remote
+    /// desktop - the same foreground theft the survivor design exists to
+    /// avoid, caused by us.
+    #[test]
+    fn a_streamed_run_does_not_open_a_window() {
+        assert!(LIB_ACTIONS.contains("$startArgs.NoNewWindow = $true"));
     }
 }

@@ -453,12 +453,23 @@ nobody is driving sends nothing in either direction and a NAT or firewall on
 the path eventually drops it — seen in the field after as little as ~5 minutes
 of idling. The daemon sends a Refresh Rect PDU every 45s to keep the path warm
 (`connect --keep-alive-secs <n>`, `0` disables). It carries no input, focus or
-lock-key semantics, so it cannot disturb the remote desktop — which matters,
-because the *recovery* from a dropped session does: reconnecting relaunches the
-automation agent by typing Win+R there, taking foreground from whatever else is
-running. `automate status` reports `total_launches`, every agent launch against
-the host including each `connect`'s bootstrap, next to `relaunches`, which
-counts only self-heal restarts since the last connect.
+lock-key semantics, so it cannot disturb the remote desktop.
+
+**A dead transport is detected in about a minute.** The RDP socket is
+configured to give up on unacknowledged data after 30s, so a black-holed path
+(no RST/FIN, just silence) surfaces within roughly one keep-alive interval plus
+that. Before this it fell back to the OS retransmission timeout — four to five
+minutes during which `screenshot` kept succeeding against a stale frame.
+
+**The automation agent survives a reconnect.** When the transport drops, the
+agent keeps re-opening its channel for about 10 minutes rather than exiting, so
+a `connect` in that window adopts the running agent instead of launching one —
+no Win+R, no foreground change on a desktop someone else may be using.
+`automate status` reports `adopted` when that happened, `total_launches` (every
+launch that did type Win+R, including each `connect`'s bootstrap) and
+`relaunches` (self-heal restarts since the last connect). `connect
+--defer-agent` skips the launch entirely and leaves the agent to `automate
+restart`.
 
 **The automation agent heals itself.** If its DVC channel closes while the
 RDP session is alive, the daemon relaunches it (at most 3 times per 10

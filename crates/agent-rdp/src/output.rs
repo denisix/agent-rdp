@@ -64,12 +64,9 @@ impl Output {
             {
                 let mut value = serde_json::to_value(response).unwrap();
                 let warning = match automation_error {
-                    Some(reason) => format!(
-                        "The UI Automation agent did not start: {}. The daemon keeps retrying \
-                         (`automate status` shows last_error/next_retry_secs); `automate \
-                         restart` forces a retry now.",
-                        reason
-                    ),
+                    // `automation_error` already carries the advice; see the
+                    // human branch below.
+                    Some(reason) => format!("The UI Automation agent did not start: {}", reason),
                     None => "The UI Automation agent did not start. The daemon keeps retrying \
                              (`automate status` shows progress); `automate restart` forces a \
                              retry now."
@@ -106,17 +103,30 @@ impl Output {
             ResponseData::Ok => {
                 println!("OK");
             }
-            ResponseData::Connected { host, width, height, automation_ready, automation_error } => {
+            ResponseData::Connected {
+                host,
+                width,
+                height,
+                automation_ready,
+                automation_error,
+                automation_deferred,
+            } => {
                 println!("Connected to {} ({}x{})", host, width, height);
+                if *automation_deferred {
+                    eprintln!(
+                        "The automation agent was not launched (--defer-agent) and no running \
+                         one was found. `automate restart` starts it; that types Win+R on the \
+                         remote desktop."
+                    );
+                }
                 if *automation_ready == Some(false) {
                     match automation_error {
-                        Some(reason) => eprintln!(
-                            "Warning: the UI Automation agent did not start: {}. Do not \
-                             reconnect for this - the daemon keeps retrying (`automate status` \
-                             shows last_error/next_retry_secs) and `automate restart` forces \
-                             a retry now; see the session's daemon.log for details.",
-                            reason
-                        ),
+                        // The daemon composes the whole sentence, including
+                        // the advice. Adding a second copy here is what
+                        // printed the same guidance twice.
+                        Some(reason) => {
+                            eprintln!("Warning: the UI Automation agent did not start: {}", reason)
+                        }
                         None => eprintln!(
                             "Warning: the UI Automation agent did not start, so `automate` \
                              commands will not work yet. The daemon keeps retrying (`automate \
@@ -159,7 +169,16 @@ impl Output {
                 }
                 println!("Uptime: {}s", info.uptime_secs);
                 if let Some(age_ms) = info.last_frame_age_ms {
-                    println!("Last frame from server: {}s ago", age_ms / 1000);
+                    match info.keep_alive_secs {
+                        // With keep-alive on, a live server answers each tick,
+                        // so the interval is the yardstick for this number.
+                        Some(interval) => println!(
+                            "Last frame from server: {}s ago (keep-alive every {}s)",
+                            age_ms / 1000,
+                            interval
+                        ),
+                        None => println!("Last frame from server: {}s ago", age_ms / 1000),
+                    }
                 }
                 if let Some(drop) = &info.last_disconnect {
                     println!(
@@ -264,6 +283,12 @@ impl Output {
                 }
                 if status.relaunches > 0 {
                     println!("Relaunches since connect: {}", status.relaunches);
+                }
+                if status.adopted {
+                    println!(
+                        "Adopted: yes (this agent survived the last drop; no Win+R was typed \
+                         on the remote desktop)"
+                    );
                 }
                 if status.total_launches > 0 {
                     // `relaunches` resets on every connect, so on its own it

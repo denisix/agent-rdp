@@ -58,8 +58,10 @@ webpki-roots = "0.26"
 image = { version = "0.25", features = ["png", "jpeg"] }
 base64 = "0.22"
 
-# Low-level socket options (TCP keepalive)
-socket2 = "0.6"
+# Low-level socket options (TCP keepalive, TCP_USER_TIMEOUT). The `all`
+# feature is what exposes the platform-specific setters beyond the portable
+# subset - `set_tcp_user_timeout` among them.
+socket2 = { version = "0.6", features = ["all"] }
 
 # File-transfer integrity verification
 sha2 = "0.11"
@@ -91,4 +93,12 @@ rten = "0.13"  # Must match ocrs dependency
 
 [workspace.dependencies.windows-sys]
 version = "0.59"
-features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading"]
+features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    # setsockopt/TCP_MAXRT: bound how long unacknowledged data may sit before
+    # the connection is declared dead (the Windows analogue of Linux's
+    # TCP_USER_TIMEOUT).
+    "Win32_Networking_WinSock",
+]

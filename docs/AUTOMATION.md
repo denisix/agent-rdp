@@ -308,6 +308,34 @@ skipped, so the reader resynchronises instead of failing the next JSON parse.
 Write failures are always fatal (`DVC_FATAL:` too): a reply that cannot be
 sent is a reply the daemon times out on anyway.
 
+### Surviving a Reconnect (Agent + Daemon)
+
+The agent does not exit when its channel dies. It re-opens every 3s for
+`$script:ReconnectWindowSec` (600s, measured per outage), because the Windows
+session outlives the RDP transport: a reconnect inside that window finds the
+agent already there, and `launch_and_wait(.., adopt_first: true)` adopts it as
+soon as a handshake appears, waiting up to `SURVIVOR_WAIT` (6s) before typing
+Win+R. Adoption sets `AutomationStatus.adopted` and, unlike a launch, does not
+increment `total_launches`. A survivor is checked against
+`expected_build_id()` - a hash over every embedded script, not just
+`$script:Version` - so a library-only change with no version bump still
+replaces it; a mismatch is sent `shutdown`. The build id is passed to the
+launched agent as `-BuildId` and echoed back in its handshake, since the agent
+cannot compute it about itself.
+
+Two agents can therefore be alive at once — a survivor reattaching while a
+freshly launched one starts. `dvc_channel.rs` keeps whichever opened the
+channel first and answers the other's handshake with a `shutdown` request;
+`close()` is id-guarded so the rejected agent exiting cannot clear the live
+agent's handshake or wake the supervisor. This is also why the channel is
+registered with `DrdynvcClient::with_listener` rather than
+`with_dynamic_channel`: the latter hands its processor out exactly once per
+RDP session (`OnceListener::create` is a `take`), so from the IronRDP 0.17
+upgrade until 0.7.17 a relaunched agent was answered with `NO_LISTENER` and
+neither the supervisor nor `automate restart` could reattach within a session.
+`automate restart` now also asks the running agent to exit first, so the
+replacement is the agent that survives the rule above.
+
 ### Relaunch Supervisor (Daemon)
 
 A per-session supervisor task (spawned by `connect`, bound to that
@@ -421,6 +449,7 @@ temporary profile or another farm member starts empty.
 | `parse_error` (`command_failed` from the daemon's view) | `run` text does not parse as Windows PowerShell; nothing was launched. Message lists line/column per error and ends with the command line as assembled |
 | `timeout` | Operation exceeded timeout |
 | `channel_closed` | DVC channel was closed |
+| `transfer_verification_failed` | `file push`: the file the agent assembled does not match the bytes sent (or it reported no hash at all). The transfer is staged in a sidecar and swapped in only after it verifies, so the destination was left untouched |
 | `file_changed_during_transfer` | `file pull`: the file was rewritten between the hash and the read on every attempt (3 attempts, 150ms/300ms apart, for files under 8MB). Distinct from `internal_error` so a caller polling a file its producer rewrites can retry |
 | `unknown` | Unspecified error |
 
@@ -471,7 +500,13 @@ Relaunch Supervisor above).
    account and per host. A temporary profile (`C:\Users\TEMP`) is discarded
    at logoff, and an RDS farm may place the next logon on another member;
    both look like "unknown key" and the command executes again.
-7. **Reconnect disturbs the desktop**: bringing automation back up after a
-   dropped transport types Win+R there, so any other automation sharing that
-   interactive session can lose foreground at that moment. Keep-alive exists
-   to make that rare; there is no way to relaunch the agent invisibly.
+7. **Launching the agent disturbs the desktop**: a launch types Win+R there,
+   so any other automation sharing that interactive session can lose
+   foreground at that moment. A reconnect within the agent's ~10 minute
+   reconnect window adopts the running agent instead and types nothing;
+   keep-alive makes the drop itself rarer; `connect --defer-agent` withholds
+   the launch until you ask. A launch that does have to happen cannot be made
+   invisible.
+8. **The survivor depends on the Windows session**: a policy that ends
+   disconnected sessions after N minutes takes the agent with it, and the
+   next connect launches a new one.

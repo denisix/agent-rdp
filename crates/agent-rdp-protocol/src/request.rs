@@ -172,6 +172,15 @@ pub struct ConnectRequest {
     #[serde(default = "default_keep_alive_secs")]
     #[ts(type = "number")]
     pub keep_alive_secs: u64,
+
+    /// Connect without launching the automation agent (default: false).
+    ///
+    /// The drive and the DVC channel are still set up, and an agent that
+    /// survived an earlier drop is still adopted - only the Win+R launch is
+    /// skipped. For a shared desktop where the caller wants to choose the
+    /// moment the Run dialog appears; `automate restart` launches it.
+    #[serde(default)]
+    pub defer_agent: bool,
 }
 
 fn default_stream_bind() -> String {
@@ -208,6 +217,7 @@ impl Default for ConnectRequest {
             stream_quality: default_stream_quality(),
             serve_viewer: false,
             keep_alive_secs: default_keep_alive_secs(),
+            defer_agent: false,
         }
     }
 }
