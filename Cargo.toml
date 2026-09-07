@@ -16,7 +16,10 @@ version = "0.7.18" # x-release-please-version
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/denisix/agent-rdp"
-rust-version = "1.75"
+# 1.79 for `std::path::absolute`, which is what makes a Windows
+# drive-relative path (`C:report.json`) resolve the way the shell would
+# rather than being joined onto the working directory.
+rust-version = "1.79"
 
 [workspace.dependencies]
 # Internal crates

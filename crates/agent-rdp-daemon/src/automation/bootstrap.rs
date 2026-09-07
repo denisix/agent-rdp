@@ -896,6 +896,14 @@ impl AutomationBootstrap {
                 // recreated one layer down, silently, with no version-mismatch
                 // check to catch it. An agent with no build id predates the
                 // field and is always treated as stale.
+                //
+                // Normally unreachable now: the channel layer applies the
+                // same check when the handshake arrives and never stores a
+                // mismatched one, so this wait simply finds nothing and
+                // returns `None`. Kept as the backstop for a state whose
+                // `expected_build_id` was never set, and because the
+                // eviction below is the only thing that waits for the
+                // rejected agent to actually go.
                 let expected = expected_build_id();
                 if handshake.build_id.as_deref() != Some(expected.as_str()) {
                     warn!(
