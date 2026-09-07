@@ -553,17 +553,31 @@ function Invoke-Run {
     $script:LastRunLaunched = $false
 
     $command = $Params.command
-    # Quote each argument as a PowerShell single-quoted string literal (doubling
-    # embedded single quotes) so args containing spaces or quotes survive as one
-    # token when re-parsed by the -Command string below.
-    $commandArgs = if ($Params.args) {
-        ($Params.args | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join " "
-    } else { "" }
     $wait = if ($null -ne $Params.wait) { $Params.wait } else { $false }
     $hidden = if ($null -ne $Params.hidden) { $Params.hidden } else { $false }
     $timeoutMs = if ($Params.timeout_ms) { [int]$Params.timeout_ms } else { 10000 }
     $shell = if ($Params.shell) { $Params.shell } else { "powershell.exe" }
     $stream = if ($null -ne $Params.stream) { $Params.stream } else { $false }
+    $shellKind = Get-ShellKind -Shell $shell
+
+    # Arguments are quoted for the interpreter that will re-parse them, which
+    # is not the same one for every shell: a PowerShell single-quoted literal
+    # handed to cmd.exe arrives with its quotes intact.
+    $commandArgs = if ($Params.args) {
+        if ($shellKind -eq "cmd") {
+            ($Params.args | ForEach-Object {
+                if ($_ -match '"') {
+                    throw "cmd_syntax: a cmd.exe argument cannot contain a double quote; put the whole command line in the command string instead"
+                }
+                if ($_ -eq "" -or $_ -match '\s') { '"' + $_ + '"' } else { $_ }
+            }) -join " "
+        } else {
+            # Single-quoted PowerShell string literals (doubling embedded
+            # single quotes) so args containing spaces or quotes survive as
+            # one token when re-parsed by the child.
+            ($Params.args | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join " "
+        }
+    } else { "" }
 
     # Hand the script to PowerShell base64-encoded rather than as a quoted
     # -Command string. Interpolating the command into `-Command "..."` meant any
@@ -597,30 +611,54 @@ function Start-RunChild {
         [bool]$Stream
     )
 
-    $shape = Get-ChildScriptShape -UserScript $UserScript
-    # The agent's parser is the child's parser when the child is Windows
-    # PowerShell, so a script that does not parse here will not parse there
-    # either: refuse it now, with the parser's own positions, instead of
-    # launching a child whose only output is a CLIXML-wrapped parse error.
-    # A different shell (pwsh 7 syntax the 5.1 parser rejects) is launched
-    # unwrapped as before and reports its own errors.
-    if ($shape.parse_errors.Count -gt 0 -and (Test-DefaultShell -Shell $Shell)) {
-        throw "parse_error: the command does not parse as Windows PowerShell: $($shape.parse_errors -join '; ')"
+    $shellKind = Get-ShellKind -Shell $Shell
+    if ($shellKind -eq "other") {
+        throw "shell_unsupported: --shell must be powershell.exe, pwsh.exe or cmd.exe; the command is handed to PowerShell as -EncodedCommand and to cmd.exe as /c, and any other program would receive those switches instead of the command"
     }
 
-    $script = New-ChildScript -UserScript $UserScript -Shape $shape
-    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+    if ($shellKind -eq "cmd") {
+        # cmd.exe gets the line exactly as written: no parser gate, no
+        # wrapper, no encoding. `chcp 65001` because a CreateNoWindow child
+        # gets a fresh console at the OEM codepage while the agent decodes
+        # its output as UTF-8.
+        $childArgs = '/d /s /c "chcp 65001>nul & ' + $UserScript + '"'
+    } else {
+        $shape = Get-ChildScriptShape -UserScript $UserScript
+        # The agent's parser is the child's parser when the child is Windows
+        # PowerShell, so a script that does not parse here will not parse there
+        # either: refuse it now, with the parser's own positions, instead of
+        # launching a child whose only output is a CLIXML-wrapped parse error.
+        # A different shell (pwsh 7 syntax the 5.1 parser rejects) is launched
+        # unwrapped as before and reports its own errors.
+        if ($shape.parse_errors.Count -gt 0 -and (Test-DefaultShell -Shell $Shell)) {
+            throw "parse_error: the command does not parse as Windows PowerShell: $($shape.parse_errors -join '; ')"
+        }
+
+        # A cmd.exe redirection handed to PowerShell parses fine and then
+        # fails inside .NET ("FileStream was asked to open a device that was
+        # not a file"), an error that names neither the caller's text nor
+        # the real cause - and whose wording is localized, so the daemon
+        # cannot recognise it either. The AST can, before anything runs.
+        if ($shape.device_redirections.Count -gt 0 -and (Test-DefaultShell -Shell $Shell)) {
+            $devices = ($shape.device_redirections | Select-Object -Unique) -join ", "
+            throw "cmd_syntax: $devices is cmd.exe redirection, not PowerShell - PowerShell would try to open a device as a file. Use 2>`$null, or --shell cmd.exe to run the line as a cmd command"
+        }
+
+        $script = New-ChildScript -UserScript $UserScript -Shape $shape
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+        $childArgs = "-NoProfile -EncodedCommand $encodedCommand"
+    }
 
     # `--wait` wins over `--stream`, as documented. The reverse order returned
     # only a pid for `--wait --stream`, and every byte of output went to files
     # the caller was never told to poll.
     if ($Stream -and -not $Wait) {
-        return Start-StreamedRun -Shell $Shell -EncodedCommand $encodedCommand -Hidden $Hidden
+        return Start-StreamedRun -Shell $Shell -ChildArgs $childArgs -Hidden $Hidden
     }
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $Shell
-    $startInfo.Arguments = "-NoProfile -EncodedCommand $encodedCommand"
+    $startInfo.Arguments = $childArgs
     $startInfo.WorkingDirectory = $env:USERPROFILE
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $Wait
@@ -986,7 +1024,7 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 function Get-ChildScriptShape {
     param([string]$UserScript)
 
-    $shape = @{ wrappable = $true; parse_errors = @() }
+    $shape = @{ wrappable = $true; parse_errors = @(); device_redirections = @() }
     try {
         $tokens = $null
         $errors = $null
@@ -999,10 +1037,51 @@ function Get-ChildScriptShape {
         }
         if ($null -ne $ast -and $null -ne $ast.ParamBlock) { $shape.wrappable = $false }
         if ($null -ne $ast -and $ast.UsingStatements -and $ast.UsingStatements.Count -gt 0) { $shape.wrappable = $false }
+
+        # Redirections to a DOS device name. `2>nul` is valid PowerShell
+        # syntax meaning "write to a file called nul", which .NET then
+        # refuses; the caller meant cmd.exe's null device.
+        if ($null -ne $ast) {
+            $redirections = $ast.FindAll(
+                { param($node) $node -is [System.Management.Automation.Language.FileRedirectionAst] },
+                $true)
+            foreach ($redirection in $redirections) {
+                $target = $redirection.Location
+                if ($target -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                    if ($target.Value -match '^(nul|con|prn|aux|com[1-9]|lpt[1-9])$') {
+                        $shape.device_redirections += $redirection.Extent.Text
+                    }
+                }
+            }
+        }
     } catch {
         # The parser itself failing is not the user's fault; wrap and run.
     }
     return $shape
+}
+
+# Which interpreter `--shell` names, and therefore how the command text is
+# handed to it. Anything else is refused: every value was previously given
+# PowerShell's own switches, so `--shell cmd.exe` silently produced
+# "'-NoProfile' is not recognized" instead of running the command.
+function Get-ShellKind {
+    param([string]$Shell)
+
+    if (-not $Shell) { return "powershell" }
+    try {
+        $leaf = [System.IO.Path]::GetFileName($Shell).ToLowerInvariant()
+    } catch {
+        return "other"
+    }
+    switch ($leaf) {
+        "powershell.exe" { return "powershell" }
+        "powershell"     { return "powershell" }
+        "pwsh.exe"       { return "pwsh" }
+        "pwsh"           { return "pwsh" }
+        "cmd.exe"        { return "cmd" }
+        "cmd"            { return "cmd" }
+        default          { return "other" }
+    }
 }
 
 # Whether the child is Windows PowerShell - the interpreter whose parser
@@ -1010,15 +1089,7 @@ function Get-ChildScriptShape {
 function Test-DefaultShell {
     param([string]$Shell)
 
-    if (-not $Shell) { return $true }
-    try {
-        $leaf = [System.IO.Path]::GetFileName($Shell).ToLowerInvariant()
-        return ($leaf -eq "powershell.exe" -or $leaf -eq "powershell")
-    } catch {
-        # An unparseable path is not Windows PowerShell as far as we can
-        # tell; launch it unwrapped and let it report its own errors.
-        return $false
-    }
+    return ((Get-ShellKind -Shell $Shell) -eq "powershell")
 }
 
 function New-ChildScript {
@@ -1124,7 +1195,7 @@ function Remove-ExpiredStreams {
 function Start-StreamedRun {
     param(
         [string]$Shell,
-        [string]$EncodedCommand,
+        [string]$ChildArgs,
         [bool]$Hidden
     )
 
@@ -1137,7 +1208,7 @@ function Start-StreamedRun {
 
     $startArgs = @{
         FilePath               = $Shell
-        ArgumentList           = "-NoProfile -EncodedCommand $EncodedCommand"
+        ArgumentList           = $ChildArgs
         WorkingDirectory       = $env:USERPROFILE
         RedirectStandardOutput = $stdoutPath
         RedirectStandardError  = $stderrPath

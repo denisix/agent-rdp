@@ -132,7 +132,11 @@ hidden: boolean,
  */
 timeout_ms: number, 
 /**
- * Shell executable to run the command through (default: powershell.exe).
+ * Shell to run the command through: `powershell.exe` (default),
+ * `pwsh.exe`, or `cmd.exe`. PowerShell shells receive the command
+ * as `-EncodedCommand`; `cmd.exe` receives it as `/c` exactly as
+ * written. Any other value is refused (`shell_unsupported`), since
+ * it would be handed PowerShell's own switches.
  */
 shell?: string, 
 /**

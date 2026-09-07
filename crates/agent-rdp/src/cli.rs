@@ -584,9 +584,15 @@ pub enum AutomateAction {
         selector: Option<String>,
     },
 
-    /// Run a PowerShell command
+    /// Run a command on the remote host.
+    ///
+    /// The command text is a Windows PowerShell 5.1 script: the agent parses
+    /// it, wraps it in try/catch and hands it to powershell.exe. cmd.exe
+    /// syntax such as `2>nul` is therefore not understood and is refused
+    /// before anything runs - use `2>$null`, or `--shell cmd.exe` to run a
+    /// cmd command line exactly as written.
     Run {
-        /// Command to run
+        /// Command to run (Windows PowerShell 5.1 unless --shell says otherwise)
         command: String,
 
         /// Command arguments
@@ -609,7 +615,10 @@ pub enum AutomateAction {
         #[arg(long = "process-timeout")]
         process_timeout: Option<u64>,
 
-        /// Shell executable to run the command through (default: powershell.exe)
+        /// Shell to run the command through: powershell.exe (default),
+        /// pwsh.exe, or cmd.exe. PowerShell shells receive the command as
+        /// -EncodedCommand; cmd.exe receives it as `/c` exactly as written.
+        /// Any other value is refused.
         #[arg(long)]
         shell: Option<String>,
 

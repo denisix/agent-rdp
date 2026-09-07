@@ -1336,6 +1336,44 @@ mod tests {
         assert!(LIB_ACTIONS.contains("[AgentDesktop]::GetForegroundWindow()"));
     }
 
+    /// `--shell cmd.exe` used to get PowerShell's own switches, so it could
+    /// never have worked: cmd printed "'-NoProfile' is not recognized".
+    /// A cmd line is now handed over as-is.
+    #[test]
+    fn cmd_shell_runs_the_command_line_as_is() {
+        assert!(LIB_ACTIONS.contains("function Get-ShellKind"));
+        assert!(LIB_ACTIONS.contains("'/d /s /c \"chcp 65001>nul & ' + $UserScript + '\"'"));
+        // Every other shell would be handed switches meant for PowerShell.
+        assert!(LIB_ACTIONS.contains("\"shell_unsupported: --shell must be powershell.exe, pwsh.exe or cmd.exe"));
+        // The PowerShell encoding path must stay on the PowerShell branch:
+        // it is built after the cmd branch has already returned its args.
+        let cmd_at = LIB_ACTIONS.find("if ($shellKind -eq \"cmd\") {").unwrap();
+        let encoded_at = LIB_ACTIONS.find("$childArgs = \"-NoProfile -EncodedCommand").unwrap();
+        assert!(cmd_at < encoded_at, "the cmd branch must precede the -EncodedCommand assembly");
+        assert_eq!(
+            LIB_ACTIONS.matches("-NoProfile -EncodedCommand").count(),
+            1,
+            "only the PowerShell branch may build -EncodedCommand arguments"
+        );
+    }
+
+    /// `2>nul` parses as PowerShell (a file named `nul`) and then fails
+    /// inside .NET with a message that names neither the command nor the
+    /// cause - and is localized, so the daemon cannot match on it either.
+    /// The AST catches it before anything is launched.
+    #[test]
+    fn device_redirections_are_refused_before_launch() {
+        assert!(LIB_ACTIONS.contains("FileRedirectionAst"));
+        assert!(LIB_ACTIONS.contains("'^(nul|con|prn|aux|com[1-9]|lpt[1-9])$'"));
+        assert!(LIB_ACTIONS.contains("\"cmd_syntax: $devices is cmd.exe redirection"));
+        // Nothing may be started before the refusal.
+        let body_at = LIB_ACTIONS.find("function Start-RunChild").unwrap();
+        let body = &LIB_ACTIONS[body_at..];
+        let refuse_at = body.find("cmd_syntax: $devices").unwrap();
+        let start_at = body.find("[System.Diagnostics.Process]::Start($startInfo)").unwrap();
+        assert!(refuse_at < start_at, "the refusal must precede any launch");
+    }
+
     /// Waited runs and finished stream polls report when the process
     /// exited, by the remote clock: the freshness marker for their output.
     #[test]
@@ -1692,8 +1730,8 @@ mod retry_edge_tests {
         // A corrupt entry is removed so the next execution can be recorded.
         assert!(LIB_ACTIONS.contains("Discarding unreadable journal entry"));
         assert!(LIB_ACTIONS.contains("Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue"));
-        // An unparseable --shell path is treated as non-default, not as a crash.
-        let shell_fn = LIB_ACTIONS.find("function Test-DefaultShell").unwrap();
+        // An unparseable --shell path is classified, not a crash.
+        let shell_fn = LIB_ACTIONS.find("function Get-ShellKind").unwrap();
         assert!(LIB_ACTIONS[shell_fn..shell_fn + 600].contains("} catch {"));
     }
 }

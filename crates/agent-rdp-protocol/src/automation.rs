@@ -162,7 +162,13 @@ pub enum AutomateRequest {
         selector: Option<String>,
     },
 
-    /// Run a PowerShell command.
+    /// Run a command on the remote host.
+    ///
+    /// The command text is Windows PowerShell 5.1 source unless `shell`
+    /// says otherwise: the agent parses it, wraps it in try/catch and
+    /// passes it as `-EncodedCommand`. cmd.exe redirections such as
+    /// `2>nul` are refused before launch (`cmd_syntax`) because PowerShell
+    /// would try to open a device as a file.
     Run {
         /// Command to run.
         command: String,
@@ -179,7 +185,11 @@ pub enum AutomateRequest {
         #[serde(default = "default_run_timeout")]
         #[ts(type = "number")]
         timeout_ms: u64,
-        /// Shell executable to run the command through (default: powershell.exe).
+        /// Shell to run the command through: `powershell.exe` (default),
+        /// `pwsh.exe`, or `cmd.exe`. PowerShell shells receive the command
+        /// as `-EncodedCommand`; `cmd.exe` receives it as `/c` exactly as
+        /// written. Any other value is refused (`shell_unsupported`), since
+        /// it would be handed PowerShell's own switches.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         shell: Option<String>,

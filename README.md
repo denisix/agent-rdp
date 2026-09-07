@@ -328,6 +328,9 @@ agent-rdp automate window maximize|minimize|restore|close
 
 agent-rdp automate run "Get-Process" --wait --process-timeout 5000
 agent-rdp automate run "$PSVersionTable" --wait --shell pwsh.exe
+agent-rdp automate run "type C:\log.txt 2>nul" --wait --shell cmd.exe
+                                            # the command text is PowerShell unless --shell says
+                                            # otherwise; cmd syntax like 2>nul is refused, not run
 agent-rdp automate run "ping -t 127.0.0.1" --stream   # returns a pid immediately
 agent-rdp automate run-poll <pid>                     # drain output; repeat until exited
 agent-rdp automate run-poll <pid> --json              # `pending: true` = alive, nothing new yet
