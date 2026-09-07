@@ -542,9 +542,11 @@ Relaunch Supervisor above).
    no inbound PDU at all (`KEEP_ALIVE_MISSED_LIMIT`) end the session, because
    a server whose TCP stack still ACKs but whose RDP service is gone answers
    nothing and trips no socket-level timeout. The verdict arms itself first -
-   it fires only after a refresh has been answered in a period where the
-   client sent nothing else - so a server that never answers a Refresh Rect
-   (the protocol permits it) is not misjudged. `AGENT_RDP_NO_SILENCE_DROP=1`
+   it fires only after a refresh was answered within two seconds on a link
+   where the client sent nothing else - so a server that never answers a
+   Refresh Rect (the protocol permits it) is not misjudged, and an
+   unsolicited repaint landing somewhere in a 45-second period is not
+   mistaken for an answer. `AGENT_RDP_NO_SILENCE_DROP=1`
    disables the verdict while keeping the traffic, and `--keep-alive-secs 0`
    disables both. Strikes are counted per send, so a local stall of any length
    (RDPDR I/O blocks this loop) adds at most one. Because the interval is

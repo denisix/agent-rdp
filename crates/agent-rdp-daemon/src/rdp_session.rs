@@ -175,6 +175,16 @@ impl DropProbe {
     pub fn drop_reason(&self) -> Option<String> {
         self.shared.read().drop_reason.clone()
     }
+
+    /// Whether `session` is the very session this probe watches.
+    ///
+    /// A graceful shutdown - `disconnect`, or a replacement - stamps no drop
+    /// reason by design, so "is it still the one in the daemon's slot?" is
+    /// the only way to tell that a long-running `connect` is still talking
+    /// about a live session rather than one taken away underneath it.
+    pub fn watches(&self, session: &RdpSession) -> bool {
+        Arc::ptr_eq(&self.shared, &session.shared)
+    }
 }
 
 /// Unix milliseconds now, for the activity stamps.
@@ -240,25 +250,33 @@ pub struct KeepAliveWatch {
     armed: bool,
 }
 
+/// How soon after a refresh an inbound PDU counts as its answer.
+///
+/// `last_frame_at` moves for *any* inbound PDU - a clock repaint, a caret
+/// blink, an agent re-opening its channel - so "something arrived somewhere
+/// in the last 45 seconds" is not evidence that this server answers Refresh
+/// Rect. A repaint that lands within a couple of seconds of the request is:
+/// unsolicited traffic is not synchronized to our sends, so it corroborates
+/// the answer rather than imitating it. This only gates *arming*; once armed,
+/// any inbound PDU still clears the strikes, which errs toward keeping a
+/// session alive.
+pub const KEEP_ALIVE_ANSWER_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl KeepAliveWatch {
     /// Record that a refresh was just sent. `answered_since_last_send` is
     /// whether any PDU arrived after the *previous* send;
-    /// `client_quiet_since_last_send` whether this client sent nothing else
-    /// in that period (so an answer can only have been to the refresh).
-    /// Returns `true` when the server has now been silent for
-    /// `KEEP_ALIVE_MISSED_LIMIT` sends in a row and the verdict is armed.
-    pub fn record_send(
-        &mut self,
-        answered_since_last_send: bool,
-        client_quiet_since_last_send: bool,
-    ) -> bool {
+    /// `promptly_answered` whether one arrived within
+    /// `KEEP_ALIVE_ANSWER_WINDOW` of it on an otherwise quiet link, which is
+    /// what arms the verdict. Returns `true` when the server has now been
+    /// silent for `KEEP_ALIVE_MISSED_LIMIT` sends in a row and it is armed.
+    pub fn record_send(&mut self, answered_since_last_send: bool, promptly_answered: bool) -> bool {
         if answered_since_last_send {
             self.unanswered = 0;
-            if client_quiet_since_last_send {
-                self.armed = true;
-            }
         } else {
             self.unanswered = self.unanswered.saturating_add(1);
+        }
+        if promptly_answered {
+            self.armed = true;
         }
         self.armed && self.unanswered >= KEEP_ALIVE_MISSED_LIMIT
     }
@@ -268,7 +286,7 @@ impl KeepAliveWatch {
         self.unanswered
     }
 
-    /// Whether a refresh has ever been answered on a quiet link - the
+    /// Whether a refresh has been answered promptly on a quiet link - the
     /// evidence the verdict needs before it can fire.
     pub fn armed(&self) -> bool {
         self.armed
@@ -1157,6 +1175,11 @@ async fn run_frame_processor(
     // input, clipboard, DVC data. A reply in such a period proves nothing
     // about Refresh Rect, so it does not arm the silence verdict.
     let mut client_sent_since_keep_alive = false;
+    // The refresh whose answer we are still waiting for, and whether one
+    // arrived soon enough after it to be that answer rather than unsolicited
+    // traffic. Set by the read arm, consumed by the next send.
+    let mut awaiting_refresh_answer: Option<std::time::Instant> = None;
+    let mut refresh_answered_promptly = false;
     let mut keep_alive_timer = keep_alive.map(|period| {
         info!("Keep-alive enabled: every {}s", period.as_secs());
         let mut timer = tokio::time::interval(period);
@@ -1236,10 +1259,13 @@ async fn run_frame_processor(
                             // since; it never arms.
                             let client_quiet =
                                 last_keep_alive_sent_at.is_some() && !client_sent_since_keep_alive;
+                            let promptly = client_quiet && refresh_answered_promptly;
                             last_keep_alive_sent_at = Some(now);
                             client_sent_since_keep_alive = false;
+                            refresh_answered_promptly = false;
+                            awaiting_refresh_answer = Some(now);
                             let was_armed = keep_alive_watch.armed();
-                            let dead = keep_alive_watch.record_send(answered, client_quiet);
+                            let dead = keep_alive_watch.record_send(answered, promptly);
                             if !was_armed && keep_alive_watch.armed() {
                                 debug!(
                                     "The server answers keep-alive refreshes on an idle link; \
@@ -1250,12 +1276,13 @@ async fn run_frame_processor(
                                 let inbound_age = shared.read().last_frame_at.elapsed();
                                 drop_reason = format!(
                                     "no PDU of any kind from the server across the last {} \
-                                     keep-alive periods ({}s), although it answered earlier \
-                                     refreshes on this idle link and its TCP connection is \
-                                     still open - its RDP service has stopped responding. \
-                                     Set {}=1 to keep such a session instead.",
+                                     keep-alive periods ({}s), although an earlier refresh on \
+                                     this idle link was answered within {}s and its TCP \
+                                     connection is still open - its RDP service has stopped \
+                                     responding. Set {}=1 to keep such a session instead.",
                                     keep_alive_watch.unanswered(),
                                     inbound_age.as_secs(),
+                                    KEEP_ALIVE_ANSWER_WINDOW.as_secs(),
                                     SILENCE_DROP_KILL_SWITCH
                                 );
                                 error!("{}", drop_reason);
@@ -1427,6 +1454,17 @@ async fn run_frame_processor(
 
             // Process incoming RDP frames
             result = framed.read_pdu() => {
+                // Only the first PDU after a refresh, and only if it comes
+                // quickly, is evidence that this server answers Refresh Rect
+                // (see `KEEP_ALIVE_ANSWER_WINDOW`). Unsolicited repaints are
+                // not synchronized to our sends, so they rarely land here;
+                // taking the *first* inbound only means a late repaint cannot
+                // be credited to a refresh it never answered.
+                if let Some(sent) = awaiting_refresh_answer.take() {
+                    if sent.elapsed() <= KEEP_ALIVE_ANSWER_WINDOW {
+                        refresh_answered_promptly = true;
+                    }
+                }
                 match result {
                     Ok((action, payload)) => {
                         // Process frame and collect responses
@@ -1648,8 +1686,10 @@ async fn reactivate(
         ironrdp_tokio::single_sequence_step(framed, &mut activation, &mut buf)
             .await
             .map_err(|e| RdpError::ProtocolError(e.to_string()))?;
-        // Reactivation traffic is proof of life too; without this the
-        // keep-alive watch could count the sequence as a silent period.
+        // Reactivation traffic is proof of life too. Belt and braces: the
+        // read that triggered this sequence already stamped `last_frame_at`,
+        // so this only matters if a reactivation ever outlasts a keep-alive
+        // period - which it can, on a slow renegotiation.
         shared.write().last_frame_at = std::time::Instant::now();
     }
 
@@ -2083,10 +2123,10 @@ mod liveness_tests {
     #[test]
     fn the_server_gets_three_unanswered_sends_before_it_is_declared_dead() {
         let mut watch = armed_watch();
-        assert!(!watch.record_send(false, true));
-        assert!(!watch.record_send(false, true));
+        assert!(!watch.record_send(false, false));
+        assert!(!watch.record_send(false, false));
         assert_eq!(watch.unanswered(), 2);
-        assert!(watch.record_send(false, true), "the third consecutive silence is death");
+        assert!(watch.record_send(false, false), "the third consecutive silence is death");
         assert_eq!(watch.unanswered(), 3);
     }
 
@@ -2095,13 +2135,13 @@ mod liveness_tests {
     #[test]
     fn any_answer_clears_the_strikes() {
         let mut watch = armed_watch();
-        watch.record_send(false, true);
-        watch.record_send(false, true);
+        watch.record_send(false, false);
+        watch.record_send(false, false);
         assert!(!watch.record_send(true, false));
         assert_eq!(watch.unanswered(), 0);
-        assert!(!watch.record_send(false, true));
-        assert!(!watch.record_send(false, true));
-        assert!(watch.record_send(false, true));
+        assert!(!watch.record_send(false, false));
+        assert!(!watch.record_send(false, false));
+        assert!(watch.record_send(false, false));
     }
 
     /// The stall the counter exists for: the loop was blocked for longer than
@@ -2113,7 +2153,7 @@ mod liveness_tests {
         let mut watch = armed_watch();
         // Resume after a 10-minute stall: the timer fires once, and the
         // replies to the pre-stall send are still in the socket buffer.
-        assert!(!watch.record_send(false, true), "one overdue tick is one strike, not death");
+        assert!(!watch.record_send(false, false), "one overdue tick is one strike, not death");
         assert_eq!(watch.unanswered(), 1);
         // The read arm drains the buffer; the next send sees an answer.
         assert!(!watch.record_send(true, true));
@@ -2129,7 +2169,8 @@ mod liveness_tests {
         let mut watch = KeepAliveWatch::default();
         watch.record_send(true, false);
         for _ in 0..20 {
-            assert!(!watch.record_send(false, true), "unarmed: silence is not evidence");
+            // Never answered, so never promptly answered either.
+            assert!(!watch.record_send(false, false), "unarmed: silence is not evidence");
         }
         assert!(!watch.armed());
         assert!(watch.unanswered() >= KEEP_ALIVE_MISSED_LIMIT, "the strikes are still counted");
@@ -2137,10 +2178,11 @@ mod liveness_tests {
 
     /// An answer that arrives in a period where this client also sent input
     /// proves nothing about Refresh Rect - the server may have been
-    /// answering the input - so it does not arm the verdict. Only a quiet
-    /// period's answer does.
+    /// answering the input - and neither does one that merely arrived
+    /// *somewhere* in a 45-second period, which is any clock repaint. Only a
+    /// prompt answer on a quiet link arms the verdict.
     #[test]
-    fn only_an_answer_on_a_quiet_link_arms_the_verdict() {
+    fn only_a_prompt_answer_on_a_quiet_link_arms_the_verdict() {
         let mut watch = KeepAliveWatch::default();
         watch.record_send(true, false);
         assert!(!watch.record_send(true, false), "busy period: answered, but not evidence");
@@ -2150,6 +2192,35 @@ mod liveness_tests {
         // And once armed it stays armed through answered periods of any kind.
         watch.record_send(true, false);
         assert!(watch.armed());
+    }
+
+    /// The window that separates "answered our refresh" from "repainted its
+    /// clock at some point in the last minute". It has to be far shorter
+    /// than any sane keep-alive interval or it means nothing.
+    #[test]
+    fn the_answer_window_is_much_shorter_than_the_interval() {
+        assert!(KEEP_ALIVE_ANSWER_WINDOW < std::time::Duration::from_secs(5));
+        let shortest_allowed =
+            std::time::Duration::from_secs(agent_rdp_protocol::KEEP_ALIVE_MIN_SECS);
+        assert!(
+            KEEP_ALIVE_ANSWER_WINDOW * 4 <= shortest_allowed,
+            "the window must stay a small fraction of even the shortest interval"
+        );
+    }
+
+    /// A server whose only inbound traffic is unsolicited (a clock repaint
+    /// landing mid-period) never arms the verdict: the processor only
+    /// reports a prompt answer, and this is what it does with one.
+    #[test]
+    fn late_traffic_clears_strikes_without_arming() {
+        let mut watch = KeepAliveWatch::default();
+        watch.record_send(true, false);
+        for _ in 0..10 {
+            // Answered somewhere in the period, never promptly.
+            assert!(!watch.record_send(true, false));
+            assert!(!watch.armed(), "unsolicited traffic is not evidence");
+            assert_eq!(watch.unanswered(), 0, "but it does keep the session alive");
+        }
     }
 
     #[test]

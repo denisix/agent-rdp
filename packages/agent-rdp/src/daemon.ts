@@ -153,7 +153,9 @@ export class DaemonManager {
    * name, so after an upgrade a stale daemon would otherwise keep serving the
    * old code - including the automation scripts it embeds - indefinitely.
    */
-  async ensureRunning(options: { replaceStale?: boolean } = {}): Promise<IpcClient> {
+  async ensureRunning(
+    options: { replaceStale?: boolean; allowStale?: boolean } = {},
+  ): Promise<IpcClient> {
     const pid = this.runningPid();
     if (pid !== null) {
       const client = new IpcClient(this.session);
@@ -161,6 +163,13 @@ export class DaemonManager {
 
       const staleVersion = await this.staleDaemonVersion(client);
       if (staleVersion === null) {
+        return client;
+      }
+      // `disconnect` must always work, whatever version answers it: it is
+      // how a caller gets out of a mismatch, and refusing it would leave the
+      // only exit as a `connect` that needs credentials and opens a new
+      // session to close the old one.
+      if (options.allowStale) {
         return client;
       }
       // Only `connect` replaces a version-mismatched daemon, matching the

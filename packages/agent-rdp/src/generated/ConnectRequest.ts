@@ -87,7 +87,7 @@ keep_alive_secs: number,
  * survived an earlier drop is still adopted - only the Win+R launch is
  * skipped. For a shared desktop where the caller wants to choose the
  * moment the Run dialog appears; `automate restart` launches it. Only
- * meaningful with `enable_automation`; the daemon refuses the pair
+ * meaningful with `enable_win_automation`; the daemon refuses the pair
  * `defer_agent` without it rather than ignoring the flag.
  */
 defer_agent: boolean, };

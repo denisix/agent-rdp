@@ -1197,11 +1197,14 @@ function Invoke-FileWriteChunk {
     # sidecar is removed before the error goes back, so a failed push does
     # not park a partial file on the remote disk until the next push to the
     # same path sweeps it.
+    # Outside the try below: this is our own message, not a .NET failure, and
+    # wrapping it would prefix it with a useless exception type.
+    if ($Params.first -and (Test-Path -LiteralPath $path -PathType Container)) {
+        throw "Cannot write '$path': it is a directory"
+    }
+
     try {
         if ($Params.first) {
-            if (Test-Path -LiteralPath $path -PathType Container) {
-                throw "Cannot write '$path': it is a directory"
-            }
             $dir = Split-Path -Parent $path
             # Not New-Item: it has no -LiteralPath, and a parent directory
             # with [brackets] in its name is a wildcard to it.

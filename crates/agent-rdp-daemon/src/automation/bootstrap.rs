@@ -929,6 +929,26 @@ impl AutomationBootstrap {
                 }
                 Self::record_ready(&mut state);
                 state.adopted = true;
+                let ipc = state.dvc_ipc.clone();
+                drop(state);
+                // Say something to it. The agent measures its "no client"
+                // window from the first failure and restarts it on the first
+                // message it *receives* - a handshake it merely wrote into a
+                // channel with nobody behind it proves nothing. Without a
+                // request here, an agent adopted late in its window would
+                // keep the old one and exit minutes into a session that is
+                // using it.
+                if let Some(ipc) = ipc {
+                    if let Err(e) = ipc
+                        .send_request_with_timeout(
+                            &agent_rdp_protocol::AutomateRequest::Status,
+                            Duration::from_secs(10),
+                        )
+                        .await
+                    {
+                        debug!("Adopted agent did not answer the post-adoption status: {}", e);
+                    }
+                }
                 info!(
                     "Adopted the automation agent that survived the last drop (pid {}, version {}) \
                      - no Win+R was typed on the remote desktop",

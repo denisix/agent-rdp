@@ -177,4 +177,15 @@ export class IpcClient {
   isConnected(): boolean {
     return this.socket !== null;
   }
+
+  /**
+   * Whether this connection can still carry a request.
+   *
+   * False once a request timed out on it: the daemon's reply to that request
+   * is still coming, and handing it to the next call would answer one
+   * question with another's result. The caller replaces the connection.
+   */
+  isUsable(): boolean {
+    return this.socket !== null && !this.desynchronized;
+  }
 }

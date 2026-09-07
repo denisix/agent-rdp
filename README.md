@@ -466,9 +466,10 @@ declared dead after three unanswered refreshes in a row (about 2.25 minutes
 at the default interval). Before these, detection fell back to the OS
 retransmission timeout or to nothing at all: four to eighteen minutes during
 which `screenshot` kept succeeding against a stale frame. The second rule
-arms itself first: it fires only once a refresh has been answered on an
-otherwise idle link, so a server that never answers one (the protocol allows
-it) is never declared dead for it. `AGENT_RDP_NO_SILENCE_DROP=1` disables the
+arms itself first: it fires only once a refresh has been answered within two
+seconds on an otherwise idle link, so a server that never answers one (the
+protocol allows it) is never declared dead for it, and an unsolicited repaint
+is not mistaken for an answer. `AGENT_RDP_NO_SILENCE_DROP=1` disables the
 verdict while keeping the traffic; `--keep-alive-secs 0` disables both. Since
 the interval is also the liveness window, a non-zero value below 10 seconds
 is refused.

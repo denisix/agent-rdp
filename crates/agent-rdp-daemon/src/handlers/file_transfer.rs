@@ -61,6 +61,11 @@ pub const TRANSFER_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// push. Best effort: the failure that got us here may be the channel itself.
 const ABORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// What a client should allow beyond `TRANSFER_BUDGET`: the post-budget
+/// abort, plus room for the reply to travel. The CLI derives its own timeout
+/// from this so the daemon is always the layer that gives up first.
+pub const CLI_TRANSFER_SLACK: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Per-request deadline within a transfer: the smaller of the step's own
 /// deadline and what is left of `TRANSFER_BUDGET`. `None` once the budget is
 /// gone.
@@ -68,8 +73,25 @@ fn step_timeout(
     step: std::time::Duration,
     started: std::time::Instant,
 ) -> Option<std::time::Duration> {
-    let remaining = TRANSFER_BUDGET.checked_sub(started.elapsed())?;
-    if remaining.is_zero() {
+    step_timeout_for(step, started.elapsed())
+}
+
+/// Smallest deadline worth giving a step. A request allowed only a few
+/// milliseconds always "times out", and a DVC timeout is reported as an
+/// indeterminate outcome ("the reply was lost, check before retrying") -
+/// which would be a confusing way to say the transfer simply ran out of
+/// budget.
+const MIN_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The budget arithmetic on its own, so it can be tested without an
+/// `Instant` in the past (subtracting from `Instant::now()` panics on a host
+/// that has been up for less than the amount subtracted - a fresh CI runner).
+fn step_timeout_for(
+    step: std::time::Duration,
+    elapsed: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let remaining = TRANSFER_BUDGET.checked_sub(elapsed)?;
+    if remaining < MIN_STEP_TIMEOUT {
         return None;
     }
     Some(step.min(remaining))
@@ -122,8 +144,8 @@ fn check_remote_path(remote: &str) -> Result<(), Response> {
         return Err(Response::error(
             ErrorCode::InvalidRequest,
             format!(
-                "Remote path '{}' must be absolute (like C:\\\\path\\\\file.txt or \
-                 \\\\\\\\server\\\\share\\\\file.txt): a relative path is resolved against the \
+                "Remote path '{}' must be absolute (like C:\\path\\file.txt or \
+                 \\\\server\\share\\file.txt): a relative path is resolved against the \
                  automation agent's working directory, not any directory you chose.",
                 remote
             ),
@@ -202,6 +224,12 @@ fn changed_advice(attempt: u32, size: u64, elapsed: std::time::Duration) -> Stri
 /// partial file: into a sibling temp file first, then renamed into place.
 /// A `write` straight to the path left a truncated file behind on a full
 /// disk, and let a local poller read half a file mid-write.
+///
+/// Rename semantics, which differ from the in-place write this replaced: a
+/// destination that is a symlink is *replaced*, not followed, and the file
+/// ends up with the temp file's permissions and owner rather than the old
+/// file's. For a transfer destination that is what a caller expects; it is
+/// worth knowing if the path is a symlink into somewhere else on purpose.
 async fn write_local_atomically(local_path: &str, data: &[u8]) -> std::io::Result<()> {
     let path = std::path::Path::new(local_path);
     if let Some(parent) = path.parent() {
@@ -1242,31 +1270,54 @@ mod push_integrity_tests {
     /// finishing a push minutes after the caller was told it timed out.
     #[test]
     fn a_step_never_outlives_the_transfer_budget() {
-        let now = std::time::Instant::now();
+        use std::time::Duration;
         // Fresh transfer: the step's own deadline applies.
-        assert_eq!(step_timeout(CHUNK_TIMEOUT, now), Some(CHUNK_TIMEOUT));
-        assert_eq!(step_timeout(VERIFY_TIMEOUT, now), Some(VERIFY_TIMEOUT));
+        assert_eq!(step_timeout_for(CHUNK_TIMEOUT, Duration::ZERO), Some(CHUNK_TIMEOUT));
+        assert_eq!(step_timeout_for(VERIFY_TIMEOUT, Duration::ZERO), Some(VERIFY_TIMEOUT));
 
         // Near the end of the budget the step is clipped to what remains.
-        let nearly_done = now - (TRANSFER_BUDGET - std::time::Duration::from_secs(10));
-        let clipped = step_timeout(VERIFY_TIMEOUT, nearly_done).expect("some budget left");
-        assert!(clipped <= std::time::Duration::from_secs(10));
-        assert!(clipped > std::time::Duration::ZERO);
+        let spent_all_but = TRANSFER_BUDGET - Duration::from_secs(10);
+        let clipped = step_timeout_for(VERIFY_TIMEOUT, spent_all_but).expect("some budget left");
+        assert_eq!(clipped, Duration::from_secs(10));
 
-        // Past it, there is no step to take.
-        let spent = now - (TRANSFER_BUDGET + std::time::Duration::from_secs(1));
-        assert_eq!(step_timeout(CHUNK_TIMEOUT, spent), None);
+        // A sliver of budget is not a step: a two-second deadline would time
+        // out and be reported as an indeterminate outcome.
+        assert_eq!(step_timeout_for(CHUNK_TIMEOUT, TRANSFER_BUDGET - Duration::from_secs(2)), None);
+
+        // Past it, there is no step to take, and no underflow.
+        assert_eq!(step_timeout_for(CHUNK_TIMEOUT, TRANSFER_BUDGET), None);
+        assert_eq!(
+            step_timeout_for(CHUNK_TIMEOUT, TRANSFER_BUDGET + Duration::from_secs(60)),
+            None
+        );
+
+        // And the live wrapper agrees for a transfer that just started.
+        assert_eq!(
+            step_timeout(CHUNK_TIMEOUT, std::time::Instant::now()),
+            Some(CHUNK_TIMEOUT)
+        );
 
         let text = budget_exhausted("Push", 4, 700, "C:\\big.iso");
         assert!(text.contains("4/700"));
         assert!(text.contains(&TRANSFER_BUDGET.as_secs().to_string()));
     }
 
-    /// The CLI and watchdog budgets are derived from `TRANSFER_BUDGET`; a
-    /// change here has to leave room for the reply to travel.
+    /// The daemon must give up before the CLI does, so the caller gets the
+    /// daemon's explanation rather than a bare socket timeout - and before
+    /// the agent's stale-sidecar sweep, or a live transfer's own sidecar
+    /// could be swept out from under it.
     #[test]
-    fn the_daemon_budget_leaves_the_cli_room() {
-        assert!(TRANSFER_BUDGET < std::time::Duration::from_secs(10 * 60));
+    fn the_daemon_budget_gives_up_first() {
+        assert!(
+            ABORT_TIMEOUT < CLI_TRANSFER_SLACK,
+            "the post-budget abort ({:?}) must fit in the slack ({:?}) the CLI adds",
+            ABORT_TIMEOUT,
+            CLI_TRANSFER_SLACK
+        );
+        assert!(
+            TRANSFER_BUDGET < std::time::Duration::from_secs(10 * 60),
+            "and inside the agent's 10-minute stale-sidecar cutoff"
+        );
         assert!(TRANSFER_BUDGET > VERIFY_TIMEOUT);
     }
 
@@ -1274,13 +1325,21 @@ mod push_integrity_tests {
     /// carrying the local hash as though the remote had confirmed it.
     #[test]
     fn a_pull_with_no_remote_hash_is_refused() {
+        // The agent's stat always reports one, which is why this is a
+        // backstop rather than a live path.
         let script = include_str!("../automation/scripts/lib/actions.ps1");
-        // The agent always reports one, which is why this is a backstop.
-        assert!(script.contains("sha256 ="));
-        // And the daemon refuses rather than trusting itself.
+        let stat = script.split("function Invoke-FileStat").nth(1).expect("Invoke-FileStat");
+        assert!(stat.contains("Get-FileHash"), "the stat is what supplies the hash");
+        // And the daemon refuses rather than reporting its own hash back.
         let source = include_str!("file_transfer.rs");
-        assert!(source.contains("if remote_sha256.is_empty()"));
-        assert!(source.contains("could not be verified"));
+        let pull = source.split("async fn pull_once").nth(1).expect("pull_once");
+        let body = &pull[..pull.find("async fn ready_ipc").unwrap_or(pull.len())];
+        assert!(body.contains("if remote_sha256.is_empty()"));
+        assert!(body.contains("TransferVerificationFailed"));
+        assert!(
+            body.find("if remote_sha256.is_empty()") < body.find("PullAttempt::Ok"),
+            "the refusal comes before any success is returned"
+        );
     }
 
     /// `file stat` is what every transfer error tells the caller to run, so

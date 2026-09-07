@@ -82,8 +82,12 @@ Counted per send, not by elapsed time: the processor services RDPDR I/O
 synchronously, so a wedged file operation stalls this loop for minutes with
 the server healthy, and a time-based rule killed the session the instant the
 stall ended. The verdict also **arms itself**: it fires only after a refresh
-was answered in a period where the client sent nothing else
-(`client_sent_since_keep_alive` feeds `record_send`'s second argument). The
+was answered *within `KEEP_ALIVE_ANSWER_WINDOW`* (2s) on a link where the
+client sent nothing else. Both halves matter - `last_frame_at` moves for any
+inbound PDU, so "something arrived during the last 45s" is satisfied by a
+clock repaint and would arm against the very server the arming exists to
+protect. Only the first PDU after a send is considered, and only if prompt.
+The
 protocol lets a server that never advertised `refreshRectSupport` ignore the
 PDU, and declaring such a server dead would reconnect - and retype Win+R -
 every few minutes forever. `AGENT_RDP_NO_SILENCE_DROP` disables the verdict

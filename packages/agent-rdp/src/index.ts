@@ -72,6 +72,14 @@ const TRANSFER_TIMEOUT_MS = 570_000;
 /** The daemon's spawn deadline for a detached `run`. */
 const SPAWN_TIMEOUT_MS = 90_000;
 
+/**
+ * Slack over the daemon's own deadline for a command, so the daemon is the
+ * layer that gives up first and the caller gets its explanation rather than
+ * a bare socket timeout. A caller's short `timeout` must not undercut this,
+ * which is why it is a floor and not an addition.
+ */
+const DAEMON_SLACK_MS = 30_000;
+
 /** Socket timeout for one request: the base, extended per command. */
 export function requestTimeout(request: Request, base: number): number {
   switch (request.type) {
@@ -81,21 +89,24 @@ export function requestTimeout(request: Request, base: number): number {
       return Math.max(base, RESTART_TIMEOUT_MS);
     case 'file_push':
     case 'file_pull':
-      return base + TRANSFER_TIMEOUT_MS;
+      return Math.max(base, DAEMON_SLACK_MS) + TRANSFER_TIMEOUT_MS;
     case 'automate': {
       const op = request as { op?: string; wait?: boolean; timeout_ms?: number };
-      // A remote command's own budget is the daemon's; this must clear it.
+      // A remote command's own budget is the daemon's, which allows itself
+      // some margin past it; this must clear both.
       if (op.op === 'run') {
-        return op.wait ? base + (op.timeout_ms ?? 10_000) : base + SPAWN_TIMEOUT_MS;
+        return op.wait
+          ? Math.max(base, DAEMON_SLACK_MS) + (op.timeout_ms ?? 10_000)
+          : Math.max(base, DAEMON_SLACK_MS) + SPAWN_TIMEOUT_MS;
       }
       if (op.op === 'wait_for') {
-        return base + (op.timeout_ms ?? 30_000);
+        return Math.max(base, DAEMON_SLACK_MS) + (op.timeout_ms ?? 30_000);
       }
       return base;
     }
     case 'locate': {
       const wait = (request as { wait_ms?: number }).wait_ms;
-      return wait ? base + wait : base;
+      return wait ? Math.max(base, DAEMON_SLACK_MS) + wait : base;
     }
     default:
       return base;
@@ -694,8 +705,27 @@ export class RdpSession {
    * Disconnect from the RDP server.
    */
   async disconnect(): Promise<void> {
-    await this._send({ type: 'disconnect' });
-    await this.close();
+    // Must work against any daemon version, like the CLI's: this is the way
+    // out of a version mismatch, and the IPC connection is closed either
+    // way so a failure here cannot strand one.
+    try {
+      if (this.client && !this.client.isUsable()) {
+        await this.client.close();
+        this.client = null;
+      }
+      if (!this.client) {
+        this.client = await this.daemon.ensureRunning({ allowStale: true });
+      }
+      const response = await this.client.send({ type: 'disconnect' }, this.timeout);
+      if (!response.success) {
+        throw new RdpError(
+          response.error?.code ?? 'internal_error',
+          response.error?.message ?? 'Unknown error',
+        );
+      }
+    } finally {
+      await this.close();
+    }
   }
 
   /**
@@ -724,6 +754,14 @@ export class RdpSession {
    * @internal
    */
   async _send(request: Request): Promise<Response> {
+    // A connection abandoned by a timed-out request still has that reply
+    // coming, so it cannot carry another one. Replace it rather than
+    // refusing every later call - including `disconnect()`, which is exactly
+    // what a caller reaches for after a timeout.
+    if (this.client && !this.client.isUsable()) {
+      await this.client.close();
+      this.client = null;
+    }
     if (!this.client) {
       // Auto-connect to daemon if not connected
       this.client = await this.daemon.ensureRunning();

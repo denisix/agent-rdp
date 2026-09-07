@@ -13,7 +13,9 @@ use crate::session_manager::SessionManager;
 /// and the CLI reports the daemon's verdict rather than a bare timeout while
 /// the daemon quietly finishes the push behind it.
 pub const TRANSFER_TIMEOUT_MS: u64 =
-    agent_rdp_daemon::handlers::file_transfer::TRANSFER_BUDGET.as_millis() as u64 + 30_000;
+    (agent_rdp_daemon::handlers::file_transfer::TRANSFER_BUDGET.as_millis()
+        + agent_rdp_daemon::handlers::file_transfer::CLI_TRANSFER_SLACK.as_millis())
+        as u64;
 
 /// Resolve a local path against *this* process's working directory.
 ///

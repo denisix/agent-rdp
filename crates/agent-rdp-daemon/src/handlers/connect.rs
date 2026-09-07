@@ -363,20 +363,37 @@ pub async fn handle(
         );
     }
 
-    // A newer `connect` can have taken over during the bootstrap (a caller
-    // whose CLI timed out and tried again). It shut this session down
-    // gracefully, which stamps no drop reason - so without this check this
-    // handler would report success for a session that no longer exists and
-    // then clear the daemon's disconnect record on its behalf.
-    if session_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
-        return Response::error(
-            ErrorCode::ConnectionFailed,
-            format!(
-                "This connect to {} was superseded by a newer connect while its automation \
-                 agent was starting; the newer session is the live one.",
-                host
-            ),
-        );
+    // The session can also have been taken away without dying: a newer
+    // `connect` (a caller whose CLI timed out and tried again) or a
+    // `disconnect` from another caller. Both shut it down gracefully, which
+    // stamps no drop reason by design - so the only honest test is whether
+    // the daemon's slot still holds *this* session. Without it the handler
+    // reported success, and an automation error promising background
+    // retries, for a session that was already gone.
+    {
+        let session = rdp_session.lock().await;
+        let still_ours = session.as_ref().is_some_and(|s| drop_probe.watches(s));
+        if !still_ours {
+            let superseded =
+                session_generation.load(std::sync::atomic::Ordering::SeqCst) != generation;
+            return Response::error(
+                ErrorCode::ConnectionFailed,
+                if superseded {
+                    format!(
+                        "This connect to {} was superseded by another connect while its \
+                         automation agent was starting; whatever that one built is what the \
+                         daemon now holds.",
+                        host
+                    )
+                } else {
+                    format!(
+                        "The session to {} was disconnected while its automation agent was \
+                         starting, so this connect has nothing to report success about.",
+                        host
+                    )
+                },
+            );
+        }
     }
 
     Response::success(ResponseData::Connected {

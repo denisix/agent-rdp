@@ -304,9 +304,9 @@ one keep-alive interval plus that. A server that still ACKs at the TCP level
 but no longer runs RDP (the `ERROR_SEM_TIMEOUT` drops) is caught differently:
 each keep-alive is a refresh request the server answers, and three unanswered
 in a row (~2.25 minutes by default) declare it dead — previously that case sat
-undetected for up to 18 minutes. That rule only applies to servers that have
-been seen answering a refresh, so one that never does is left alone rather
-than reconnected in a loop. Until a drop surfaces, `screenshot` keeps
+undetected for up to 18 minutes. That rule only applies to servers seen
+answering a refresh promptly on an idle link, so one that never does is left
+alone rather than reconnected in a loop. Until a drop surfaces, `screenshot` keeps
 returning the last frame it has; once it has surfaced, `screenshot` and
 `locate` refuse instead of answering from a frozen framebuffer. `session
 info` reports the frame age against the keep-alive interval, and a frame much
