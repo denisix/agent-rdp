@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.19](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.18...agent-rdp-v0.7.19) (2026-09-07)
+
+
+### Bug Fixes
+
+* bind the silence verdict to a prompt answer, unbrick the SDK session ([77c3b14](https://github.com/denisix/agent-rdp/commit/77c3b141c1a3ecb340ab3a8c9e398b40e66b7e42))
+* refuse dead sessions, evict stale agents, bound transfers ([0c1c5e5](https://github.com/denisix/agent-rdp/commit/0c1c5e5f160d63ee496a391cfe05c0fa2d05eb66))
+
 ## [0.7.18](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.17...agent-rdp-v0.7.18) (2026-09-06)
 
 
