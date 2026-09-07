@@ -46,6 +46,49 @@ const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Deadline for the final chunk, which also hashes the whole file remotely.
 const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Bound on one whole transfer, both directions.
+///
+/// The per-chunk deadlines alone bound nothing useful: the largest allowed
+/// file is several hundred chunks, and a link slow enough to make each one
+/// take seconds runs the daemon past the point where the CLI has already
+/// given up and reported a timeout - after which the daemon still finished
+/// the push, and the destination changed minutes after the caller was told
+/// nothing happened. The CLI's own budget (`cli/commands/file.rs`) is derived
+/// from this constant so the daemon is always the layer that decides.
+pub const TRANSFER_BUDGET: std::time::Duration = std::time::Duration::from_secs(9 * 60);
+
+/// How long to spend telling the agent to discard a sidecar after a failed
+/// push. Best effort: the failure that got us here may be the channel itself.
+const ABORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Per-request deadline within a transfer: the smaller of the step's own
+/// deadline and what is left of `TRANSFER_BUDGET`. `None` once the budget is
+/// gone.
+fn step_timeout(
+    step: std::time::Duration,
+    started: std::time::Instant,
+) -> Option<std::time::Duration> {
+    let remaining = TRANSFER_BUDGET.checked_sub(started.elapsed())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(step.min(remaining))
+}
+
+/// The text for a transfer that ran out of `TRANSFER_BUDGET`.
+fn budget_exhausted(what: &str, done: usize, total: usize, path: &str) -> String {
+    format!(
+        "{} of '{}' exceeded the transfer budget of {}s after {}/{} chunk(s): the link is too \
+         slow for a file this size over the automation channel. Compress it, or move it \
+         through a mapped drive instead.",
+        what,
+        path,
+        TRANSFER_BUDGET.as_secs(),
+        done,
+        total
+    )
+}
+
 /// Reject a transfer whose paths cannot mean what the caller thinks.
 ///
 /// Both sides resolve relative paths against a working directory that is not
@@ -67,6 +110,14 @@ fn check_paths(local: &str, remote: &str) -> Result<(), Response> {
             ),
         ));
     }
+    check_remote_path(remote)
+}
+
+/// The remote half of `check_paths`, also applied to `file stat`: every
+/// transfer error tells the caller to check the destination with it, and a
+/// stat that quietly answered about a same-named file in the agent's own
+/// directory would send them to the wrong conclusion.
+fn check_remote_path(remote: &str) -> Result<(), Response> {
     if !is_absolute_windows_path(remote) {
         return Err(Response::error(
             ErrorCode::InvalidRequest,
@@ -124,6 +175,60 @@ fn pull_backoff(attempt: u32) -> std::time::Duration {
     PULL_RETRY_BASE * 2u32.pow(attempt.saturating_sub(1).min(8))
 }
 
+/// Why a changed pull was not retried again - "rewritten faster than it can
+/// be read" is only true after the retries were actually used up; a file too
+/// large to retry, or an agent too slow, was given up on after one read.
+fn changed_advice(attempt: u32, size: u64, elapsed: std::time::Duration) -> String {
+    if attempt >= PULL_ATTEMPTS {
+        "It is being rewritten faster than it can be read - pull a snapshot copy instead."
+            .to_string()
+    } else if size > PULL_RETRY_MAX_BYTES {
+        format!(
+            "Files over {} bytes are not re-read automatically - pull a snapshot copy, or \
+             re-run once the producer has finished writing it.",
+            PULL_RETRY_MAX_BYTES
+        )
+    } else {
+        format!(
+            "The read had already taken {}s, past the {}s retry limit - re-run once the \
+             producer has finished writing it.",
+            elapsed.as_secs(),
+            PULL_RETRY_MAX_ELAPSED.as_secs()
+        )
+    }
+}
+
+/// Write the pulled bytes so that a reader of the destination never sees a
+/// partial file: into a sibling temp file first, then renamed into place.
+/// A `write` straight to the path left a truncated file behind on a full
+/// disk, and let a local poller read half a file mid-write.
+async fn write_local_atomically(local_path: &str, data: &[u8]) -> std::io::Result<()> {
+    let path = std::path::Path::new(local_path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = path.with_file_name(format!(
+        ".{}.agent-rdp-{}.part",
+        file_name,
+        uuid::Uuid::new_v4()
+    ));
+    if let Err(e) = tokio::fs::write(&temp, data).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(e);
+    }
+    if let Err(e) = tokio::fs::rename(&temp, path).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// One `file pull` attempt: stat, read, verify.
 enum PullAttempt {
     Ok {
@@ -145,13 +250,23 @@ enum PullAttempt {
 /// Stat the remote file, read it whole, and verify it against the hash from
 /// that same stat. Every attempt re-stats: the freshness check and the hash
 /// both have to describe the bytes this attempt actually delivered.
-async fn pull_once(ipc: &crate::automation::DvcIpc, params: &FilePullRequest) -> PullAttempt {
+async fn pull_once(
+    ipc: &crate::automation::DvcIpc,
+    params: &FilePullRequest,
+    started: std::time::Instant,
+) -> PullAttempt {
     // Stat first: it tells us the size (so an oversized file is refused
     // before transferring any of it) and the remote hash to verify against.
+    let Some(stat_timeout) = step_timeout(VERIFY_TIMEOUT, started) else {
+        return PullAttempt::Failed(Response::error(
+            ErrorCode::Timeout,
+            budget_exhausted("Pull", 0, 0, &params.remote_path),
+        ));
+    };
     let stat = match ipc
         .send_request_with_timeout(
             &AutomateRequest::FileStat { path: params.remote_path.clone() },
-            VERIFY_TIMEOUT,
+            stat_timeout,
         )
         .await
     {
@@ -229,13 +344,21 @@ async fn pull_once(ipc: &crate::automation::DvcIpc, params: &FilePullRequest) ->
             length: CHUNK_BYTES as u64,
         };
 
-        let value = match ipc.send_request_with_timeout(&request, CHUNK_TIMEOUT).await {
+        let Some(chunk_timeout) = step_timeout(CHUNK_TIMEOUT, started) else {
+            let total = total_size.div_ceil(CHUNK_BYTES as u64) as usize;
+            return PullAttempt::Failed(Response::error(
+                ErrorCode::Timeout,
+                budget_exhausted("Pull", chunks as usize, total, &params.remote_path),
+            ));
+        };
+        let value = match ipc.send_request_with_timeout(&request, chunk_timeout).await {
             Ok(value) => value,
             Err(e) => {
                 return PullAttempt::Failed(Response::error(
                     ErrorCode::AutomationError,
                     format!(
-                        "Transfer failed at offset {} of '{}': {}",
+                        "Transfer failed at offset {} of '{}': {}. Nothing was written \
+                         locally; re-running is safe.",
                         data.len(),
                         params.remote_path,
                         e
@@ -281,7 +404,23 @@ async fn pull_once(ipc: &crate::automation::DvcIpc, params: &FilePullRequest) ->
     hasher.update(&data);
     let local_sha256 = hex_digest(hasher);
 
-    if !remote_sha256.is_empty() && remote_sha256 != local_sha256 {
+    // No hash from the stat means nothing was verified, and "verified" is
+    // what the result claims. A current agent always reports one (its stat
+    // fails outright if hashing does), so this is a backstop, but it must be
+    // a refusal - not a silent success carrying the local hash as if the
+    // remote had confirmed it.
+    if remote_sha256.is_empty() {
+        return PullAttempt::Failed(Response::error(
+            ErrorCode::TransferVerificationFailed,
+            format!(
+                "The agent reported no hash for '{}', so the {} bytes received could not be \
+                 verified. Nothing was written locally; reconnect to redeploy the agent.",
+                params.remote_path,
+                data.len()
+            ),
+        ));
+    }
+    if remote_sha256 != local_sha256 {
         return PullAttempt::Changed {
             remote: remote_sha256,
             local: local_sha256,
@@ -398,6 +537,7 @@ pub async fn handle_push(
     // transfer cannot leave a torn file where a good one used to be.
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let mut final_reply = None;
+    let started = std::time::Instant::now();
 
     for (index, chunk) in chunks.iter().enumerate() {
         let last = index + 1 == total_chunks;
@@ -411,9 +551,17 @@ pub async fn handle_push(
             // silently-corrupt file behind.
             sha256: last.then(|| sha256.clone()),
             transfer_id: transfer_id.clone(),
+            abort: false,
         };
 
-        let timeout = if last { VERIFY_TIMEOUT } else { CHUNK_TIMEOUT };
+        let step = if last { VERIFY_TIMEOUT } else { CHUNK_TIMEOUT };
+        let Some(timeout) = step_timeout(step, started) else {
+            abort_push(&ipc, &params.remote_path, &transfer_id).await;
+            return Response::error(
+                ErrorCode::Timeout,
+                budget_exhausted("Push", index, total_chunks, &params.remote_path),
+            );
+        };
         match ipc.send_request_with_timeout(&request, timeout).await {
             Ok(reply) => {
                 if last {
@@ -421,43 +569,26 @@ pub async fn handle_push(
                 }
             }
             Err(e) => {
-            // A push is safe to repeat: chunk 0 carries `first: true`, which
-            // truncates the remote file, so re-running starts from scratch
-            // rather than appending. Say so instead of the generic
-            // "retrying may apply it twice" the DVC layer attaches to every
-            // indeterminate outcome - for this command that warning is wrong
-            // and sent callers off to build gzip+clipboard workarounds.
-                // Honest about what a retry can do. A lost reply leaves the
-                // outcome unknown - the swap may already have happened - so
-                // the caller should look before retrying. An error the agent
-                // raised on the final step is deterministic for this input,
-                // and callers rebuilt their workflows around a "re-run" hint
-                // that could not help with it. Anything else is retryable.
-                let indeterminate = e.downcast_ref::<crate::automation::DvcIndeterminate>().is_some();
-                let advice = if indeterminate {
-                    "The outcome is unknown (the reply was lost): the swap into place may or \
-                     may not have happened. Check the destination with `file stat` before \
-                     deciding whether to re-run."
-                } else if last {
-                    "The agent rejected the final step (verification or the swap into \
-                     place) - that is deterministic for this input, so re-running will \
-                     produce the same error; report it with the sidecar name above."
-                } else {
-                    "Re-running is safe: the transfer restarts from the first chunk."
-                };
+                let indeterminate =
+                    e.downcast_ref::<crate::automation::DvcIndeterminate>().is_some();
+                // Every failure before the final chunk leaves the destination
+                // untouched by construction - the swap is the final chunk's
+                // last step - so a partial sidecar is all there is to clean
+                // up. Discard it here rather than leaving it to the agent's
+                // ten-minute sweep, which only runs on the next push to the
+                // same path.
+                if !last || !indeterminate {
+                    abort_push(&ipc, &params.remote_path, &transfer_id).await;
+                }
                 return Response::error(
                     ErrorCode::AutomationError,
                     format!(
-                        "Transfer failed on chunk {}/{} of '{}': {}. The destination was not \
-                         replaced - the transfer is assembled in a sidecar \
-                         ('{}.agent-rdp-{}.part') and only swapped in once it verifies. {}",
+                        "Transfer failed on chunk {}/{} of '{}': {}. {}",
                         index + 1,
                         total_chunks,
                         params.remote_path,
                         e,
-                        params.remote_path,
-                        transfer_id,
-                        advice
+                        push_failure_advice(last, indeterminate)
                     ),
                 );
             }
@@ -492,6 +623,54 @@ pub async fn handle_push(
         modified_unix: None,
         age_secs: None,
     }))
+}
+
+/// What a failed push's caller can do about it.
+///
+/// Honest about what a retry can do. Before the final chunk the destination
+/// is untouched by construction, whatever the error - so re-running is
+/// always safe there, lost reply or not. On the final chunk a lost reply
+/// leaves the outcome unknown (the swap may already have happened), so the
+/// caller should look before retrying; an error the agent raised there is
+/// usually deterministic for this input - but a lock or permission problem
+/// on the destination is in that set too, and those clear up, so say which.
+fn push_failure_advice(last: bool, indeterminate: bool) -> &'static str {
+    if !last {
+        "The destination was not touched: the transfer is assembled in a sidecar and only \
+         swapped into place after the final chunk verifies, and that chunk was never sent. \
+         The partial sidecar was discarded. Re-running is safe."
+    } else if indeterminate {
+        "The outcome is unknown (the reply to the final chunk was lost): the verified file \
+         may or may not have been swapped into place. Check the destination with `file \
+         stat` before deciding whether to re-run."
+    } else {
+        "The agent rejected the final step (write, verification or the swap into place) \
+         and discarded the staged copy; the destination was not replaced. Re-running \
+         only helps if the error names something that has since changed - a file held \
+         open by another program, or a permission - otherwise the same input produces \
+         the same error."
+    }
+}
+
+/// Tell the agent to discard a failed push's sidecar. Best effort and
+/// bounded: the failure that led here may be the channel itself, and a
+/// cleanup that cannot get through must not hold the error message hostage.
+async fn abort_push(ipc: &DvcIpc, remote_path: &str, transfer_id: &str) {
+    let request = AutomateRequest::FileWriteChunk {
+        path: remote_path.to_string(),
+        data_b64: String::new(),
+        first: false,
+        last: false,
+        sha256: None,
+        transfer_id: transfer_id.to_string(),
+        abort: true,
+    };
+    if let Err(e) = ipc.send_request_with_timeout(&request, ABORT_TIMEOUT).await {
+        warn!(
+            "Could not discard the sidecar of failed transfer {} to '{}': {}",
+            transfer_id, remote_path, e
+        );
+    }
 }
 
 /// Check the agent's report of the finished file against what was sent.
@@ -583,7 +762,7 @@ pub async fn handle_pull(
     let started = std::time::Instant::now();
     let (data, chunks, local_sha256, freshness) = loop {
         attempt += 1;
-        match pull_once(&ipc, &params).await {
+        match pull_once(&ipc, &params, started).await {
             PullAttempt::Ok { data, chunks, sha256, freshness } => {
                 break (data, chunks, sha256, freshness)
             }
@@ -596,9 +775,12 @@ pub async fn handle_pull(
                         ErrorCode::FileChangedDuringTransfer,
                         format!(
                             "'{}' changed while it was being transferred ({} attempt(s)): \
-                             remote hash {}, received {}. It is being rewritten faster than \
-                             it can be read - pull a snapshot copy instead.",
-                            params.remote_path, attempt, remote, local
+                             remote hash {}, received {}. {}",
+                            params.remote_path,
+                            attempt,
+                            remote,
+                            local,
+                            changed_advice(attempt, size, started.elapsed())
                         ),
                     );
                 }
@@ -614,15 +796,16 @@ pub async fn handle_pull(
         }
     };
 
-    if let Some(parent) = std::path::Path::new(&params.local_path).parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-    }
-    if let Err(e) = tokio::fs::write(&params.local_path, &data).await {
+    if let Err(e) = write_local_atomically(&params.local_path, &data).await {
         return Response::error(
             ErrorCode::InternalError,
-            format!("Cannot write '{}': {}", params.local_path, e),
+            format!(
+                "Cannot write '{}': {}. The {} bytes were received and verified; only the \
+                 local write failed, and the destination was left as it was.",
+                params.local_path,
+                e,
+                data.len()
+            ),
         );
     }
 
@@ -649,6 +832,10 @@ pub async fn handle_stat(
         Ok(ipc) => ipc,
         Err(response) => return response,
     };
+
+    if let Err(response) = check_remote_path(&params.remote_path) {
+        return response;
+    }
 
     let stat = match ipc
         .send_request_with_timeout(
@@ -957,8 +1144,17 @@ mod push_integrity_tests {
             !script.contains("::Replace($part, $path, $null)"),
             "`$null` becomes \"\" here and every overwrite fails"
         );
-        // The failure text names the sidecar, so a report can be acted on.
-        assert!(script.contains("staged as '$part'"));
+        // The failure text must not name a sidecar it has just deleted -
+        // it told callers to report a path that no longer existed.
+        assert!(script.contains("the staged copy was discarded"));
+        assert!(
+            !script.contains("(staged as '$part')"),
+            "the sidecar is removed on failure; naming it sends the caller to a missing file"
+        );
+        // The real exception type, not PowerShell's MethodInvocationException
+        // wrapper, which named nothing useful.
+        assert!(script.contains("function Get-RootExceptionText"));
+        assert!(script.contains("Get-RootExceptionText $_"));
     }
 
     /// The daemon used to report the hash of the bytes it *sent* as though
@@ -1016,5 +1212,137 @@ mod push_integrity_tests {
             script.contains("carried no expected hash"),
             "a missing hash is a failure, not a skipped check"
         );
+    }
+
+    /// The advice a failed push returns. Before the final chunk nothing was
+    /// touched, whatever the error - the old text called a lost reply
+    /// indeterminate there and sent callers to `file stat` for a swap that
+    /// could not have happened.
+    #[test]
+    fn the_failure_advice_matches_what_actually_happened() {
+        let early_lost = push_failure_advice(false, true);
+        let early_error = push_failure_advice(false, false);
+        assert_eq!(early_lost, early_error, "before the last chunk the cause does not matter");
+        assert!(early_lost.contains("Re-running is safe"));
+        assert!(!early_lost.contains("unknown"));
+
+        let last_lost = push_failure_advice(true, true);
+        assert!(last_lost.contains("unknown"));
+        assert!(last_lost.contains("file stat"));
+
+        let last_error = push_failure_advice(true, false);
+        assert!(last_error.contains("was not replaced"));
+        // A lock or a permission clears up; "re-running cannot help" was
+        // wrong for exactly those.
+        assert!(last_error.contains("held open by another program"));
+    }
+
+    /// Every step of a transfer is bounded by what is left of the whole
+    /// budget, so the daemon gives up before the CLI does instead of
+    /// finishing a push minutes after the caller was told it timed out.
+    #[test]
+    fn a_step_never_outlives_the_transfer_budget() {
+        let now = std::time::Instant::now();
+        // Fresh transfer: the step's own deadline applies.
+        assert_eq!(step_timeout(CHUNK_TIMEOUT, now), Some(CHUNK_TIMEOUT));
+        assert_eq!(step_timeout(VERIFY_TIMEOUT, now), Some(VERIFY_TIMEOUT));
+
+        // Near the end of the budget the step is clipped to what remains.
+        let nearly_done = now - (TRANSFER_BUDGET - std::time::Duration::from_secs(10));
+        let clipped = step_timeout(VERIFY_TIMEOUT, nearly_done).expect("some budget left");
+        assert!(clipped <= std::time::Duration::from_secs(10));
+        assert!(clipped > std::time::Duration::ZERO);
+
+        // Past it, there is no step to take.
+        let spent = now - (TRANSFER_BUDGET + std::time::Duration::from_secs(1));
+        assert_eq!(step_timeout(CHUNK_TIMEOUT, spent), None);
+
+        let text = budget_exhausted("Push", 4, 700, "C:\\big.iso");
+        assert!(text.contains("4/700"));
+        assert!(text.contains(&TRANSFER_BUDGET.as_secs().to_string()));
+    }
+
+    /// The CLI and watchdog budgets are derived from `TRANSFER_BUDGET`; a
+    /// change here has to leave room for the reply to travel.
+    #[test]
+    fn the_daemon_budget_leaves_the_cli_room() {
+        assert!(TRANSFER_BUDGET < std::time::Duration::from_secs(10 * 60));
+        assert!(TRANSFER_BUDGET > VERIFY_TIMEOUT);
+    }
+
+    /// A pull whose hash could not be checked is a failure, not a success
+    /// carrying the local hash as though the remote had confirmed it.
+    #[test]
+    fn a_pull_with_no_remote_hash_is_refused() {
+        let script = include_str!("../automation/scripts/lib/actions.ps1");
+        // The agent always reports one, which is why this is a backstop.
+        assert!(script.contains("sha256 ="));
+        // And the daemon refuses rather than trusting itself.
+        let source = include_str!("file_transfer.rs");
+        assert!(source.contains("if remote_sha256.is_empty()"));
+        assert!(source.contains("could not be verified"));
+    }
+
+    /// `file stat` is what every transfer error tells the caller to run, so
+    /// it resolves the same absolute paths the transfers do.
+    #[test]
+    fn stat_checks_the_remote_path_like_a_transfer_does() {
+        assert!(check_remote_path("C:\\x\\y.txt").is_ok());
+        assert!(check_remote_path("\\\\host\\share\\y.txt").is_ok());
+        let refused = check_remote_path("report.json").expect_err("a relative path is refused");
+        assert!(!refused.success);
+        let source = include_str!("file_transfer.rs");
+        let stat = source.split("pub async fn handle_stat").nth(1).expect("handle_stat exists");
+        let body = &stat[..stat.find("pub struct Freshness").unwrap_or(stat.len())];
+        assert!(body.contains("check_remote_path"), "handle_stat must apply it");
+    }
+
+    /// A local write that fails leaves the previous file alone, and a
+    /// reader never sees a half-written one.
+    #[tokio::test]
+    async fn a_pull_writes_the_local_file_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested").join("out.bin");
+        write_local_atomically(target.to_str().unwrap(), b"hello")
+            .await
+            .expect("creates parents and writes");
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"hello");
+
+        // Overwriting leaves no temp files behind.
+        write_local_atomically(target.to_str().unwrap(), b"second").await.unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second");
+        let mut entries = tokio::fs::read_dir(target.parent().unwrap()).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, vec!["out.bin".to_string()], "no sidecar left behind");
+    }
+
+    /// The retry-exhausted message must say why it stopped: "rewritten
+    /// faster than it can be read" is only true after the retries ran.
+    #[test]
+    fn the_changed_file_advice_says_why_it_gave_up() {
+        let quick = std::time::Duration::from_secs(1);
+        assert!(changed_advice(PULL_ATTEMPTS, 1024, quick).contains("faster than it can be read"));
+        assert!(changed_advice(1, PULL_RETRY_MAX_BYTES + 1, quick).contains("not re-read"));
+        assert!(changed_advice(1, 1024, PULL_RETRY_MAX_ELAPSED).contains("retry limit"));
+    }
+
+    /// The agent has to understand the abort the daemon sends after a
+    /// failed push, or the sidecar stays on the remote disk.
+    #[test]
+    fn the_agent_handles_the_abort_chunk() {
+        let script = include_str!("../automation/scripts/lib/actions.ps1");
+        assert!(script.contains("if ($Params.abort)"));
+        assert!(script.contains("aborted = $true"));
+        // And it is checked before the payload is decoded: an abort carries none.
+        let write = script
+            .split("function Invoke-FileWriteChunk")
+            .nth(1)
+            .expect("the function exists");
+        let abort_at = write.find("$Params.abort").expect("abort branch");
+        let decode_at = write.find("FromBase64String").expect("decode");
+        assert!(abort_at < decode_at, "an abort must not need a payload");
     }
 }

@@ -21,6 +21,14 @@ pub async fn handle(
     clipboard_changed_rx: &ClipboardChangedRx,
     session_generation: &Arc<std::sync::atomic::AtomicU64>,
 ) -> Response {
+    // Refuse rather than reinterpret: a keep-alive interval short enough to
+    // make ordinary latency look like a dead server, or a deferral of an
+    // agent that was never asked for, would otherwise be honored silently
+    // and surface as a mystery later.
+    if let Err(reason) = agent_rdp_protocol::validate_connect_request(&params) {
+        return Response::error(ErrorCode::InvalidRequest, reason);
+    }
+
     let enable_automation = params.enable_win_automation;
     let stream_port = params.stream_port;
     let stream_bind = params.stream_bind.clone();
@@ -160,18 +168,27 @@ pub async fn handle(
     // closes the connection right after logon does exactly that. Reporting
     // "Connected" here is what left callers with a successful connect and a
     // disconnected session.
-    if let Some(reason) = rdp.drop_reason() {
-        return Response::error(
-            ErrorCode::ConnectionFailed,
-            format!("Connected to {} but the transport dropped immediately: {}", host, reason),
-        );
-    }
     let drop_probe = rdp.drop_probe();
     let connected_at = std::time::Instant::now();
 
-    // Store the session
+    // Store the session - unless it is already dead. Checked under the slot
+    // lock, not before taking it: `drop_reason` is stamped before the
+    // processor sends its drop notification, so a drop seen here was either
+    // stamped before this check (and the daemon's teardown, which runs
+    // whether or not the slot was filled, found an empty slot) or lands
+    // after the store (and the teardown finds the session in the slot).
+    // A check outside the lock left a gap between the two where a dead
+    // session was stored and nothing ever removed it.
     {
         let mut session = rdp_session.lock().await;
+        if let Some(reason) = rdp.drop_reason() {
+            drop(session);
+            let _ = rdp.disconnect().await;
+            return Response::error(
+                ErrorCode::ConnectionFailed,
+                format!("Connected to {} but the transport dropped immediately: {}", host, reason),
+            );
+        }
         *session = Some(rdp);
     }
 
@@ -272,6 +289,13 @@ pub async fn handle(
             // an earlier drop can still reattach on its own - only the Win+R
             // is withheld. Try to adopt one anyway: that costs the remote
             // desktop nothing, which is the whole point of the flag.
+            //
+            // Set before the adoption attempt, not after: evicting a stale
+            // survivor closes its channel, and the supervisor's close arm
+            // would otherwise arm a launch of its own five seconds later -
+            // Win+R typed on a desktop the caller explicitly said to leave
+            // alone. The flag is what `should_retry` checks.
+            automation_state.lock().await.launch_deferred = true;
             match crate::automation::adopt_only(automation_state).await {
                 true => automation_ready = Some(true),
                 false => {
@@ -335,6 +359,22 @@ pub async fn handle(
                 host,
                 connected_at.elapsed().as_secs(),
                 reason
+            ),
+        );
+    }
+
+    // A newer `connect` can have taken over during the bootstrap (a caller
+    // whose CLI timed out and tried again). It shut this session down
+    // gracefully, which stamps no drop reason - so without this check this
+    // handler would report success for a session that no longer exists and
+    // then clear the daemon's disconnect record on its behalf.
+    if session_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        return Response::error(
+            ErrorCode::ConnectionFailed,
+            format!(
+                "This connect to {} was superseded by a newer connect while its automation \
+                 agent was starting; the newer session is the live one.",
+                host
             ),
         );
     }

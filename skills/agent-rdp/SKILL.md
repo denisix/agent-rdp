@@ -6,7 +6,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.17. Check with `agent-rdp session info` (shows
+Tested against agent-rdp 0.7.19. Check with `agent-rdp session info` (shows
 both CLI and daemon versions, also in `--json` as `cli_version` /
 `daemon_version`) — a `daemon_version_mismatch` error means an older daemon
 survived an upgrade; run `connect` again to replace it.
@@ -154,14 +154,23 @@ slow to paint, not a dead session.
 **`file push`/`pull` take absolute paths.** Both are executed by the daemon and
 the remote agent, neither of which shares your working directory. The CLI and
 SDK make the local path absolute for you; a relative *remote* path is refused
-rather than written somewhere nobody looks. A push is staged beside the
-destination (`<path>.agent-rdp-<id>.part`, named in any error) and swapped in
-only after its hash is checked on both ends, so a failed transfer leaves the
-previous file intact; error text from the agent may be in the remote OS's
-language (it is a .NET message), with the exception type always in English.
-Stdout from `run` keeps Windows CRLF line endings; split on `\r?\n`.
-`transfer_verification_failed`
-means nothing was replaced.
+rather than written somewhere nobody looks — including for `file stat`, so
+the path you check is the path you pushed to. A push is staged beside the
+destination and swapped in only after its hash is checked on both ends, so a
+failed transfer leaves the previous file intact and the staged copy is
+discarded rather than left on the remote disk. The error says which of three
+situations you are in: before the final chunk nothing was touched and
+re-running is safe; a lost reply *to* the final chunk is the one case where
+the outcome is unknown, so check with `file stat` first; an agent-side
+rejection there is usually deterministic, unless it names something that
+changes (a file held open, a permission). Error text from the agent may be in
+the remote OS's language (it is a .NET message), with the exception type
+always in English. Stdout from `run` keeps Windows CRLF line endings; split
+on `\r?\n`. `transfer_verification_failed` means nothing was replaced.
+
+A pull writes the local file atomically (temp file, then rename), so a failed
+one leaves whatever was there before, and a `timeout` on a transfer is the
+daemon's own verdict — it stops too, rather than finishing minutes later.
 
 **Pulling a file while something rewrites it.** `file pull` hashes the remote
 file and then reads it — two separate remote operations, so a file being
@@ -277,9 +286,17 @@ foreground change — Win+R, paste, Enter into the Run dialog — so if someone
 else's automation shares that desktop it will notice. Two ways to avoid it:
 reconnect promptly (a fast reconnect finds the agent still there), and keep
 sessions alive so the drop does not happen (`connect --keep-alive-secs`,
-default 45s, 0 disables). `connect --defer-agent` skips the launch entirely: it
-still adopts a surviving agent, and otherwise leaves the agent down until you
-run `automate restart`.
+default 45s, 0 disables, and values between 1 and 9 are refused because the
+interval is also the liveness window). `connect --defer-agent` (which needs
+`--enable-win-automation`) skips the launch entirely: it still adopts a
+surviving agent, and otherwise leaves the agent down until you run `automate
+restart` — nothing launches on its own in the meantime, even if an outdated
+survivor had to be evicted first.
+
+A survivor is adopted only if it is running exactly the scripts this daemon
+ships, compared by hash. One that is not is asked to exit and is never talked
+to, so "adopted" in `automate status` always means an agent this version
+would have launched itself.
 
 **A dead transport is noticed within a few minutes.** The socket gives up on
 unacknowledged data after 30s, so a black-holed path surfaces within roughly
@@ -287,10 +304,14 @@ one keep-alive interval plus that. A server that still ACKs at the TCP level
 but no longer runs RDP (the `ERROR_SEM_TIMEOUT` drops) is caught differently:
 each keep-alive is a refresh request the server answers, and three unanswered
 in a row (~2.25 minutes by default) declare it dead — previously that case sat
-undetected for up to 18 minutes. Until it surfaces, `screenshot` keeps returning
-the last frame it has; `session info` reports the frame age against the
-keep-alive interval, and a frame much older than the interval on a live
-session usually points at the transport rather than an idle desktop.
+undetected for up to 18 minutes. That rule only applies to servers that have
+been seen answering a refresh, so one that never does is left alone rather
+than reconnected in a loop. Until a drop surfaces, `screenshot` keeps
+returning the last frame it has; once it has surfaced, `screenshot` and
+`locate` refuse instead of answering from a frozen framebuffer. `session
+info` reports the frame age against the keep-alive interval, and a frame much
+older than the interval on a live session usually points at the transport
+rather than an idle desktop.
 
 **Never use `connect` as a health check or a retry reflex.** `connect` is a
 session action: it tears down and rebuilds the RDP session (and, before

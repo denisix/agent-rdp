@@ -44,6 +44,8 @@ export class IpcClient {
   private buffer = '';
   private pendingResolve: ((response: Response) => void) | null = null;
   private pendingReject: ((error: Error) => void) | null = null;
+  /** A request timed out with its reply still in flight; see `send`. */
+  private desynchronized = false;
 
   constructor(private session: string) {}
 
@@ -116,6 +118,13 @@ export class IpcClient {
     if (!this.socket) {
       throw new RdpError('ipc_error', 'Not connected to daemon');
     }
+    if (this.desynchronized) {
+      throw new RdpError(
+        'ipc_error',
+        'This connection was abandoned by a timed-out request and cannot be reused; ' +
+          'the daemon may still answer it. Create a new session object.',
+      );
+    }
 
     return new Promise((resolve, reject) => {
       this.pendingResolve = resolve;
@@ -124,6 +133,14 @@ export class IpcClient {
       const timeoutId = setTimeout(() => {
         this.pendingResolve = null;
         this.pendingReject = null;
+        // The request was written and the daemon answers requests in order,
+        // so its reply is still coming - on this socket, with nobody
+        // waiting for it. Reusing the connection would hand that reply to
+        // the *next* call, which silently answered one question with
+        // another's result. Retire the socket instead.
+        this.desynchronized = true;
+        this.socket?.destroy();
+        this.socket = null;
         reject(new RdpError('timeout', 'Request timed out'));
       }, timeout);
 

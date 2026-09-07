@@ -59,6 +59,7 @@ async fn stop_running_agent(automation_state: &SharedAutomationState) {
     }
 
     info!("Asking the running automation agent to exit before relaunching");
+    let channel_id = dvc_state.lock().channel_id;
     let _ = ipc
         .send_request_with_timeout(
             &AutomateRequest::Shutdown,
@@ -66,9 +67,16 @@ async fn stop_running_agent(automation_state: &SharedAutomationState) {
         )
         .await;
 
+    // Answered or not, the caller asked for a *new* agent: release this one
+    // as primary now, so the replacement is accepted the moment it opens
+    // even if the old channel lingers (a slow Close PDU, or a long command
+    // queued ahead of the shutdown). Its eventual close is then ignored.
+    let Some(channel_id) = channel_id else { return };
+    dvc_state.lock().release_primary(channel_id);
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if dvc_state.lock().handshake.is_none() {
+        if !dvc_state.lock().extras.contains(&channel_id) {
             debug!("The previous automation agent exited");
             return;
         }
@@ -178,9 +186,12 @@ pub async fn handle_restart(
 /// the agent is down - it is how a caller learns *why* and whether a retry
 /// is scheduled.
 fn offline_status(state: &crate::automation::AutomationState) -> Response {
+    // A launch in progress is the most current fact: `last_error` describes
+    // why the previous agent went away, and reporting that ahead of "a
+    // launch is running" made a recovering session look stuck.
     let last_error = match (&state.last_error, state.relaunch_in_flight, state.dvc_ipc.is_some()) {
+        (_, true, _) => Some("a launch of the automation agent is in progress".to_string()),
         (Some(err), _, _) => Some(err.clone()),
-        (None, true, _) => Some("a launch of the automation agent is in progress".to_string()),
         (None, false, false) => Some(
             "automation DVC IPC not initialized (the automation directory or drive mapping failed at connect)"
                 .to_string(),

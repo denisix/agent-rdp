@@ -27,6 +27,9 @@ pub async fn handle(
                 return Response::error(ErrorCode::NotConnected, "Not connected to an RDP server");
             }
         };
+        if let Some(refusal) = crate::handlers::refuse_if_dropped(rdp) {
+            return refusal;
+        }
 
         let frame_age_ms = rdp.last_frame_age().as_millis() as u64;
         // Read together with the pixels below, under the same lock, so the

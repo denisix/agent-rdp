@@ -153,7 +153,7 @@ export class DaemonManager {
    * name, so after an upgrade a stale daemon would otherwise keep serving the
    * old code - including the automation scripts it embeds - indefinitely.
    */
-  async ensureRunning(): Promise<IpcClient> {
+  async ensureRunning(options: { replaceStale?: boolean } = {}): Promise<IpcClient> {
     const pid = this.runningPid();
     if (pid !== null) {
       const client = new IpcClient(this.session);
@@ -162,6 +162,19 @@ export class DaemonManager {
       const staleVersion = await this.staleDaemonVersion(client);
       if (staleVersion === null) {
         return client;
+      }
+      // Only `connect` replaces a version-mismatched daemon, matching the
+      // CLI. Doing it on any first call meant a `screenshot` after an
+      // upgrade killed a daemon holding a live RDP session (and the remote
+      // agent's channel with it) and then failed with `not_connected`.
+      if (!options.replaceStale) {
+        await client.close();
+        throw new RdpError(
+          'daemon_version_mismatch',
+          `The running daemon is version ${staleVersion}; this package expects a different one. ` +
+            'Call connect() to replace it - that is the one command allowed to end the ' +
+            'existing session.',
+        );
       }
       await this.replaceStaleDaemon(client, pid, staleVersion);
     }

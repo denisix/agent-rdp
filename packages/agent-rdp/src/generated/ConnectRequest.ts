@@ -74,6 +74,10 @@ serve_viewer: boolean,
  * after its own idle timeout (observed in the field at ~285s). TCP
  * keepalive alone did not prevent it. Each tick sends a Refresh Rect PDU,
  * which is real wire traffic with no input, focus or lock-key semantics.
+ *
+ * The interval is also the liveness window (three unanswered ticks end
+ * the session), so a non-zero value below `KEEP_ALIVE_MIN_SECS` is
+ * refused by the daemon rather than silently turned into false drops.
  */
 keep_alive_secs: number, 
 /**
@@ -82,6 +86,8 @@ keep_alive_secs: number,
  * The drive and the DVC channel are still set up, and an agent that
  * survived an earlier drop is still adopted - only the Win+R launch is
  * skipped. For a shared desktop where the caller wants to choose the
- * moment the Run dialog appears; `automate restart` launches it.
+ * moment the Run dialog appears; `automate restart` launches it. Only
+ * meaningful with `enable_automation`; the daemon refuses the pair
+ * `defer_agent` without it rather than ignoring the flag.
  */
 defer_agent: boolean, };

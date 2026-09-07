@@ -25,13 +25,39 @@ const SCRIPT_ACTIVITY_WINDOW: Duration = Duration::from_secs(30);
 pub fn launch_and_wait_worst_case() -> Duration {
     let mut total = Duration::ZERO;
     for attempt in 1..=LAUNCH_ATTEMPTS {
-        total += LAUNCH_FIXED_WAITS + AutomationBootstrap::handshake_window(attempt) * 2;
+        total += LAUNCH_FIXED_WAITS
+            + AutomationBootstrap::handshake_window(attempt) * 2
+            + HANDSHAKE_POLL_MAX_DELAY;
     }
     total
 }
 
+/// Upper bound on `automate restart`: evicting the running agent (a bounded
+/// `shutdown` request plus a bounded wait for its channel) before the full
+/// launch sequence, and the status probe of the new agent after it. The
+/// CLI's `RESTART_MIN_TIMEOUT_MS` is asserted against this.
+pub fn restart_worst_case() -> Duration {
+    STALE_AGENT_SHUTDOWN_REPLY + STALE_AGENT_EXIT_WAIT + launch_and_wait_worst_case() + STATUS_PROBE
+}
+
 /// Sleeps inside `launch_agent` (desktop settle, Run dialog, paste).
 const LAUNCH_FIXED_WAITS: Duration = Duration::from_millis(2000 + 300 + 2000 + 500);
+
+/// Longest sleep between two handshake polls. The window is only checked
+/// after a sleep, so each attempt can overshoot its window by this much -
+/// the worst-case budgets above account for it.
+const HANDSHAKE_POLL_MAX_DELAY: Duration = Duration::from_secs(5);
+
+/// How long an agent being evicted gets to answer `shutdown`.
+const STALE_AGENT_SHUTDOWN_REPLY: Duration = Duration::from_secs(5);
+
+/// How long after that its channel gets to close before a launch proceeds
+/// without waiting (the channel layer has already released it as primary).
+const STALE_AGENT_EXIT_WAIT: Duration = Duration::from_secs(5);
+
+/// The `automate status` probe `restart` makes of the new agent (the
+/// `DvcIpc` default request timeout).
+const STATUS_PROBE: Duration = Duration::from_secs(10);
 
 /// How long `connect` waits for an agent that outlived the previous
 /// transport drop to re-open its channel, before typing Win+R for a new one.
@@ -52,14 +78,16 @@ const SURVIVOR_POLL: Duration = Duration::from_millis(250);
 /// full launch sequence. Distinct from `launch_and_wait_worst_case`, which
 /// stays the bound for `automate restart` (it never waits for a survivor).
 pub fn connect_bootstrap_worst_case() -> Duration {
-    SURVIVOR_WAIT + launch_and_wait_worst_case()
+    // The survivor wait can end by finding a stale agent and evicting it,
+    // which is bounded separately from the wait itself.
+    SURVIVOR_WAIT + STALE_AGENT_SHUTDOWN_REPLY + STALE_AGENT_EXIT_WAIT + launch_and_wait_worst_case()
 }
 
 /// The agent version this daemon ships, parsed out of the embedded script.
 ///
-/// An adopted agent is a *previous* daemon's process, so it can predate an
-/// upgrade. Comparing against the script we would deploy is what keeps a
-/// stale agent from being adopted into a daemon whose protocol has moved on.
+/// Reported for diagnostics. It is *not* the adoption gate - that is
+/// `expected_build_id()`, because `$script:Version` names `agent.ps1` alone
+/// and a library file can change without a version bump.
 pub fn expected_agent_version() -> Option<String> {
     let marker = "$script:Version = \"";
     let start = AGENT_SCRIPT.find(marker)? + marker.len();
@@ -210,7 +238,7 @@ pub async fn launch_guarded(
     automation_state: &Arc<Mutex<AutomationState>>,
     adopt_first: bool,
 ) -> Result<(), String> {
-    {
+    let epoch = {
         let mut state = automation_state.lock().await;
         if !state.enabled {
             return Err("automation is not enabled for this session".to_string());
@@ -224,15 +252,18 @@ pub async fn launch_guarded(
         // Cleared up front: whatever comes out of this call, "adopted" must
         // describe the agent that ends up connected, not an earlier one.
         state.adopted = false;
-    }
+        // An explicit launch ends a deferral.
+        state.launch_deferred = false;
+        state.epoch
+    };
 
     let bootstrap = AutomationBootstrap::new(crate::get_session_dir(""));
     let result = bootstrap
-        .launch_and_wait(rdp_session, automation_state, adopt_first)
+        .launch_and_wait(rdp_session, automation_state, adopt_first, epoch)
         .await;
 
     let mut state = automation_state.lock().await;
-    finish_launch(&mut state, &result, std::time::Instant::now());
+    finish_launch(&mut state, &result, std::time::Instant::now(), epoch);
     result
 }
 
@@ -241,21 +272,26 @@ pub async fn launch_guarded(
 ///
 /// A transport drop during the bootstrap runs the daemon's teardown
 /// concurrently with the still-blocked `launch_and_wait`; `cleanup()` resets
-/// this same state object to `enabled = false` but does not touch
-/// `relaunch_in_flight`. When the abandoned launch finally resolves, recording
-/// its outcome would count a launch against a session that no longer exists -
-/// and `total_launches` is deliberately kept across `initialize()`, so the
-/// next connect would inherit the miscount. The flag is still reset
-/// unconditionally: `initialize()` resets it too, so nothing depends on this,
-/// but a state that says a launch is in flight when none is helps nobody.
-///
-/// Known gap, not closed here: this has no session-generation check, so an
-/// abandoned launch from a *replaced* session that resolves after a newer
-/// session has started its own launch clears that newer session's flag. A
-/// real fix threads a generation through `launch_guarded`/`adopt_only`/
-/// `launch_and_wait` the way `retry_snapshot` already does for the
-/// supervisor - a larger change than this pass makes.
-fn finish_launch(state: &mut AutomationState, result: &Result<(), String>, now: std::time::Instant) {
+/// this same state object, and a later `connect` re-`initialize()`s it and
+/// may start its own launch on it. When the abandoned launch finally
+/// resolves it must touch nothing: recording its outcome would count a
+/// launch (or a failure, arming a retry) against a session it never
+/// belonged to, and clearing `relaunch_in_flight` would defeat the newer
+/// session's own in-flight mutex. `epoch` is the launch's proof that the
+/// state is still the one it started under.
+fn finish_launch(
+    state: &mut AutomationState,
+    result: &Result<(), String>,
+    now: std::time::Instant,
+    epoch: u64,
+) {
+    if state.epoch != epoch {
+        debug!(
+            "A launch from automation epoch {} resolved under epoch {}; not recording it",
+            epoch, state.epoch
+        );
+        return;
+    }
     state.relaunch_in_flight = false;
     if state.enabled {
         record_launch_outcome(state, result, now);
@@ -269,14 +305,14 @@ fn finish_launch(state: &mut AutomationState, result: &Result<(), String>, now: 
 /// anything appearing on the remote desktop, but a survivor costs nothing to
 /// take. Guarded like a launch so it cannot race one.
 pub async fn adopt_only(automation_state: &Arc<Mutex<AutomationState>>) -> bool {
-    let dvc_state = {
+    let (dvc_state, epoch) = {
         let mut state = automation_state.lock().await;
         if !state.enabled || state.relaunch_in_flight {
             return false;
         }
         state.relaunch_in_flight = true;
         state.adopted = false;
-        state.dvc_state.clone()
+        (state.dvc_state.clone(), state.epoch)
     };
 
     let bootstrap = AutomationBootstrap::new(crate::get_session_dir(""));
@@ -289,11 +325,16 @@ pub async fn adopt_only(automation_state: &Arc<Mutex<AutomationState>>) -> bool 
     };
 
     let mut state = automation_state.lock().await;
+    // As in `finish_launch`: a state re-initialized underneath this wait
+    // belongs to a newer session, whose own bookkeeping this must not touch.
+    if state.epoch != epoch {
+        return false;
+    }
     state.relaunch_in_flight = false;
     // "No survivor" is not a failure - it must not arm a supervisor retry,
     // which would type Win+R on its own later - so only a success is ever
-    // recorded here. And, as in `finish_launch`, not against a state that a
-    // drop during the wait has already reset.
+    // recorded here. And not against a state that a drop during the wait
+    // has already reset.
     let adopted = adopted && state.enabled;
     if adopted {
         record_launch_outcome(&mut state, &Ok(()), std::time::Instant::now());
@@ -310,12 +351,14 @@ pub async fn relaunch_agent(
     rdp_session: &Arc<Mutex<Option<RdpSession>>>,
     automation_state: &Arc<Mutex<AutomationState>>,
 ) -> Result<(), String> {
+    let epoch = automation_state.lock().await.epoch;
     let result = launch_guarded(rdp_session, automation_state, false).await;
     if result.is_ok() {
         let mut state = automation_state.lock().await;
-        // Not for a launch whose session dropped underneath it - the same
-        // condition under which `finish_launch` recorded nothing.
-        if state.enabled {
+        // Not for a launch whose session dropped (or was rebuilt) underneath
+        // it - the same condition under which `finish_launch` recorded
+        // nothing.
+        if state.enabled && state.epoch == epoch {
             state.relaunches += 1;
         }
     }
@@ -335,6 +378,7 @@ pub struct RetrySnapshot {
     pub next_retry_at: Option<std::time::Instant>,
     pub last_input_age: Option<Duration>,
     pub auto_relaunch_disabled: bool,
+    pub launch_deferred: bool,
 }
 
 /// Whether the supervisor should launch the agent now; the reason not to,
@@ -347,6 +391,9 @@ pub fn should_retry(s: &RetrySnapshot, now: std::time::Instant) -> Result<(), &'
     }
     if s.auto_relaunch_disabled {
         return Err("automatic relaunch disabled by AGENT_RDP_NO_AUTO_RELAUNCH");
+    }
+    if s.launch_deferred {
+        return Err("launch deferred by --defer-agent (`automate restart` launches it)");
     }
     if !s.session_alive {
         return Err("RDP session is gone");
@@ -392,7 +439,15 @@ async fn retry_snapshot(
             None => (false, None),
         }
     };
-    let (enabled, relaunch_in_flight, handshake_done, next_retry_at, dvc_state, auto_relaunch_disabled) = {
+    let (
+        enabled,
+        relaunch_in_flight,
+        handshake_done,
+        next_retry_at,
+        dvc_state,
+        auto_relaunch_disabled,
+        launch_deferred,
+    ) = {
         let state = automation_state.lock().await;
         (
             state.enabled,
@@ -405,6 +460,7 @@ async fn retry_snapshot(
             state.next_retry_at,
             state.dvc_state.clone(),
             state.auto_relaunch_disabled,
+            state.launch_deferred,
         )
     };
     let agent_starting = match dvc_state {
@@ -421,6 +477,7 @@ async fn retry_snapshot(
         next_retry_at,
         last_input_age,
         auto_relaunch_disabled,
+        launch_deferred,
     }
 }
 
@@ -501,6 +558,11 @@ pub fn spawn_relaunch_supervisor(
                     .map(|s| s.lock().handshake.is_some())
                     .unwrap_or(false);
                 if state.enabled && !state.relaunch_in_flight && !agent_up {
+                    // The status fields must not keep describing the agent
+                    // that just left: `automate status` reads `agent_pid`
+                    // from here when the channel cannot be asked.
+                    state.agent_ready = false;
+                    state.agent_pid = None;
                     if state.next_retry_at.is_none() {
                         state.next_retry_at = Some(std::time::Instant::now());
                     }
@@ -589,18 +651,28 @@ impl AutomationBootstrap {
         // the relaunch supervisor (spawned by `connect` from `closed_rx`)
         // sees the channel end and exits.
         let dvc_state = new_shared_dvc_state();
-        let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
-        dvc_state.lock().closed_notify = Some(closed_tx);
+        {
+            let mut dvc = dvc_state.lock();
+            let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+            dvc.closed_notify = Some(closed_tx);
+            // The channel layer refuses any agent not running exactly these
+            // scripts, whichever order the agents open in.
+            dvc.expected_build_id = Some(expected_build_id());
+            state.closed_rx = Some(closed_rx);
+        }
         let dvc_ipc = DvcIpc::new(dvc_state.clone());
         state.dvc_state = Some(dvc_state);
         state.dvc_ipc = Some(dvc_ipc);
-        state.closed_rx = Some(closed_rx);
         state.relaunch_in_flight = false;
         state.relaunches = 0;
         state.last_error = None;
         state.next_retry_at = None;
         state.launch_failures = 0;
         state.auto_relaunch_disabled = auto_relaunch_disabled();
+        state.launch_deferred = false;
+        // A new epoch: launches from before this point belong to a session
+        // that is gone and must not touch what follows.
+        state.epoch = state.epoch.wrapping_add(1);
 
         state.enabled = true;
         info!(
@@ -701,15 +773,22 @@ impl AutomationBootstrap {
         window: Duration,
         rdp_session: &Arc<Mutex<Option<RdpSession>>>,
         baseline: Option<std::time::Instant>,
+        automation_state: &Arc<Mutex<AutomationState>>,
+        epoch: u64,
     ) -> anyhow::Result<()> {
         let started = std::time::Instant::now();
         let mut delay = Duration::from_millis(500);
-        let max_delay = Duration::from_secs(5);
+        let max_delay = HANDSHAKE_POLL_MAX_DELAY;
         let mut extended = false;
 
         loop {
             if Self::handshake_is_newer(dvc_state, baseline) {
                 return Ok(());
+            }
+            // The session dropped, or a newer connect rebuilt the state:
+            // nothing this wait could see would be its agent any more.
+            if automation_state.lock().await.epoch != epoch {
+                anyhow::bail!("the session this launch belonged to is gone");
             }
 
             let elapsed = started.elapsed();
@@ -865,17 +944,24 @@ impl AutomationBootstrap {
         automation_state: &Arc<Mutex<AutomationState>>,
     ) {
         let ipc = automation_state.lock().await.dvc_ipc.clone();
+        let channel_id = dvc_state.lock().channel_id;
         if let Some(ipc) = ipc {
             let _ = ipc
                 .send_request_with_timeout(
                     &agent_rdp_protocol::AutomateRequest::Shutdown,
-                    Duration::from_secs(5),
+                    STALE_AGENT_SHUTDOWN_REPLY,
                 )
                 .await;
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // Whether or not it answered, it is no longer the agent this daemon
+        // talks to: free the primary slot now so the agent about to be
+        // launched is accepted even if this one's channel lingers.
+        if let Some(channel_id) = channel_id {
+            dvc_state.lock().release_primary(channel_id);
+        }
+        let deadline = std::time::Instant::now() + STALE_AGENT_EXIT_WAIT;
         while std::time::Instant::now() < deadline {
-            if dvc_state.lock().handshake.is_none() {
+            if !dvc_state.lock().extras.contains(&channel_id.unwrap_or(u32::MAX)) {
                 return;
             }
             sleep(SURVIVOR_POLL).await;
@@ -914,6 +1000,7 @@ impl AutomationBootstrap {
         rdp_session: &Arc<Mutex<Option<RdpSession>>>,
         automation_state: &Arc<Mutex<AutomationState>>,
         adopt_first: bool,
+        epoch: u64,
     ) -> Result<(), String> {
         let mut last_reason = String::new();
 
@@ -929,6 +1016,15 @@ impl AutomationBootstrap {
             }
         }
 
+        // The one thing an abandoned launch must never do is type into a
+        // session it does not belong to: attempt 2 of a bootstrap whose
+        // transport dropped would otherwise drive the Run dialog of whatever
+        // session a later `connect` put in the slot, concurrently with that
+        // connect's own launch.
+        let gone = || async {
+            automation_state.lock().await.epoch != epoch
+        };
+
         // Whatever handshake is on the channel right now is the one this
         // launch has to replace, not accept - `None` only when the channel
         // is genuinely empty (a cold connect, or eviction above succeeded).
@@ -939,6 +1035,9 @@ impl AutomationBootstrap {
         let baseline = dvc_state.lock().handshake_at;
 
         for attempt in 1..=LAUNCH_ATTEMPTS {
+            if gone().await {
+                return Err("the session this launch belonged to is gone".to_string());
+            }
             // Attempt 2+: if the previous launch is visibly still starting,
             // wait for it instead of firing Win+R again.
             let launched = if attempt > 1 && Self::agent_is_starting(&dvc_state, rdp_session).await {
@@ -967,9 +1066,15 @@ impl AutomationBootstrap {
 
             if launched {
                 let window = Self::handshake_window(attempt);
-                match self.wait_for_handshake(&dvc_state, window, rdp_session, baseline).await {
+                match self
+                    .wait_for_handshake(&dvc_state, window, rdp_session, baseline, automation_state, epoch)
+                    .await
+                {
                     Ok(()) => {
                         let mut auto_state = automation_state.lock().await;
+                        if auto_state.epoch != epoch {
+                            return Err("the session this launch belonged to is gone".to_string());
+                        }
                         Self::record_ready(&mut auto_state);
                         return Ok(());
                     }
@@ -1021,6 +1126,10 @@ impl AutomationBootstrap {
         // The session that was adopted is over; a later `offline_status`
         // must not keep reporting it.
         state.adopted = false;
+        state.launch_deferred = false;
+        // Whatever launch is still blocked on this session's channel must
+        // not record itself against the next one.
+        state.epoch = state.epoch.wrapping_add(1);
 
         Ok(())
     }
@@ -1174,7 +1283,23 @@ mod tests {
             next_retry_at: Some(now - Duration::from_secs(1)),
             last_input_age: Some(RETRY_INPUT_QUIET + Duration::from_secs(1)),
             auto_relaunch_disabled: false,
+            launch_deferred: false,
         }
+    }
+
+    /// `connect --defer-agent` found a stale survivor and evicted it: the
+    /// channel closed, which arms a retry - and the supervisor must still
+    /// not type Win+R on a desktop the caller said to leave alone.
+    #[test]
+    fn a_deferred_launch_is_never_taken_by_the_supervisor() {
+        let now = std::time::Instant::now();
+        let mut snap = ready_snapshot(now);
+        assert_eq!(should_retry(&snap, now), Ok(()));
+        snap.launch_deferred = true;
+        assert_eq!(
+            should_retry(&snap, now),
+            Err("launch deferred by --defer-agent (`automate restart` launches it)")
+        );
     }
 
     /// The retry decision, case by case. The load-bearing ones: an
@@ -1391,6 +1516,7 @@ mod retry_edge_tests {
             next_retry_at: Some(now),
             last_input_age: None,
             auto_relaunch_disabled: true,
+            launch_deferred: false,
         };
         assert_eq!(
             should_retry(&snap, now),
@@ -1578,17 +1704,35 @@ mod survivor_tests {
         assert!(LIB_DVC.contains("build_id = $BuildId"));
     }
 
-    /// Connect pays for the survivor wait; restart never does, and its budget
-    /// has less headroom - conflating the two would push restart over.
+    /// Connect and restart bound different sequences: connect pays for the
+    /// survivor wait, restart for evicting the agent it replaces and probing
+    /// the new one. Both must exceed the bare launch, and each CLI budget is
+    /// asserted against its own function (see `watchdog_tests`).
     #[test]
-    fn connect_costs_the_survivor_wait_and_restart_does_not() {
+    fn connect_and_restart_each_bound_their_own_sequence() {
         let launch = launch_and_wait_worst_case();
         let connect = connect_bootstrap_worst_case();
-        assert_eq!(connect, launch + SURVIVOR_WAIT);
-        assert!(connect > launch);
+        let restart = restart_worst_case();
+        assert!(connect > launch + SURVIVOR_WAIT, "connect covers eviction too");
+        assert!(restart > launch, "restart covers eviction and the status probe");
         // Small enough that a cold connect, which pays it for nothing, does
         // not notice against a ~30s launch.
         assert!(SURVIVOR_WAIT <= Duration::from_secs(10));
+    }
+
+    /// Each handshake window is only checked after a poll sleep, so an
+    /// attempt can overshoot by one sleep; the worst case has to include it
+    /// or the CLI's budget is short by up to 15s across three attempts.
+    #[test]
+    fn the_worst_case_accounts_for_the_poll_overshoot() {
+        let windows: Duration = (1..=LAUNCH_ATTEMPTS)
+            .map(|a| AutomationBootstrap::handshake_window(a) * 2)
+            .sum();
+        let fixed = LAUNCH_FIXED_WAITS * LAUNCH_ATTEMPTS as u32;
+        assert_eq!(
+            launch_and_wait_worst_case(),
+            windows + fixed + HANDSHAKE_POLL_MAX_DELAY * LAUNCH_ATTEMPTS as u32
+        );
     }
 
     /// An adopted agent was not launched: nothing was typed on the remote
@@ -1677,6 +1821,7 @@ mod adoption_tests {
     use crate::automation::dvc_channel::DvcHandshake;
     use std::path::PathBuf;
     use std::time::Instant;
+    use tempfile::TempDir;
 
     fn handshake(build_id: Option<&str>) -> DvcHandshake {
         DvcHandshake {
@@ -1788,7 +1933,9 @@ mod adoption_tests {
         let closer = Arc::clone(&dvc);
         tokio::spawn(async move {
             sleep(Duration::from_millis(300)).await;
+            // What the channel layer's `close()` does for a released agent.
             let mut s = closer.lock();
+            s.extras.remove(&1);
             s.handshake = None;
             s.channel_id = None;
         });
@@ -1804,8 +1951,9 @@ mod adoption_tests {
     }
 
     /// The counter-example an adversarial review found: a stale survivor
-    /// that will *not* leave stays connected and ready-looking, with no
-    /// launch in flight. That state must never be reported as adopted.
+    /// that will *not* leave. It is released as primary the moment it is
+    /// told to go, so it can neither be mistaken for the live agent nor
+    /// block the replacement's channel, and it is never adopted.
     #[tokio::test]
     async fn a_stale_survivor_that_will_not_leave_is_still_not_adoptable() {
         let dvc = new_shared_dvc_state();
@@ -1826,7 +1974,8 @@ mod adoption_tests {
         // Exactly what `handlers::automate::handle` sees afterwards.
         let s = state.lock().await;
         let reachable = s.dvc_ipc.as_ref().map(|i| i.is_ready()).unwrap_or(false);
-        assert!(reachable, "the channel is still open - that is the whole problem");
+        assert!(!reachable, "the rejected agent no longer holds the primary slot");
+        assert!(dvc.lock().extras.contains(&1), "its channel is tracked, not forgotten");
         assert!(!s.agent_ready);
         assert!(!s.relaunch_in_flight);
         let build_matches = dvc
@@ -1845,6 +1994,48 @@ mod adoption_tests {
             ),
             "a flight-flag-only gate would have adopted this rejected agent"
         );
+    }
+
+    /// And the replacement launched right after such an eviction is
+    /// accepted: with the old channel released, the new agent's handshake
+    /// makes it primary instead of being refused as a second agent.
+    #[test]
+    fn a_replacement_is_accepted_after_the_stale_agent_is_released() {
+        use crate::automation::dvc_channel::AutomationDvc;
+        use ironrdp_dvc::DvcProcessor;
+
+        let dvc = new_shared_dvc_state();
+        dvc.lock().expected_build_id = Some(expected_build_id());
+        let mut processor = AutomationDvc::new(Arc::clone(&dvc));
+        processor.start(1).unwrap();
+        // The stale agent handshakes and is refused by the channel layer.
+        let stale = serde_json::to_vec(&serde_json::json!({
+            "type": "handshake",
+            "version": "1.7.0",
+            "agent_pid": 11,
+            "capabilities": [],
+            "build_id": "an-older-build",
+        }))
+        .unwrap();
+        let replies = processor.process(1, &stale).unwrap();
+        assert_eq!(replies.len(), 1, "it is told to exit");
+        assert!(dvc.lock().channel_id.is_none(), "and it is not the primary");
+
+        // The replacement opens a second channel and handshakes.
+        processor.start(2).unwrap();
+        let fresh = serde_json::to_vec(&serde_json::json!({
+            "type": "handshake",
+            "version": "1.8.0",
+            "agent_pid": 22,
+            "capabilities": [],
+            "build_id": expected_build_id(),
+        }))
+        .unwrap();
+        assert!(processor.process(2, &fresh).unwrap().is_empty(), "accepted, not shut down");
+        let s = dvc.lock();
+        assert_eq!(s.channel_id, Some(2));
+        assert_eq!(s.handshake.as_ref().unwrap().agent_pid, 22);
+        assert_eq!(s.stale_rejections, 1);
     }
 
     /// A survivor that handshakes after the session it would join has
@@ -1917,19 +2108,93 @@ mod adoption_tests {
         state.relaunch_in_flight = true;
         state.total_launches = 3;
         state.launch_failures = 2;
+        let epoch = state.epoch;
 
-        finish_launch(&mut state, &Ok(()), Instant::now());
+        finish_launch(&mut state, &Ok(()), Instant::now(), epoch);
         assert!(!state.relaunch_in_flight);
         assert_eq!(state.total_launches, 3, "must not count against the next host");
         assert_eq!(state.launch_failures, 2, "must not clear bookkeeping it does not own");
 
-        finish_launch(&mut state, &Err("late".into()), Instant::now());
+        finish_launch(&mut state, &Err("late".into()), Instant::now(), epoch);
         assert!(state.next_retry_at.is_none(), "must not arm a retry for a dead session");
 
         // Against a live session it records normally.
         state.enabled = true;
-        finish_launch(&mut state, &Ok(()), Instant::now());
+        finish_launch(&mut state, &Ok(()), Instant::now(), epoch);
         assert_eq!(state.total_launches, 4);
         assert_eq!(state.launch_failures, 0);
+    }
+
+    /// The case the epoch exists for: the session dropped, a newer connect
+    /// re-initialized the same state and started its own launch, and only
+    /// then does the abandoned launch resolve. It must neither release the
+    /// newer launch's in-flight flag nor record a failure against it.
+    #[test]
+    fn a_launch_from_an_older_epoch_touches_nothing() {
+        let mut state = AutomationState::new(PathBuf::from("/x"));
+        state.enabled = true;
+        let old_epoch = state.epoch;
+        // cleanup + initialize of the next session, which then launches.
+        state.epoch = state.epoch.wrapping_add(2);
+        state.relaunch_in_flight = true;
+        state.total_launches = 5;
+
+        finish_launch(&mut state, &Err("handshake timed out".into()), Instant::now(), old_epoch);
+        assert!(state.relaunch_in_flight, "the newer session's launch is still in flight");
+        assert_eq!(state.total_launches, 5);
+        assert_eq!(state.launch_failures, 0, "no failure recorded against the newer session");
+        assert!(state.next_retry_at.is_none());
+        assert!(state.last_error.is_none());
+
+        // The newer session's own launch records normally.
+        let current = state.epoch;
+        finish_launch(&mut state, &Ok(()), Instant::now(), current);
+        assert!(!state.relaunch_in_flight);
+        assert_eq!(state.total_launches, 6);
+    }
+
+    /// `initialize()` and `cleanup()` each move the epoch, so a launch
+    /// spanning a drop-and-reconnect can never match by accident.
+    #[tokio::test]
+    async fn initialize_and_cleanup_each_bump_the_epoch() {
+        let dir = TempDir::new().unwrap();
+        let bootstrap = AutomationBootstrap::new(dir.path().to_path_buf());
+        let mut state = AutomationState::new(dir.path().to_path_buf());
+        let e0 = state.epoch;
+        bootstrap.initialize(&mut state).await.unwrap();
+        let e1 = state.epoch;
+        assert_ne!(e0, e1);
+        assert!(!state.launch_deferred);
+        assert_eq!(
+            state.dvc_state.as_ref().unwrap().lock().expected_build_id.as_deref(),
+            Some(expected_build_id().as_str()),
+            "the channel layer is told which scripts to accept"
+        );
+        bootstrap.cleanup(&mut state).await.unwrap();
+        assert_ne!(state.epoch, e1);
+        assert!(!state.enabled);
+    }
+
+    /// A launch whose epoch is gone stops before typing anything: the
+    /// attempt loop refuses up front rather than driving the Run dialog of
+    /// a session it does not belong to.
+    #[tokio::test]
+    async fn a_launch_from_a_gone_epoch_refuses_before_typing() {
+        let dir = TempDir::new().unwrap();
+        let bootstrap = AutomationBootstrap::new(dir.path().to_path_buf());
+        let automation_state = Arc::new(Mutex::new(AutomationState::new(dir.path().to_path_buf())));
+        {
+            let mut s = automation_state.lock().await;
+            s.enabled = true;
+            s.dvc_state = Some(new_shared_dvc_state());
+            s.epoch = 4;
+        }
+        let rdp_session: Arc<Mutex<Option<RdpSession>>> = Arc::new(Mutex::new(None));
+        let started = Instant::now();
+        let result = bootstrap
+            .launch_and_wait(&rdp_session, &automation_state, false, 3)
+            .await;
+        assert_eq!(result, Err("the session this launch belonged to is gone".to_string()));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

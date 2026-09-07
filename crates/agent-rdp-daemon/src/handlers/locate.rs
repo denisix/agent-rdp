@@ -110,6 +110,9 @@ async fn run_one_pass(
                 return Err(Response::error(ErrorCode::NotConnected, "Not connected to an RDP server"));
             }
         };
+        if let Some(refusal) = crate::handlers::refuse_if_dropped(rdp) {
+            return Err(refusal);
+        }
 
         match params.region {
             None => {

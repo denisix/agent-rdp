@@ -465,10 +465,17 @@ service is gone — the case where nothing at the TCP level ever fails — is
 declared dead after three unanswered refreshes in a row (about 2.25 minutes
 at the default interval). Before these, detection fell back to the OS
 retransmission timeout or to nothing at all: four to eighteen minutes during
-which `screenshot` kept succeeding against a stale frame. A server that never
-answers a Refresh Rect would trip the second rule; `AGENT_RDP_NO_SILENCE_DROP=1`
-keeps the traffic but disables that verdict, and `--keep-alive-secs 0` disables
-both.
+which `screenshot` kept succeeding against a stale frame. The second rule
+arms itself first: it fires only once a refresh has been answered on an
+otherwise idle link, so a server that never answers one (the protocol allows
+it) is never declared dead for it. `AGENT_RDP_NO_SILENCE_DROP=1` disables the
+verdict while keeping the traffic; `--keep-alive-secs 0` disables both. Since
+the interval is also the liveness window, a non-zero value below 10 seconds
+is refused.
+
+Once the transport is gone, `screenshot` and `locate` refuse rather than
+answer from the last frame the dead session painted, and `session info`
+reports it as disconnected.
 
 **The automation agent survives a reconnect.** When the transport drops, the
 agent keeps re-opening its channel for about 10 minutes rather than exiting, so
@@ -477,23 +484,32 @@ no Win+R, no foreground change on a desktop someone else may be using.
 `automate status` reports `adopted` when that happened, `total_launches` (every
 launch that did type Win+R, including each `connect`'s bootstrap) and
 `relaunches` (self-heal restarts since the last connect). `connect
---defer-agent` skips the launch entirely and leaves the agent to `automate
-restart`.
+--defer-agent` (which needs `--enable-win-automation`) skips the launch
+entirely and leaves the agent to `automate restart` — including when the
+survivor it found was running older scripts and had to be evicted, which
+would otherwise have woken the self-heal.
+
+Adoption is decided by a hash of the scripts the daemon would deploy, not by
+the agent's version string, since a library file can change without a version
+bump. An agent whose hash does not match is asked to exit and is never talked
+to, whichever agent opened its channel first.
 
 **The automation agent heals itself.** If its DVC channel closes while the
-RDP session is alive, the daemon relaunches it (at most 3 times per 10
-minutes; `automate status` reports `relaunches`), and the agent no longer
-exits on the transient read errors a CPU-starved host produces. Cold
-`connect --enable-win-automation` on such a host is given up to ~5 minutes:
-three launch attempts with handshake windows of 25/45/75s, each extended when
-the agent is visibly still starting.
+RDP session is alive, the daemon relaunches it (see the retry budget above),
+and the agent no longer exits on the transient read errors a CPU-starved host
+produces. Cold `connect --enable-win-automation` on such a host is given up
+to ~5 minutes: three launch attempts with handshake windows of 25/45/75s,
+each extended when the agent is visibly still starting.
 
 **`daemon_version_mismatch`** means the daemon was started by a different
 agent-rdp version than the CLI — it kept running across an upgrade, and is
 still serving the old code, including the automation agent it embeds. Run
-`agent-rdp connect ...` again: it replaces the daemon (and the SDK does the
-same on its own). `session info` shows both versions. This is worth knowing
-about because it is how "upgraded, but the old bug still reproduces" happens.
+`agent-rdp connect ...` again: it replaces the daemon. Every other command
+refuses instead, in the CLI and in the SDK alike — replacing a daemon ends
+whatever RDP session it is holding, which is a decision for `connect` to
+make, not for a screenshot. `session info` shows both versions. This is worth
+knowing about because it is how "upgraded, but the old bug still reproduces"
+happens.
 
 **Arrow-key navigation inside a panel can land on the wrong item.** Observed in
 1C side panels: Up/Down then Enter is not reliably deterministic. Prefer
@@ -558,6 +574,9 @@ Add `--json` to any command:
 | `AGENT_RDP_PASSWORD` | RDP password |
 | `AGENT_RDP_SESSION` | Session name (default: "default") |
 | `AGENT_RDP_STREAM_PORT` | WebSocket streaming port (0 = disabled) |
+| `AGENT_RDP_STREAM_BIND` | Address the streaming server binds to (default: `127.0.0.1`) |
+| `AGENT_RDP_STREAM_FPS` | Streaming frame rate (default: 10) |
+| `AGENT_RDP_STREAM_QUALITY` | Streaming JPEG quality, 0-100 (default: 80) |
 | `AGENT_RDP_MODELS_DIR` | OCR models directory (set automatically by the npm wrapper; needed for standalone binary installs) |
 | `AGENT_RDP_DIAGNOSTICS` | Set to `0` to disable the request transcript and failure captures |
 | `AGENT_RDP_NO_AUTO_RELAUNCH` | Set to `1` before `connect` to stop the daemon relaunching the automation agent on its own (`automate restart` still works) |

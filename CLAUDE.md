@@ -74,10 +74,30 @@ It fires only on data *we* sent going unacked, so a quiet server is unaffected.
 That is also its blind spot: a server whose TCP stack still ACKs while its RDP
 service is dead (the field's `ERROR_SEM_TIMEOUT` case, 18 minutes of silence)
 never trips it. The keep-alive arm therefore also checks `last_frame_at` after
-each successful send, and `keep_alive_unanswered` (pure, tested) declares the
-transport dead after `KEEP_ALIVE_MISSED_LIMIT` (3) periods with no inbound PDU
+each successful send, and `KeepAliveWatch` (pure, tested) declares the
+transport dead after `KEEP_ALIVE_MISSED_LIMIT` (3) *sends* with no inbound PDU
 at all - a Refresh Rect is a request the server answers with a repaint, so
 sustained silence is the one signal that separates idle from dead there.
+Counted per send, not by elapsed time: the processor services RDPDR I/O
+synchronously, so a wedged file operation stalls this loop for minutes with
+the server healthy, and a time-based rule killed the session the instant the
+stall ended. The verdict also **arms itself**: it fires only after a refresh
+was answered in a period where the client sent nothing else
+(`client_sent_since_keep_alive` feeds `record_send`'s second argument). The
+protocol lets a server that never advertised `refreshRectSupport` ignore the
+PDU, and declaring such a server dead would reconnect - and retype Win+R -
+every few minutes forever. `AGENT_RDP_NO_SILENCE_DROP` disables the verdict
+without losing the traffic. The interval is therefore also the liveness
+window, so `validate_connect_request` refuses a non-zero
+`keep_alive_secs` below `KEEP_ALIVE_MIN_SECS` (10) in the daemon, the CLI
+parser and the SDK.
+
+**Every processor exit stamps `drop_reason`, panics included.** The task is
+wrapped in `catch_unwind`; without it a panic left the session in the slot
+as Connected forever, keep-alive stopped, every command answering from a
+frozen framebuffer. `screenshot` and `locate` also call
+`handlers::refuse_if_dropped` - `session info` reporting Disconnected while
+they kept succeeding was the same lie one layer up.
 
 **PowerShell `$null` is not a .NET null.** Passing `$null` to a .NET method's
 `string` parameter hands it `""`, and `File.Replace` rejects `""` as a backup
@@ -115,7 +135,28 @@ self-heal restarts since the last connect, and `record_launch_outcome` is where
 both are decided). Two agents can be alive at once, so `dvc_channel.rs` keeps
 the first channel opened and `shutdown`s any other, with an id-guarded
 `close()` - a rejected agent exiting must not clear the live one's handshake.
-`connect --defer-agent` adopts but never launches.
+**Build id beats first-opener**: `DvcSharedState.expected_build_id` (set by
+`initialize()`) makes the channel layer refuse any handshake whose build does
+not match, releasing the primary slot if the refused agent held it. Without
+that, a stale survivor reattaching during a launch was kept and the freshly
+launched correct agent was the one told to exit. `release_primary` is the
+same move for a *current* agent being replaced (`automate restart`,
+`shutdown_stale_agent`): the replacement must not be rejected because the old
+channel is slow to close.
+
+`connect --defer-agent` adopts but never launches, and sets
+`launch_deferred`, which `should_retry` checks - evicting a stale survivor
+closes a channel, and the supervisor would otherwise have typed Win+R five
+seconds later on the desktop the caller said to leave alone. It requires
+`enable_win_automation`; the pair is refused, not ignored.
+
+**Launches carry an epoch.** `AutomationState.epoch` is bumped by
+`initialize()` and `cleanup()`. A launch captures it and, once it no longer
+matches, types nothing (`launch_and_wait` checks per attempt and in
+`wait_for_handshake`) and records nothing (`finish_launch`, `adopt_only`,
+`relaunch_agent`). A bootstrap abandoned by a transport drop used to keep
+driving the Run dialog of whatever session a later `connect` had put in the
+slot, then record its failure against it.
 
 **The DVC channel must be registered with `with_listener`.**
 `with_dynamic_channel` wraps the processor in ironrdp's `OnceListener`, whose
@@ -169,7 +210,11 @@ compare it with their own. Socket/pid paths depend only on the session name,
 so without this check an upgraded CLI silently keeps driving the old daemon —
 and the old daemon redeploys *its* embedded PS scripts on every `connect`.
 `connect` replaces a mismatched daemon; every other command refuses with
-`daemon_version_mismatch`, except `disconnect`, which must always work.
+`daemon_version_mismatch`, except `disconnect`, which must always work. The
+SDK follows the same rule: `ensureRunning({ replaceStale })` is passed `true`
+only by `connect()`. It used to replace on any first call, so a `screenshot`
+after an upgrade killed a daemon holding a live session and then failed with
+`not_connected`.
 
 ### Key components
 
@@ -218,7 +263,17 @@ change in between; `pull_once` is one whole attempt and `handle_pull` runs up
 to `PULL_ATTEMPTS` of them (exponential backoff) for files under
 `PULL_RETRY_MAX_BYTES`, then reports `file_changed_during_transfer`. Each
 attempt re-stats, so `--max-age` describes the bytes actually delivered; the
-local file is written once, after verification.
+local file is written to a sibling temp file and renamed, so a reader never
+sees a partial one and a failed write leaves the old file intact. A stat with
+no hash is refused rather than reported as verified. `file stat` gets the
+same absolute-remote-path check as the transfers, since every transfer error
+tells the caller to check the destination with it. A failed push sends the
+agent an `abort` chunk that discards the sidecar, and the advice it returns
+distinguishes the three cases that actually differ: before the final chunk
+the destination is untouched and a retry is safe; a lost reply *to* the final
+chunk is the only indeterminate one; an agent-side rejection there has
+already discarded the staged copy. The error text must not name the sidecar
+it just deleted.
 
 **`automation/*.rs`** — Windows UI Automation via a PowerShell agent injected
 into the remote session, over a Dynamic Virtual Channel. Scripts under
@@ -250,13 +305,24 @@ shortest silently decides the real limit:
 4. the remote command's own budget (`--process-timeout`, `wait-for --timeout`)
 
 A CLI-side loop (`run-poll --follow`) extends only layer 3 by its own budget;
-each iteration keeps the ordinary per-request layers. The automation
-bootstrap's worst case (`launch_and_wait_worst_case()`: three launches with
-handshake windows of 25/45/75s, each extendable once while the agent is
-visibly still starting) is asserted against `DEFAULT_CONNECT_TIMEOUT_MS` and
-`RESTART_MIN_TIMEOUT_MS` by a unit test - change one, change all. The CLI
-retries a request once after a dropped connection **only** if
-`Request::is_read_only()` (protocol crate) says so.
+each iteration keeps the ordinary per-request layers. `--follow-timeout`
+implies `--follow`, so `watchdog_budget_ms` must match on either - matching
+`follow: true` alone let the watchdog kill a five-minute follow at 90s. The
+automation bootstrap's worst cases (`launch_and_wait_worst_case()`: three
+launches with handshake windows of 25/45/75s, each extendable once while the
+agent is visibly still starting, plus one poll-sleep of overshoot per
+attempt; `connect_bootstrap_worst_case()` adds the survivor wait and a stale
+agent's eviction; `restart_worst_case()` adds that eviction and the status
+probe) are asserted against `DEFAULT_CONNECT_TIMEOUT_MS` and
+`RESTART_MIN_TIMEOUT_MS` by unit tests - change one, change all. A transfer
+has a whole-transfer budget of its own (`file_transfer::TRANSFER_BUDGET`,
+9 min), from which the CLI's timeout and watchdog are derived, so the daemon
+is the layer that gives up first; before it, the CLI reported a timeout and
+the daemon quietly finished the push minutes later. The CLI retries a request
+once after a dropped connection **only** if `Request::is_read_only()`
+(protocol crate) says so. The TS SDK has the same layering in
+`requestTimeout()`, and a timed-out request there retires its socket: the
+daemon's late reply would otherwise be handed to the next call.
 
 Adding a command that can legitimately run long means extending 1–3 to cover 4.
 
@@ -277,6 +343,10 @@ events.
 | `AGENT_RDP_PASSWORD` | RDP password |
 | `AGENT_RDP_SESSION` | Session name (default: "default") |
 | `AGENT_RDP_STREAM_PORT` | WebSocket streaming port (0 = disabled) |
+| `AGENT_RDP_STREAM_BIND` | Streaming bind address (default: `127.0.0.1`) |
+| `AGENT_RDP_STREAM_FPS` | Streaming frame rate (default: 10) |
+| `AGENT_RDP_STREAM_QUALITY` | Streaming JPEG quality, 0-100 (default: 80) |
+| `AGENT_RDP_DIAGNOSTICS` | `0` disables the request transcript and failure captures |
 | `AGENT_RDP_MODELS_DIR` | OCR models directory (set by the npm wrapper; needed for standalone binary installs) |
 | `AGENT_RDP_NO_AUTO_RELAUNCH` | `1` disables the daemon's automatic relaunch of the automation agent |
 | `AGENT_RDP_NO_SILENCE_DROP` | `1` keeps the keep-alive traffic but disables the "server answered none of the last 3 refreshes" disconnect verdict |

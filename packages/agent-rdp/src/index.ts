@@ -56,6 +56,52 @@ import {
 export * from './types.js';
 export { AutomationController } from './automation.js';
 
+/**
+ * Extra socket budget for the commands the daemon legitimately takes a long
+ * time to answer, mirroring the CLI's own layering.
+ *
+ * The daemon has its own deadline for each of these; the client's has to be
+ * the longer one, or the SDK reports a timeout for work that then completes,
+ * and the caller retries an action that already happened. Every value here
+ * is the daemon-side budget plus slack.
+ */
+const CONNECT_TIMEOUT_MS = 360_000;
+const RESTART_TIMEOUT_MS = 360_000;
+/** The daemon's whole-transfer budget (9 min) plus slack. */
+const TRANSFER_TIMEOUT_MS = 570_000;
+/** The daemon's spawn deadline for a detached `run`. */
+const SPAWN_TIMEOUT_MS = 90_000;
+
+/** Socket timeout for one request: the base, extended per command. */
+export function requestTimeout(request: Request, base: number): number {
+  switch (request.type) {
+    case 'connect':
+      return Math.max(base, CONNECT_TIMEOUT_MS);
+    case 'automation_restart':
+      return Math.max(base, RESTART_TIMEOUT_MS);
+    case 'file_push':
+    case 'file_pull':
+      return base + TRANSFER_TIMEOUT_MS;
+    case 'automate': {
+      const op = request as { op?: string; wait?: boolean; timeout_ms?: number };
+      // A remote command's own budget is the daemon's; this must clear it.
+      if (op.op === 'run') {
+        return op.wait ? base + (op.timeout_ms ?? 10_000) : base + SPAWN_TIMEOUT_MS;
+      }
+      if (op.op === 'wait_for') {
+        return base + (op.timeout_ms ?? 30_000);
+      }
+      return base;
+    }
+    case 'locate': {
+      const wait = (request as { wait_ms?: number }).wait_ms;
+      return wait ? base + wait : base;
+    }
+    default:
+      return base;
+  }
+}
+
 export interface RdpSessionOptions {
   /** Session name (default: 'default') */
   session?: string;
@@ -245,12 +291,23 @@ export class FileController {
     return response.data as unknown as FileTransferResult;
   }
 
-  /** Copy a file from the remote machine. See `push` on path handling. */
-  async pull(remotePath: string, localPath: string): Promise<FileTransferResult> {
+  /**
+   * Copy a file from the remote machine. See `push` on path handling.
+   *
+   * `maxAgeSecs` refuses a file the remote machine last wrote longer ago
+   * than that, by the remote clock: the way to tell "the command wrote its
+   * output" from "the file from the previous run is still there".
+   */
+  async pull(
+    remotePath: string,
+    localPath: string,
+    options: { maxAgeSecs?: number } = {},
+  ): Promise<FileTransferResult> {
     const response = await this.rdp._send({
       type: 'file_pull',
       remote_path: remotePath,
       local_path: resolve(localPath),
+      max_age_secs: options.maxAgeSecs,
     });
     return response.data as unknown as FileTransferResult;
   }
@@ -319,8 +376,25 @@ export class RdpSession {
    * @param options.deferAgent Connect without launching the automation agent (default: false)
    */
   async connect(options: ConnectOptions): Promise<ConnectResult> {
-    // Ensure daemon is running and connect
-    this.client = await this.daemon.ensureRunning();
+    if (options.deferAgent && !options.enableWinAutomation) {
+      throw new RdpError(
+        'invalid_request',
+        'deferAgent needs enableWinAutomation: without automation there is no agent to defer.',
+      );
+    }
+    if (
+      options.keepAliveSecs !== undefined &&
+      options.keepAliveSecs !== 0 &&
+      options.keepAliveSecs < 10
+    ) {
+      throw new RdpError(
+        'invalid_request',
+        'keepAliveSecs must be 0 (disabled) or at least 10: the interval is also the ' +
+          'liveness window, and a few seconds of silence is not evidence of a dead server.',
+      );
+    }
+    // The one command allowed to replace a version-mismatched daemon.
+    this.client = await this.daemon.ensureRunning({ replaceStale: true });
 
     const request: Request = {
       type: 'connect',
@@ -344,13 +418,39 @@ export class RdpSession {
     };
 
     const response = await this._send(request);
-    const data = response.data as { type: 'connected'; host: string; width: number; height: number };
+    const data = response.data as {
+      type: 'connected';
+      host: string;
+      width: number;
+      height: number;
+      automation_ready?: boolean | null;
+      automation_error?: string | null;
+      automation_deferred?: boolean;
+    };
 
+    // The automation fields matter to the caller and used to be dropped
+    // here: RDP-level success hid an agent that failed to start, and a
+    // `deferAgent` caller could not tell an adopted survivor from nothing
+    // running at all.
     return {
       host: data.host,
       width: data.width,
       height: data.height,
+      automationReady: data.automation_ready ?? null,
+      automationError: data.automation_error ?? null,
+      automationDeferred: data.automation_deferred ?? false,
     };
+  }
+
+  /**
+   * Relaunch the automation agent without reconnecting.
+   *
+   * This types Win+R on the remote desktop, so it takes foreground on a
+   * shared session. The counterpart to `deferAgent`, which withholds exactly
+   * that until you ask for it.
+   */
+  async restartAutomation(): Promise<void> {
+    await this._send({ type: 'automation_restart' });
   }
 
   /**
@@ -629,7 +729,7 @@ export class RdpSession {
       this.client = await this.daemon.ensureRunning();
     }
 
-    const response = await this.client.send(request, this.timeout);
+    const response = await this.client.send(request, requestTimeout(request, this.timeout));
 
     if (!response.success) {
       throw new RdpError(

@@ -104,10 +104,12 @@ function Start-Agent {
     try {
         Send-DvcHandshake -Handle $script:DvcHandle -Version $script:Version -Capabilities $capabilities -BuildId $BuildId
         Write-Log "DVC handshake sent: version=$($script:Version)"
-        # A client took us: the reconnect window starts over from the next
-        # failure, so an agent that has served several sessions still gets a
-        # full window each time rather than a shrinking one.
-        $script:HandshakeSinceFailure = $true
+        # Not the moment a client took us: the write can succeed on a channel
+        # with nobody behind it (the session's client is gone; reads then
+        # return nothing until the dead-handle rule fires). Counting that as
+        # a handshake restarted the reconnect window on every attempt, and an
+        # orphan lived until logoff instead of ten minutes. The window resets
+        # only on the first message actually received - see the main loop.
     } catch {
         Write-Log "Failed to send handshake: $($_.Exception.Message)" "ERROR"
         throw
@@ -133,6 +135,14 @@ function Start-Agent {
             if ($null -eq $request) {
                 # No message available, continue polling
                 continue
+            }
+
+            # A client is really there: the reconnect window starts over
+            # from the next failure, so an agent that has served several
+            # sessions still gets a full window each time rather than a
+            # shrinking one.
+            if (-not $script:HandshakeSinceFailure) {
+                $script:HandshakeSinceFailure = $true
             }
 
             # Validate message type

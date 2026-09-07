@@ -109,6 +109,17 @@ pub struct DvcSharedState {
     /// others are told to exit. Tracked by id so a late `close()` from a
     /// rejected agent cannot clear the live agent's handshake.
     pub extras: std::collections::HashSet<u32>,
+    /// The build id an agent must present to be talked to at all. Set by
+    /// the bootstrap from the scripts this daemon deploys; `None` (tests)
+    /// accepts any. An agent running other scripts is answered with
+    /// `shutdown` at its handshake and never becomes the primary - without
+    /// this, whichever agent opened first was kept, so a stale survivor
+    /// reattaching during a launch was adopted and the freshly launched,
+    /// correct agent was the one told to exit.
+    pub expected_build_id: Option<String>,
+    /// Handshakes refused for a build-id mismatch this session, for status
+    /// and for tests.
+    pub stale_rejections: u32,
     /// Sender to send DVC data through the RDP session.
     pub command_tx: Option<DvcCommandSender>,
     /// Fired from `close()` so the session's relaunch supervisor learns that
@@ -125,6 +136,8 @@ impl Default for DvcSharedState {
             handshake_at: None,
             channel_id: None,
             extras: std::collections::HashSet::new(),
+            expected_build_id: None,
+            stale_rejections: 0,
             command_tx: None,
             closed_notify: None,
         }
@@ -136,6 +149,50 @@ impl DvcSharedState {
     /// it is starting up. A relaunch now would produce two agents.
     pub fn is_launching(&self) -> bool {
         self.channel_id.is_some() && self.handshake.is_none()
+    }
+
+    /// Whether a handshake carrying `build_id` is from scripts this daemon
+    /// would deploy. Anything is accepted when no expectation is set.
+    pub fn build_id_accepted(&self, build_id: Option<&str>) -> bool {
+        match self.expected_build_id.as_deref() {
+            Some(expected) => build_id == Some(expected),
+            None => true,
+        }
+    }
+
+    /// Stop treating `channel_id` as the agent this daemon talks to, without
+    /// waiting for the server's Close PDU.
+    ///
+    /// For the moment after an agent has been told to shut down: its channel
+    /// may stay open for seconds (a slow close, or a long command queued
+    /// ahead of the `shutdown`), and during that time the first-opener-wins
+    /// rule would reject the replacement being launched as an extra. Moving
+    /// the old primary to `extras` instead means its eventual close and any
+    /// late replies are ignored, and the next channel to handshake is the
+    /// primary. Pending requests are failed as on a close. Does not fire
+    /// `closed_notify`: the caller is about to launch, and a supervisor
+    /// wake-up here would only be noise. Id-guarded: a channel that is not
+    /// the primary any more is left alone.
+    pub fn release_primary(&mut self, channel_id: u32) -> bool {
+        if self.channel_id != Some(channel_id) {
+            return false;
+        }
+        self.channel_id = None;
+        self.handshake = None;
+        self.handshake_at = None;
+        self.extras.insert(channel_id);
+        for (id, sender) in self.pending.drain() {
+            warn!("Agent released, failing pending request {}", id);
+            let _ = sender.send(DvcResponse {
+                success: false,
+                data: None,
+                error: Some(DvcError {
+                    code: "channel_closed".to_string(),
+                    message: "the automation agent was asked to exit".to_string(),
+                }),
+            });
+        }
+        true
     }
 }
 
@@ -303,6 +360,36 @@ impl DvcProcessor for AutomationDvc {
                     state.channel_id.is_none() || state.channel_id == Some(channel_id)
                 };
 
+                // Before the first-opener rule: an agent running scripts this
+                // daemon does not ship is never the one it talks to, whether
+                // it opened first or not. It is told to exit and, if it held
+                // the primary slot, the slot is freed for the next opener -
+                // the correct agent a launch is bringing up, or an extra
+                // already waiting.
+                let stale = {
+                    let mut state = self.state.lock();
+                    if state.build_id_accepted(build_id.as_deref()) {
+                        false
+                    } else {
+                        state.stale_rejections = state.stale_rejections.saturating_add(1);
+                        if state.channel_id == Some(channel_id) {
+                            state.channel_id = None;
+                        }
+                        state.extras.insert(channel_id);
+                        true
+                    }
+                };
+                if stale {
+                    warn!(
+                        "Automation agent (pid {}, version {}, build {:?}) on channel {} runs \
+                         different scripts than this daemon ships; asking it to exit",
+                        agent_pid, version, build_id, channel_id
+                    );
+                    return Ok(vec![Box::new(crate::automation::dvc_encode::RawDvcBytes(
+                        Self::shutdown_request(channel_id),
+                    ))]);
+                }
+
                 if is_extra && !promote {
                     warn!(
                         "Second automation agent (pid {}, version {}) handshook on channel {}; \
@@ -405,7 +492,11 @@ impl DvcProcessor for AutomationDvc {
             debug!("Rejected automation agent on channel {} exited", channel_id);
             return;
         }
-        if state.channel_id.is_some_and(|primary| primary != channel_id) {
+        // Only the primary's close means the agent is gone. A close for an
+        // id that is neither the primary nor a known extra (a channel that
+        // never handshook and was released meanwhile) must not fire the
+        // supervisor or fail the live agent's pending requests.
+        if state.channel_id != Some(channel_id) {
             debug!(
                 "Ignoring close of channel {} - it is not the channel in use",
                 channel_id
@@ -731,5 +822,110 @@ mod two_agent_tests {
         assert!(out.is_empty());
         assert!(state.lock().pending.contains_key("real"), "an unrelated pending request is untouched");
         assert!(state.lock().channel_id.is_none(), "a stray reply does not open a channel");
+    }
+
+    fn handshake_with_build(pid: u32, build_id: &str) -> Vec<u8> {
+        AutomationDvc::encode_message(&DvcProtocolMessage::Handshake {
+            version: "1.8.0".to_string(),
+            agent_pid: pid,
+            capabilities: vec!["run".to_string()],
+            build_id: Some(build_id.to_string()),
+        })
+        .unwrap()
+    }
+
+    /// First-opener-wins is not enough on its own: a survivor from before an
+    /// upgrade re-opens its channel in the seconds after a drop, ahead of
+    /// the agent the reconnect just launched. The build id decides.
+    #[test]
+    fn a_build_mismatch_loses_the_channel_even_when_it_opened_first() {
+        let state = new_shared_dvc_state();
+        state.lock().expected_build_id = Some("build-new".to_string());
+        let mut processor = AutomationDvc::new(Arc::clone(&state));
+
+        processor.start(1).unwrap();
+        let replies = processor.process(1, &handshake_with_build(11, "build-old")).unwrap();
+        assert_eq!(replies.len(), 1, "the stale agent is told to exit");
+        {
+            let s = state.lock();
+            assert!(s.channel_id.is_none(), "and it gives up the primary slot");
+            assert!(s.handshake.is_none());
+            assert!(s.extras.contains(&1));
+            assert_eq!(s.stale_rejections, 1);
+        }
+
+        processor.start(2).unwrap();
+        assert!(
+            processor.process(2, &handshake_with_build(22, "build-new")).unwrap().is_empty(),
+            "the matching agent is accepted"
+        );
+        let s = state.lock();
+        assert_eq!(s.channel_id, Some(2));
+        assert_eq!(s.handshake.as_ref().unwrap().agent_pid, 22);
+    }
+
+    /// With no expectation recorded (tests, and any path that never set one)
+    /// nothing is refused - the gate must not break the default.
+    #[test]
+    fn no_expected_build_accepts_any_agent() {
+        let state = new_shared_dvc_state();
+        assert!(state.lock().build_id_accepted(None));
+        assert!(state.lock().build_id_accepted(Some("anything")));
+        state.lock().expected_build_id = Some("b".to_string());
+        assert!(!state.lock().build_id_accepted(None), "an agent predating the field is stale");
+        assert!(state.lock().build_id_accepted(Some("b")));
+    }
+
+    /// `release_primary` is what lets a replacement in while the agent it
+    /// replaces is still closing: the slot is freed at the moment the old
+    /// agent is asked to go, not when its channel finally closes.
+    #[test]
+    fn releasing_the_primary_frees_the_slot_and_fails_pending_requests() {
+        let state = new_shared_dvc_state();
+        let mut processor = AutomationDvc::new(Arc::clone(&state));
+        processor.start(1).unwrap();
+        processor.process(1, &handshake_bytes(11, "1.8.0")).unwrap();
+
+        let (tx, rx) = oneshot::channel();
+        state.lock().pending.insert("in-flight".to_string(), tx);
+
+        assert!(state.lock().release_primary(1));
+        {
+            let s = state.lock();
+            assert!(s.channel_id.is_none());
+            assert!(s.handshake.is_none());
+            assert!(s.extras.contains(&1), "its later close is ignored, not acted on");
+            assert!(s.pending.is_empty());
+        }
+        let reply = rx.blocking_recv().expect("the pending request was answered, not left hanging");
+        assert!(!reply.success);
+
+        // Id-guarded: releasing something that is not the primary is a no-op.
+        processor.start(2).unwrap();
+        processor.process(2, &handshake_bytes(22, "1.8.0")).unwrap();
+        assert_eq!(state.lock().channel_id, Some(2));
+        assert!(!state.lock().release_primary(1));
+        assert_eq!(state.lock().channel_id, Some(2), "the live agent is untouched");
+    }
+
+    /// A released agent's close must not look like the live agent leaving:
+    /// no supervisor wake-up, no cleared handshake.
+    #[test]
+    fn a_released_agent_closing_does_not_disturb_the_live_one() {
+        let state = new_shared_dvc_state();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.lock().closed_notify = Some(tx);
+        let mut processor = AutomationDvc::new(Arc::clone(&state));
+
+        processor.start(1).unwrap();
+        processor.process(1, &handshake_bytes(11, "1.8.0")).unwrap();
+        state.lock().release_primary(1);
+        processor.start(2).unwrap();
+        processor.process(2, &handshake_bytes(22, "1.8.0")).unwrap();
+
+        processor.close(1);
+        assert_eq!(state.lock().channel_id, Some(2), "the live agent still holds the channel");
+        assert!(state.lock().handshake.is_some());
+        assert!(rx.try_recv().is_err(), "no relaunch is triggered by the old agent leaving");
     }
 }

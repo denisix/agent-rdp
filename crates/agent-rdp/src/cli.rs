@@ -2,6 +2,22 @@
 
 use clap::{ArgGroup, Parser, Subcommand};
 
+/// `--keep-alive-secs`: 0 or at least `KEEP_ALIVE_MIN_SECS`. The daemon
+/// refuses the same values; checking here turns that into a usage error
+/// before a daemon is spawned for nothing.
+fn parse_keep_alive_secs(raw: &str) -> Result<u64, String> {
+    let secs: u64 = raw.parse().map_err(|e| format!("not a number of seconds: {e}"))?;
+    if secs != 0 && secs < agent_rdp_protocol::KEEP_ALIVE_MIN_SECS {
+        return Err(format!(
+            "must be 0 (disabled) or at least {} - three unanswered ticks end the session, \
+             and {}s of silence is not evidence of a dead server",
+            agent_rdp_protocol::KEEP_ALIVE_MIN_SECS,
+            secs * 3
+        ));
+    }
+    Ok(secs)
+}
+
 pub mod commands;
 
 /// CLI tool for AI agents to control Windows Remote Desktop sessions.
@@ -18,8 +34,9 @@ pub struct Cli {
     pub json: bool,
 
     /// Command timeout in milliseconds. Defaults to 30000 for ordinary
-    /// commands and 150000 for `connect`, which additionally has to cover the
-    /// TLS/CredSSP handshake and the automation agent bootstrap
+    /// commands and 360000 for `connect`, which additionally has to cover the
+    /// TLS/CredSSP handshake and the automation agent bootstrap (up to three
+    /// launch attempts)
     #[arg(long, global = true)]
     pub timeout: Option<u64>,
 
@@ -178,7 +195,11 @@ pub struct ConnectArgs {
     /// costs a reconnect, and a reconnect relaunches the automation agent by
     /// typing Win+R on the remote desktop. Keeping the session alive is much
     /// cheaper than recovering it.
-    #[arg(long, default_value = "45", value_name = "SECONDS")]
+    ///
+    /// The interval is also the liveness window: a server that answers none
+    /// of three consecutive keep-alives is treated as dead, so values under
+    /// 10 are refused (a busy server can take seconds to repaint).
+    #[arg(long, default_value = "45", value_name = "SECONDS", value_parser = parse_keep_alive_secs)]
     pub keep_alive_secs: u64,
 
     /// Connect without launching the automation agent.
@@ -186,8 +207,9 @@ pub struct ConnectArgs {
     /// An agent that survived an earlier drop is still adopted (that costs
     /// the remote desktop nothing); only the Win+R launch is withheld, so
     /// nothing appears on a shared desktop until you ask for it with
-    /// `automate restart`.
-    #[arg(long)]
+    /// `automate restart`. Needs --enable-win-automation: without it there
+    /// is no agent to defer.
+    #[arg(long, requires = "enable_win_automation")]
     pub defer_agent: bool,
 }
 

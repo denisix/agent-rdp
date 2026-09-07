@@ -8,11 +8,12 @@ use crate::session_manager::SessionManager;
 
 /// Extra IPC budget for a transfer, on top of the base timeout.
 ///
-/// A transfer is many round trips, each with a remote disk write, plus a
-/// full-file hash on both ends. The daemon caps the file size, so this is a
-/// ceiling on the worst legitimate case rather than a guess about any
-/// particular file.
-const TRANSFER_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+/// Derived from the daemon's own whole-transfer budget plus slack for the
+/// reply to travel, so the daemon is always the layer that gives up first
+/// and the CLI reports the daemon's verdict rather than a bare timeout while
+/// the daemon quietly finishes the push behind it.
+pub const TRANSFER_TIMEOUT_MS: u64 =
+    agent_rdp_daemon::handlers::file_transfer::TRANSFER_BUDGET.as_millis() as u64 + 30_000;
 
 /// Resolve a local path against *this* process's working directory.
 ///
@@ -22,16 +23,16 @@ const TRANSFER_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 /// to, somewhere the caller never chose - and if a same-named file happened
 /// to be there, the transfer succeeded against the wrong bytes.
 ///
-/// No canonicalization: a pull's destination legitimately does not exist yet,
-/// and resolving symlinks would change where the caller asked to write.
+/// `std::path::absolute` rather than `cwd.join`: on Windows a drive-relative
+/// `C:report.json` is not absolute, and joining it to the cwd produces
+/// `<cwd>\C:report.json`; `absolute` resolves it against that drive's
+/// current directory the way the shell would. No canonicalization: a pull's
+/// destination legitimately does not exist yet, and resolving symlinks would
+/// change where the caller asked to write.
 fn absolute_local(path: &str) -> anyhow::Result<String> {
-    let path = std::path::Path::new(path);
-    if path.is_absolute() {
-        return Ok(path.to_string_lossy().into_owned());
-    }
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("Cannot resolve '{}': {}", path.display(), e))?;
-    Ok(cwd.join(path).to_string_lossy().into_owned())
+    let resolved = std::path::absolute(path)
+        .map_err(|e| anyhow::anyhow!("Cannot resolve '{}': {}", path, e))?;
+    Ok(resolved.to_string_lossy().into_owned())
 }
 
 pub async fn run(

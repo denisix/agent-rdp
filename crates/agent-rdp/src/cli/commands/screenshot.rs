@@ -118,10 +118,16 @@ pub async fn run(
         // frame age in the tens of seconds. At 5s this warned on every
         // screenshot of a static desktop and taught callers to ignore it.
         if frame_age_ms > STALE_FRAME_WARN_MS {
+            // This command cannot see the session's keep-alive setting, so
+            // it cannot claim the server should have answered: with the
+            // default 45s keep-alive a live server usually has, but with it
+            // disabled or lengthened an idle desktop is exactly what this
+            // looks like. `session info` shows both the setting and the drop.
             eprintln!(
-                "Warning: no data from the server for {}s. With keep-alive on, a live server \
-                 answers each refresh, so this usually means the transport is dead rather than \
-                 the desktop idle - `session info` shows the drop once the OS reports it.",
+                "Warning: no data from the server for {}s. With the default keep-alive a live \
+                 server answers each refresh, so this usually means the transport is dead; if \
+                 keep-alive is off or longer than that, an idle desktop looks the same. \
+                 `session info` shows the keep-alive setting and any drop.",
                 frame_age_ms / 1000
             );
         }

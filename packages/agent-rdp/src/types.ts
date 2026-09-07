@@ -106,6 +106,16 @@ export interface ConnectResult {
   host: string;
   width: number;
   height: number;
+  /**
+   * Whether the automation agent is up: `true` (launched or adopted),
+   * `false` (asked for but not running - see `automationError`), or `null`
+   * when automation was not requested.
+   */
+  automationReady: boolean | null;
+  /** Why the agent is not up, when it was asked for and did not start. */
+  automationError: string | null;
+  /** `deferAgent` was honored: nothing was typed on the remote desktop. */
+  automationDeferred: boolean;
 }
 
 /**

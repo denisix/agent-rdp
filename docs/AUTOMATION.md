@@ -305,6 +305,10 @@ partial message is dropped, the loop pauses 200ms and reads again; more than
 20 in a row is treated as fatal. A fragment without `CHANNEL_FLAG_FIRST`
 arriving while nothing is accumulated is the tail of a dropped message and is
 skipped, so the reader resynchronises instead of failing the next JSON parse.
+The mirror case resynchronises too: a fragment *with* that flag arriving while
+a message is still accumulating means the rest of that message was lost, so
+the partial is discarded rather than concatenated - appending made both
+messages unparseable and cost two replies instead of one.
 Write failures are always fatal (`DVC_FATAL:` too): a reply that cannot be
 sent is a reply the daemon times out on anyway.
 
@@ -322,6 +326,21 @@ increment `total_launches`. A survivor is checked against
 replaces it; a mismatch is sent `shutdown`. The build id is passed to the
 launched agent as `-BuildId` and echoed back in its handshake, since the agent
 cannot compute it about itself.
+
+The check lives in the channel layer too (`DvcSharedState.expected_build_id`),
+not only in `adopt_survivor`: a handshake whose build does not match is
+refused wherever it arrives, and the refused agent gives up the primary slot
+if it held one. Otherwise the first agent to open won, so a stale survivor
+reattaching in the seconds after a launch was kept and the correct agent that
+had just been launched was the one told to exit. For the same reason an agent
+being *replaced* on purpose (`automate restart`, or an evicted survivor) is
+released with `release_primary` as soon as it is asked to go, rather than
+when its channel finally closes.
+
+`connect --defer-agent` sets `launch_deferred` before it tries to adopt, and
+`should_retry` refuses while it is set: evicting a stale survivor closes a
+channel, and the supervisor's close arm would otherwise have launched an
+agent five seconds later on the very desktop the flag exists to protect.
 
 Two agents can therefore be alive at once — a survivor reattaching while a
 freshly launched one starts. `dvc_channel.rs` keeps whichever opened the
@@ -515,11 +534,19 @@ Relaunch Supervisor above).
    that launched it is gone for good (killed, or the CLI's watchdog ended the
    connect before a handshake), the process sits on the desktop for the rest
    of that window rather than exiting quickly - nothing else cleans it up.
-10. **Keep-alive silence is treated as death**: three keep-alive periods with
+   The window is measured from the first failure and reset only by a message
+   actually *received*; a handshake that merely wrote successfully into a
+   channel with nobody behind it does not count, or the orphan would renew
+   its own window every cycle and live until logoff.
+10. **Keep-alive silence is treated as death**: three keep-alive sends with
    no inbound PDU at all (`KEEP_ALIVE_MISSED_LIMIT`) end the session, because
    a server whose TCP stack still ACKs but whose RDP service is gone answers
-   nothing and trips no socket-level timeout. A server that never answers a
-   Refresh Rect on an idle desktop would be misjudged; `AGENT_RDP_NO_SILENCE_DROP=1`
+   nothing and trips no socket-level timeout. The verdict arms itself first -
+   it fires only after a refresh has been answered in a period where the
+   client sent nothing else - so a server that never answers a Refresh Rect
+   (the protocol permits it) is not misjudged. `AGENT_RDP_NO_SILENCE_DROP=1`
    disables the verdict while keeping the traffic, and `--keep-alive-secs 0`
    disables both. Strikes are counted per send, so a local stall of any length
-   (RDPDR I/O blocks this loop) adds at most one.
+   (RDPDR I/O blocks this loop) adds at most one. Because the interval is
+   also the liveness window, a non-zero `--keep-alive-secs` under 10 is
+   refused.

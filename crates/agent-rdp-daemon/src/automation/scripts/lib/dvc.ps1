@@ -289,6 +289,17 @@ function Read-DvcMessage {
         $flags = [System.BitConverter]::ToUInt32($buffer, 4)
         $dataLength = $bytesRead - $script:ChannelPduHeaderSize
 
+        # Resync the other way: a FIRST fragment while a message is still
+        # accumulating means the rest of that message was lost. Appending
+        # the new head to the old body made both unparseable, and both
+        # requests went unanswered.
+        if ($null -ne $accumulated -and (($flags -band $script:ChannelFlagFirst) -ne 0)) {
+            Write-Log "A new message began after $fragments fragment(s) of a $expectedLength-byte one; discarding the partial (resync)" "WARN"
+            $accumulated.Dispose()
+            $accumulated = $null
+            $fragments = 0
+        }
+
         if ($null -eq $accumulated) {
             # Resync: a fragment without FIRST while nothing is accumulated is
             # the remainder of a message whose head was lost. Parsing it as a

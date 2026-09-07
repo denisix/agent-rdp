@@ -200,7 +200,15 @@ sha256?: string,
  * good one used to be. Defaulted rather than required: an agent from
  * before 1.8.0 ignores it, and a daemon talking to one still works.
  */
-transfer_id: string, } | { "op": "file_read_chunk", 
+transfer_id: string, 
+/**
+ * Discard this transfer's sidecar instead of writing: the daemon
+ * sends it (best effort) when a push fails part-way, so the partial
+ * file does not sit on the remote disk until something else cleans
+ * it up. `data_b64` is ignored when set. Defaulted for the same
+ * reason as `transfer_id`.
+ */
+abort: boolean, } | { "op": "file_read_chunk", 
 /**
  * Source path on the remote machine.
  */

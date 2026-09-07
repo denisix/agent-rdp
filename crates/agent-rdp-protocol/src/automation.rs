@@ -252,6 +252,13 @@ pub enum AutomateRequest {
         /// before 1.8.0 ignores it, and a daemon talking to one still works.
         #[serde(default)]
         transfer_id: String,
+        /// Discard this transfer's sidecar instead of writing: the daemon
+        /// sends it (best effort) when a push fails part-way, so the partial
+        /// file does not sit on the remote disk until something else cleans
+        /// it up. `data_b64` is ignored when set. Defaulted for the same
+        /// reason as `transfer_id`.
+        #[serde(default)]
+        abort: bool,
     },
 
     /// Read one chunk of a file from the remote machine.

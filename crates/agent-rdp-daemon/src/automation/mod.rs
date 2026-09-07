@@ -11,7 +11,7 @@ mod dvc_ipc;
 
 pub use bootstrap::{
     adopt_only, connect_bootstrap_worst_case, expected_agent_version, expected_build_id,
-    launch_and_wait_worst_case,
+    launch_and_wait_worst_case, restart_worst_case,
     launch_guarded, relaunch_agent, spawn_relaunch_supervisor, AutomationBootstrap,
     RelaunchBudget, LAUNCH_ATTEMPTS, MAX_LAUNCH_FAILURES, RETRY_INPUT_QUIET, SURVIVOR_WAIT,
 };
@@ -86,6 +86,19 @@ pub struct AutomationState {
     /// transport drop and re-opened its channel, so this reconnect typed
     /// nothing on the remote desktop. Set on adoption, cleared by any launch.
     pub adopted: bool,
+    /// Which initialization of this state a launch belongs to. Bumped by
+    /// `initialize()` and `cleanup()`; a launch captures it when it starts
+    /// and touches no bookkeeping - and types nothing - once it no longer
+    /// matches. This is what stops a bootstrap abandoned by a transport
+    /// drop from driving the Run dialog of, and recording a failure
+    /// against, the session that a later `connect` built on the same
+    /// state object.
+    pub epoch: u64,
+    /// `connect --defer-agent`: the caller chose not to have Win+R typed.
+    /// The relaunch supervisor honours it (a stale survivor being evicted
+    /// closes the channel, which would otherwise arm an automatic launch
+    /// five seconds later); `automate restart` clears it.
+    pub launch_deferred: bool,
 }
 
 impl AutomationState {
@@ -113,6 +126,8 @@ impl AutomationState {
             total_launches: 0,
             launch_target: None,
             adopted: false,
+            epoch: 0,
+            launch_deferred: false,
         }
     }
 

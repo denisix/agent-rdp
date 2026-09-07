@@ -169,6 +169,10 @@ pub struct ConnectRequest {
     /// after its own idle timeout (observed in the field at ~285s). TCP
     /// keepalive alone did not prevent it. Each tick sends a Refresh Rect PDU,
     /// which is real wire traffic with no input, focus or lock-key semantics.
+    ///
+    /// The interval is also the liveness window (three unanswered ticks end
+    /// the session), so a non-zero value below `KEEP_ALIVE_MIN_SECS` is
+    /// refused by the daemon rather than silently turned into false drops.
     #[serde(default = "default_keep_alive_secs")]
     #[ts(type = "number")]
     pub keep_alive_secs: u64,
@@ -178,9 +182,39 @@ pub struct ConnectRequest {
     /// The drive and the DVC channel are still set up, and an agent that
     /// survived an earlier drop is still adopted - only the Win+R launch is
     /// skipped. For a shared desktop where the caller wants to choose the
-    /// moment the Run dialog appears; `automate restart` launches it.
+    /// moment the Run dialog appears; `automate restart` launches it. Only
+    /// meaningful with `enable_automation`; the daemon refuses the pair
+    /// `defer_agent` without it rather than ignoring the flag.
     #[serde(default)]
     pub defer_agent: bool,
+}
+
+/// Smallest non-zero keep-alive interval accepted. Three consecutive
+/// unanswered ticks are the daemon's "server is dead" verdict, and a server
+/// under load can take seconds to answer a refresh, so a one-second interval
+/// would turn ordinary latency into a disconnect.
+pub const KEEP_ALIVE_MIN_SECS: u64 = 10;
+
+/// Why a `ConnectRequest` cannot be honored as written, if it cannot: the
+/// two field combinations that would otherwise be silently reinterpreted.
+/// Pure so the CLI, the SDK and the daemon agree without a round trip.
+pub fn validate_connect_request(request: &ConnectRequest) -> Result<(), String> {
+    if request.keep_alive_secs != 0 && request.keep_alive_secs < KEEP_ALIVE_MIN_SECS {
+        return Err(format!(
+            "keep_alive_secs must be 0 (disabled) or at least {}: the interval is also the \
+             liveness window, and {}s of silence is not evidence of a dead server",
+            KEEP_ALIVE_MIN_SECS,
+            request.keep_alive_secs * 3
+        ));
+    }
+    if request.defer_agent && !request.enable_win_automation {
+        return Err(
+            "defer_agent needs enable_win_automation: without automation there is no agent \
+             to defer, and the flag would be silently ignored"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn default_stream_bind() -> String {
@@ -856,5 +890,36 @@ mod keep_alive_field_tests {
         )
         .unwrap();
         assert_eq!(request.keep_alive_secs, 0);
+    }
+
+    /// The two field combinations a connect must refuse rather than
+    /// reinterpret. Shared by the daemon, the CLI parser and the SDK.
+    #[test]
+    fn a_connect_request_is_validated_before_it_is_honored() {
+        let base = ConnectRequest::default();
+        assert!(validate_connect_request(&base).is_ok());
+
+        // The interval is the liveness window: three ticks of 3s is not
+        // evidence of a dead server.
+        let mut fast = ConnectRequest { keep_alive_secs: 3, ..ConnectRequest::default() };
+        let refused = validate_connect_request(&fast).expect_err("too short");
+        assert!(refused.contains("at least 10"));
+        assert!(refused.contains("9s"), "says how long the window would be: {refused}");
+        fast.keep_alive_secs = KEEP_ALIVE_MIN_SECS;
+        assert!(validate_connect_request(&fast).is_ok());
+        fast.keep_alive_secs = 0;
+        assert!(validate_connect_request(&fast).is_ok(), "0 disables, and stays allowed");
+
+        // Deferring an agent that was never asked for is a silent no-op.
+        let deferred = ConnectRequest { defer_agent: true, ..ConnectRequest::default() };
+        assert!(validate_connect_request(&deferred)
+            .expect_err("no automation to defer")
+            .contains("enable_win_automation"));
+        let both = ConnectRequest {
+            defer_agent: true,
+            enable_win_automation: true,
+            ..ConnectRequest::default()
+        };
+        assert!(validate_connect_request(&both).is_ok());
     }
 }

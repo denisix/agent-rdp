@@ -234,10 +234,21 @@ fn watchdog_budget_ms(cli: &Cli) -> Option<u64> {
             }
             // `--follow` is a CLI-side loop of ordinary polls; only the
             // wall-clock budget grows, each poll keeps its own IPC timeout.
-            cli::AutomateAction::RunPoll { follow: true, follow_timeout, .. } => {
+            // `--follow-timeout` alone implies `--follow` (the command runs
+            // the loop either way), so it must budget the same - matching
+            // `follow: true` only left the watchdog killing a loop it had
+            // never been told about.
+            cli::AutomateAction::RunPoll { follow, follow_timeout, .. }
+                if *follow || follow_timeout.is_some() =>
+            {
                 follow_timeout.unwrap_or(cli::commands::automate::DEFAULT_FOLLOW_TIMEOUT_MS)
             }
-            cli::AutomateAction::WaitFor { timeout, .. } => timeout.unwrap_or(0),
+            // The request carries the same default when the flag is absent;
+            // budgeting 0 here only worked because the grace period covered
+            // the default.
+            cli::AutomateAction::WaitFor { timeout, .. } => {
+                timeout.unwrap_or(cli::commands::automate::DEFAULT_WAIT_FOR_TIMEOUT_MS)
+            }
             // Relaunching the agent retries the Win+R/handshake sequence up
             // to three times; the command's own IPC timeout is raised to
             // match, so the watchdog has to clear that too.
@@ -247,7 +258,7 @@ fn watchdog_budget_ms(cli: &Cli) -> Option<u64> {
         // A transfer is many chunked round trips plus a hash of the whole
         // file at both ends; the command's own IPC timeout is raised to
         // match, so the watchdog has to clear that too.
-        Commands::File(_) => 10 * 60 * 1000,
+        Commands::File(_) => cli::commands::file::TRANSFER_TIMEOUT_MS,
         Commands::Wait { ms } => *ms,
         // Several best-effort daemon round trips (ping, info, status,
         // screenshot, remote log pull), each with its own budget.
@@ -291,12 +302,12 @@ mod watchdog_tests {
     /// on it, or the shortest one silently decides the real limit.
     #[test]
     fn connect_and_restart_budgets_cover_the_bootstrap_worst_case() {
-        // Connect pays for the survivor wait as well; restart never does,
-        // because it is replacing the agent it would otherwise adopt.
+        // Connect pays for the survivor wait as well; restart instead pays
+        // for evicting the agent it is replacing and probing the new one.
         let connect_worst_ms =
             agent_rdp_daemon::automation::connect_bootstrap_worst_case().as_millis() as u64;
         let restart_worst_ms =
-            agent_rdp_daemon::automation::launch_and_wait_worst_case().as_millis() as u64;
+            agent_rdp_daemon::automation::restart_worst_case().as_millis() as u64;
         assert!(
             DEFAULT_CONNECT_TIMEOUT_MS > connect_worst_ms + 10_000,
             "connect budget {}ms does not clear the {}ms bootstrap worst case",
@@ -323,6 +334,83 @@ mod watchdog_tests {
             Some(DEFAULT_TIMEOUT_MS + WATCHDOG_GRACE_MS)
         );
     }
+
+    /// `--follow-timeout` implies `--follow`, and the watchdog has to know:
+    /// budgeting it as a single poll killed a five-minute follow at 90s.
+    #[test]
+    fn follow_timeout_alone_budgets_the_follow_loop() {
+        let budget = watchdog_budget_ms(&parse(&[
+            "automate", "run-poll", "42", "--follow-timeout", "300000",
+        ]))
+        .unwrap();
+        assert_eq!(budget, DEFAULT_TIMEOUT_MS + 300_000 + WATCHDOG_GRACE_MS);
+        // And a bare --follow uses the loop's default budget.
+        assert_eq!(
+            watchdog_budget_ms(&parse(&["automate", "run-poll", "42", "--follow"])),
+            Some(
+                DEFAULT_TIMEOUT_MS
+                    + cli::commands::automate::DEFAULT_FOLLOW_TIMEOUT_MS
+                    + WATCHDOG_GRACE_MS
+            )
+        );
+    }
+
+    /// `wait-for` without --timeout still waits its default; the watchdog
+    /// must budget that default, not zero.
+    #[test]
+    fn wait_for_default_is_budgeted() {
+        assert_eq!(
+            watchdog_budget_ms(&parse(&["automate", "wait-for", "name=OK"])),
+            Some(
+                DEFAULT_TIMEOUT_MS
+                    + cli::commands::automate::DEFAULT_WAIT_FOR_TIMEOUT_MS
+                    + WATCHDOG_GRACE_MS
+            )
+        );
+    }
+
+    /// The three transfer layers: daemon budget < CLI IPC timeout < watchdog.
+    #[test]
+    fn transfer_layers_are_ordered() {
+        let daemon_ms =
+            agent_rdp_daemon::handlers::file_transfer::TRANSFER_BUDGET.as_millis() as u64;
+        let ipc_ms = DEFAULT_TIMEOUT_MS + cli::commands::file::TRANSFER_TIMEOUT_MS;
+        let watchdog_ms =
+            watchdog_budget_ms(&parse(&["file", "push", "/tmp/a", "C:\\a"])).unwrap();
+        assert!(daemon_ms < ipc_ms, "daemon {daemon_ms} must give up before the CLI {ipc_ms}");
+        assert!(ipc_ms < watchdog_ms, "CLI {ipc_ms} must give up before the watchdog {watchdog_ms}");
+    }
+
+    /// The `--timeout` help text quotes the connect default; keep it honest.
+    #[test]
+    fn timeout_help_quotes_the_real_connect_default() {
+        use clap::CommandFactory;
+        let mut help = Vec::new();
+        Cli::command().write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(
+            help.contains(&DEFAULT_CONNECT_TIMEOUT_MS.to_string()),
+            "help does not mention the connect default {}",
+            DEFAULT_CONNECT_TIMEOUT_MS
+        );
+    }
+
+    /// Refused at parse time so no daemon is spawned for a request the
+    /// daemon would refuse anyway.
+    #[test]
+    fn keep_alive_below_the_floor_is_a_usage_error() {
+        let base = ["connect", "--host", "h", "--username", "u", "--password", "p"];
+        let with = |extra: &[&str]| {
+            let args: Vec<&str> = base.iter().chain(extra.iter()).copied().collect();
+            Cli::try_parse_from(std::iter::once("agent-rdp").chain(args))
+        };
+        assert!(with(&["--keep-alive-secs", "5"]).is_err());
+        assert!(with(&["--keep-alive-secs", "0"]).is_ok());
+        assert!(with(&["--keep-alive-secs", "10"]).is_ok());
+        // --defer-agent without automation is refused too.
+        assert!(with(&["--defer-agent"]).is_err());
+        assert!(with(&["--defer-agent", "--enable-win-automation"]).is_ok());
+    }
 }
 
 /// Default timeout for `connect`. Connecting is not one round-trip: it covers
@@ -334,10 +422,11 @@ mod watchdog_tests {
 /// on that line and cold starts timed out with the daemon still legitimately
 /// working. Since then the handshake windows grew (25/45/75s, each extendable
 /// once on a host that is visibly still starting PowerShell), and connect
-/// additionally waits briefly for an agent that survived the last drop, so
-/// its worst case is `connect_bootstrap_worst_case()` ≈ 311s; this clears it
-/// with room for the RDP handshake itself. A unit test keeps the two in step.
-const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 340_000;
+/// additionally waits briefly for an agent that survived the last drop and
+/// may have to evict a stale one, so its worst case is
+/// `connect_bootstrap_worst_case()` ≈ 336s; this clears it with room for the
+/// RDP handshake itself. A unit test keeps the two in step.
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 360_000;
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     use output::Output;

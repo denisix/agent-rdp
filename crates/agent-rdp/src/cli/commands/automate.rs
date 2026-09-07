@@ -112,14 +112,19 @@ pub async fn run(
     Ok(())
 }
 
-/// Minimum IPC timeout for `automate restart`: three launch attempts with
-/// handshake windows of 25/45/75s, each extendable once while the agent is
-/// visibly starting, plus the fixed launch waits - see
-/// `launch_and_wait_worst_case` in the daemon.
-pub const RESTART_MIN_TIMEOUT_MS: u64 = 320_000;
+/// Minimum IPC timeout for `automate restart`: evicting the running agent,
+/// then three launch attempts with handshake windows of 25/45/75s, each
+/// extendable once while the agent is visibly starting, plus the fixed
+/// launch waits and a status probe of the new agent - see
+/// `restart_worst_case` in the daemon (≈340s).
+pub const RESTART_MIN_TIMEOUT_MS: u64 = 360_000;
 
 /// Default wall-clock budget for `run-poll --follow`.
 pub const DEFAULT_FOLLOW_TIMEOUT_MS: u64 = 60_000;
+
+/// Default `wait-for` budget when `--timeout` is absent. One constant for
+/// the request and for the watchdog, so the two cannot disagree.
+pub const DEFAULT_WAIT_FOR_TIMEOUT_MS: u64 = 30_000;
 
 /// Interval between polls in `run-poll --follow`.
 const FOLLOW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -530,7 +535,7 @@ fn build_request(action: AutomateAction) -> Result<AutomateRequest, String> {
             };
             AutomateRequest::WaitFor {
                 selector,
-                timeout_ms: timeout.unwrap_or(30000),
+                timeout_ms: timeout.unwrap_or(DEFAULT_WAIT_FOR_TIMEOUT_MS),
                 state,
             }
         }

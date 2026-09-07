@@ -1155,13 +1155,25 @@ function Get-AgentStatus {
 # or Add-Content mangled non-Latin content. Base64 keeps the DVC message
 # JSON-safe; the bytes either side of it are never reinterpreted.
 
+# The exception behind a failed .NET call, as "Type: message". PowerShell
+# wraps every failed method call in a MethodInvocationException, so naming
+# the outer type told the caller nothing; the IOException or
+# UnauthorizedAccessException that explains the failure is the inner one.
+function Get-RootExceptionText {
+    param($ErrorRecord)
+    $ex = $ErrorRecord.Exception
+    while ($ex -is [System.Management.Automation.MethodInvocationException] -and $ex.InnerException) {
+        $ex = $ex.InnerException
+    }
+    if ($null -eq $ex) { return "$ErrorRecord" }
+    return "$($ex.GetType().Name): $($ex.Message)"
+}
+
 function Invoke-FileWriteChunk {
     param($Params)
 
     $path = $Params.path
     if (-not $path) { throw "file_write_chunk requires 'path'" }
-
-    $data = [Convert]::FromBase64String($Params.data_b64)
 
     # Chunks land in a sidecar and the destination is replaced only once the
     # whole file verifies. Writing in place meant the first chunk truncated
@@ -1171,34 +1183,56 @@ function Invoke-FileWriteChunk {
     $tid = if ($Params.transfer_id) { $Params.transfer_id } else { "legacy" }
     $part = "$path.agent-rdp-$tid.part"
 
-    if ($Params.first) {
-        if (Test-Path -LiteralPath $path -PathType Container) {
-            throw "Cannot write '$path': it is a directory"
+    # The daemon gave up on this transfer: discard whatever was staged. The
+    # destination was never touched, so there is nothing else to undo.
+    if ($Params.abort) {
+        $existed = Test-Path -LiteralPath $part -PathType Leaf
+        if ($existed) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
+        return @{ aborted = $true; discarded = [bool]$existed }
+    }
+
+    $data = [Convert]::FromBase64String($Params.data_b64)
+
+    # A chunk that cannot be written leaves nothing behind either: the
+    # sidecar is removed before the error goes back, so a failed push does
+    # not park a partial file on the remote disk until the next push to the
+    # same path sweeps it.
+    try {
+        if ($Params.first) {
+            if (Test-Path -LiteralPath $path -PathType Container) {
+                throw "Cannot write '$path': it is a directory"
+            }
+            $dir = Split-Path -Parent $path
+            # Not New-Item: it has no -LiteralPath, and a parent directory
+            # with [brackets] in its name is a wildcard to it.
+            if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+                [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+            }
+            # Sidecars from transfers that died before finishing without the
+            # daemon getting a chance to discard them (channel gone). They
+            # are named after a transfer that is over - except one still
+            # being written by an overlapping push to the same destination,
+            # which this transfer did not start and must not delete out from
+            # under it. An age cutoff is the cheap way to tell the two apart
+            # without tracking every transfer id in flight.
+            $leaf = Split-Path -Leaf $path
+            $searchDir = if ($dir) { $dir } else { "." }
+            $staleBefore = (Get-Date).AddMinutes(-10)
+            Get-ChildItem -LiteralPath $searchDir -Filter "$leaf.agent-rdp-*.part" -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $staleBefore } |
+                ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {} }
+            [System.IO.File]::WriteAllBytes($part, $data)
+        } else {
+            $stream = [System.IO.File]::Open($part, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
+            try {
+                $stream.Write($data, 0, $data.Length)
+            } finally {
+                $stream.Close()
+            }
         }
-        $dir = Split-Path -Parent $path
-        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        }
-        # Sidecars from transfers that died before finishing. Nothing else
-        # cleans them up, and they are named after a transfer that is over -
-        # except one still being written by an overlapping push to the same
-        # destination, which this transfer did not start and must not delete
-        # out from under it. An age cutoff is the cheap way to tell the two
-        # apart without tracking every transfer id in flight.
-        $leaf = Split-Path -Leaf $path
-        $searchDir = if ($dir) { $dir } else { "." }
-        $staleBefore = (Get-Date).AddMinutes(-10)
-        Get-ChildItem -LiteralPath $searchDir -Filter "$leaf.agent-rdp-*.part" -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt $staleBefore } |
-            ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {} }
-        [System.IO.File]::WriteAllBytes($part, $data)
-    } else {
-        $stream = [System.IO.File]::Open($part, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
-        try {
-            $stream.Write($data, 0, $data.Length)
-        } finally {
-            $stream.Close()
-        }
+    } catch {
+        try { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue } catch {}
+        throw "Could not write chunk of '$path': $(Get-RootExceptionText $_)"
     }
 
     $result = @{
@@ -1213,13 +1247,17 @@ function Invoke-FileWriteChunk {
     # Final chunk: verify the assembled file, then put it in place. A hash is
     # required - skipping the check when one is absent is how a transfer could
     # report success without anything having been verified.
+    #
+    # On any failure here the staged copy is discarded and the message says
+    # so: an earlier version told the caller to "report the sidecar name"
+    # after deleting the sidecar.
     try {
         if (-not $Params.sha256) {
-            throw "Transfer of '$path' carried no expected hash, so it cannot be verified (staged as '$part')"
+            throw "Transfer of '$path' carried no expected hash, so it cannot be verified; the staged copy was discarded"
         }
         $hash = (Get-FileHash -LiteralPath $part -Algorithm SHA256).Hash.ToLower()
         if ($Params.sha256.ToLower() -ne $hash) {
-            throw "Transfer verification failed for '$path': expected $($Params.sha256), got $hash (staged as '$part')"
+            throw "Transfer verification failed for '$path': expected $($Params.sha256), got $hash; the staged copy was discarded"
         }
 
         # Replace rather than Move-Item: Move-Item is a delete followed by a
@@ -1236,13 +1274,13 @@ function Invoke-FileWriteChunk {
             try {
                 [System.IO.File]::Replace($part, $path, [NullString]::Value)
             } catch {
-                throw "Could not replace '$path' with the verified transfer staged as '$part': $($_.Exception.GetType().Name): $($_.Exception.Message)"
+                throw "Could not replace '$path' with the verified transfer (the staged copy was discarded): $(Get-RootExceptionText $_)"
             }
         } else {
             try {
                 [System.IO.File]::Move($part, $path)
             } catch {
-                throw "Could not move the verified transfer staged as '$part' into place at '$path': $($_.Exception.GetType().Name): $($_.Exception.Message)"
+                throw "Could not move the verified transfer into place at '$path' (the staged copy was discarded): $(Get-RootExceptionText $_)"
             }
         }
     } catch {
