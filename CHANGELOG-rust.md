@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.19](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.18...agent-rdp-rust-v0.7.19) (2026-09-07)
+
+
+### Bug Fixes
+
+* bind the silence verdict to a prompt answer, unbrick the SDK session ([77c3b14](https://github.com/denisix/agent-rdp/commit/77c3b141c1a3ecb340ab3a8c9e398b40e66b7e42))
+* declare the real MSRV and note the adoption backstop ([e2f0063](https://github.com/denisix/agent-rdp/commit/e2f00635a22a6bb88971bd4a7377f517b7e58fa0))
+* refuse dead sessions, evict stale agents, bound transfers ([0c1c5e5](https://github.com/denisix/agent-rdp/commit/0c1c5e5f160d63ee496a391cfe05c0fa2d05eb66))
+
 ## [0.7.18](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.17...agent-rdp-rust-v0.7.18) (2026-09-06)
 
 
