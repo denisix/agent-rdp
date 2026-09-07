@@ -420,6 +420,14 @@ them all (`automate restart` brings the agent back, streamed pids are gone).
 Children see the agent's pid as `$env:AGENT_RDP_AGENT_PID`:
 `Get-Process powershell | Where-Object { $_.Id -notin $PID, [int]$env:AGENT_RDP_AGENT_PID } | Stop-Process`.
 
+**A command that overruns `--process-timeout` is killed along with
+everything it started**, and the kill is verified before it is reported as
+one: a job object holds the whole tree, so the caller's real work is not
+left running behind a "was killed" message. If anything does survive, the
+error is `kill_failed:` and names each survivor by pid — the difference
+between "your test environment is clean" and "something is still writing to
+your database". The message also carries the host CPU load at the kill.
+
 **Long-running commands** get the time they ask for: the transport deadline,
 the CLI socket timeout and the watchdog all extend to cover
 `--process-timeout`/`--timeout`. But the agent handles one command at a time,

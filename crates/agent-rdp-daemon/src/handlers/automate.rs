@@ -357,7 +357,13 @@ pub async fn handle(
                 return resolve_indeterminate(&ipc, &request, &indeterminate.request_id, &e).await;
             }
             error!("Automation request failed: {}", e);
-            Response::error(ErrorCode::AutomationError, stale_ref_hint(e.to_string()))
+            let message = e.to_string();
+            let message = if targets_an_element(&request) {
+                stale_ref_hint(message)
+            } else {
+                message
+            };
+            Response::error(ErrorCode::AutomationError, message)
         }
     }
 }
@@ -405,7 +411,12 @@ async fn resolve_indeterminate(
                         .as_str()
                         .unwrap_or("the command failed on the agent")
                         .to_string();
-                    return Response::error(ErrorCode::AutomationError, stale_ref_hint(message));
+                    let message = if targets_an_element(request) {
+                        stale_ref_hint(message)
+                    } else {
+                        message
+                    };
+                    return Response::error(ErrorCode::AutomationError, message);
                 }
 
                 // The agent is responsive and has no record of it, so it
@@ -492,6 +503,31 @@ fn request_timeout(request: &AutomateRequest, default: std::time::Duration) -> s
 /// constant so the three layers cannot drift apart.
 pub const SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Whether this request names an element, i.e. whether a stale ref is even
+/// a possible explanation for its failure.
+///
+/// The hint below matches on words that appear in plenty of unrelated agent
+/// errors ("the file was not found", "the job is disabled"), and telling
+/// someone whose `run` timed out to re-run `automate snapshot` is worse than
+/// saying nothing. Only commands that carry a selector can have a stale one.
+fn targets_an_element(request: &AutomateRequest) -> bool {
+    matches!(
+        request,
+        AutomateRequest::Click { .. }
+            | AutomateRequest::Select { .. }
+            | AutomateRequest::Toggle { .. }
+            | AutomateRequest::Expand { .. }
+            | AutomateRequest::Collapse { .. }
+            | AutomateRequest::ContextMenu { .. }
+            | AutomateRequest::Focus { .. }
+            | AutomateRequest::Get { .. }
+            | AutomateRequest::Fill { .. }
+            | AutomateRequest::Clear { .. }
+            | AutomateRequest::Scroll { .. }
+            | AutomateRequest::WaitFor { .. }
+    )
+}
+
 /// Append a "re-snapshot" hint when the agent's error text suggests the
 /// selector's ref is stale after a UI change - the ref is snapshot-scoped by
 /// design, but the raw PS error ("Element is disabled", "no longer exists")
@@ -567,6 +603,27 @@ mod is_read_only_tests {
     fn unrelated_errors_are_left_alone() {
         let message = "command_failed: invalid parameter".to_string();
         assert_eq!(stale_ref_hint(message.clone()), message);
+    }
+
+    /// The hint's trigger words show up in plenty of errors that have
+    /// nothing to do with a snapshot - "the file was not found", a kill
+    /// message naming a process that could not be stopped. Telling someone
+    /// whose `run` timed out to re-run `automate snapshot` is noise.
+    #[test]
+    fn the_stale_ref_hint_only_decorates_selector_commands() {
+        assert!(targets_an_element(&AutomateRequest::Click {
+            selector: "@1".into(),
+            double_click: false,
+        }));
+        assert!(!targets_an_element(&run_request(true, 10_000)));
+        assert!(!targets_an_element(&AutomateRequest::Status));
+        assert!(!targets_an_element(&AutomateRequest::Snapshot {
+            interactive_only: false,
+            compact: false,
+            max_depth: 10,
+            selector: None,
+            focused: false,
+        }));
     }
 
     fn run_request(wait: bool, timeout_ms: u64) -> AutomateRequest {

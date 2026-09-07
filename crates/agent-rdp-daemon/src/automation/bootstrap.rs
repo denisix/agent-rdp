@@ -1246,6 +1246,96 @@ mod tests {
         assert!(LIB_ACTIONS.contains("`nCommand line as executed by the agent: $userScript"));
     }
 
+    /// A timed-out `run --wait` must kill everything the command started,
+    /// not just the wrapper shell, and must prove it before saying so.
+    ///
+    /// The field case: a watcher script was reported "killed" and then ran
+    /// `tsdiscon` two minutes later. `Process.Kill()` terminates one
+    /// process; the caller's command is a grandchild.
+    #[test]
+    fn run_timeout_kills_the_process_tree_and_verifies_it() {
+        assert!(LIB_ACTIONS.contains("function Stop-RunTree"));
+        assert!(LIB_ACTIONS.contains("$script:KillVerifyMs = 2000"));
+        assert!(LIB_ACTIONS.contains("[AgentJob]::Terminate($Job)"));
+        assert!(LIB_ACTIONS.contains("[AgentJob]::ActiveProcesses($Job)"));
+        // The fallback walk, for a host that will not nest jobs.
+        assert!(LIB_ACTIONS.contains("function Get-ProcessDescendant"));
+        assert!(LIB_ACTIONS.contains("Win32_Process"));
+        // Survivors get their own prefix: "killed" and "could not be
+        // killed" must not read the same to a caller deciding whether its
+        // test environment is clean.
+        assert!(LIB_ACTIONS.contains("\"kill_failed: Process timed out after $TimeoutMs ms"));
+        assert!(LIB_ACTIONS.contains("verified gone"));
+        // The old unverified claim is gone.
+        assert!(
+            !LIB_ACTIONS.contains("ms and was killed\""),
+            "the bare `and was killed` claim must not survive"
+        );
+        assert!(!LIB_ACTIONS.contains("try { $process.Kill() } catch {}"));
+        // The agent must never kill itself while walking the tree.
+        assert!(LIB_ACTIONS.contains("if ($pid_ -eq $PID) { continue }"));
+
+        for import in [
+            "AssignProcessToJobObject",
+            "TerminateJobObject",
+            "QueryInformationJobObject",
+        ] {
+            assert!(LIB_TYPES.contains(import), "types.ps1 must import {import}");
+        }
+        // KILL_ON_JOB_CLOSE would make an agent restart kill the caller's
+        // running command. Applying any such limit needs
+        // SetInformationJobObject, which is deliberately not imported: the
+        // job is only ever terminated explicitly.
+        assert!(!LIB_TYPES.contains("SetInformationJobObject"));
+    }
+
+    /// `stale_ref_hint` matches on "not found"/"disabled"/"no longer
+    /// exists" anywhere in an agent error. A kill message naming a
+    /// survivor must not be decorated with "re-run `automate snapshot`".
+    #[test]
+    fn kill_messages_cannot_trigger_the_stale_ref_hint() {
+        let start = LIB_ACTIONS.find("function Get-RunTimeoutMessage").unwrap();
+        let body = &LIB_ACTIONS[start..];
+        let end = body.find("\n}\n").unwrap();
+        let body = body[..end].to_lowercase();
+        for trigger in ["not found", "disabled", "no longer exists"] {
+            assert!(
+                !body.contains(trigger),
+                "the timeout message must not contain {trigger:?}: the daemon would append a stale-ref hint"
+            );
+        }
+    }
+
+    /// A killed run says what the host was doing, so a valid command killed
+    /// by a too-short budget on a saturated host is diagnosable from the
+    /// error alone.
+    #[test]
+    fn a_timeout_reports_cpu_load_and_whether_the_command_started() {
+        assert!(LIB_ACTIONS.contains("function Get-HostCpuPercent"));
+        assert!(LIB_ACTIONS.contains("Host CPU load was $cpu% at the kill."));
+        assert!(LIB_ACTIONS.contains("The command had started and was running."));
+        assert!(LIB_ACTIONS.contains("--process-timeout 90000-120000"));
+        // In-process, not WMI: the first CIM call under the load this
+        // measures has been seen to take seconds.
+        assert!(LIB_TYPES.contains("GetSystemTimes"));
+        assert!(!LIB_ACTIONS.contains("Win32_Processor"));
+    }
+
+    /// Every `Add-Type` is a csc.exe compile at agent start, which is the
+    /// slow part on a loaded host. The P/Invoke lives in one block.
+    #[test]
+    fn native_types_are_compiled_once() {
+        assert_eq!(
+            LIB_TYPES.matches("Add-Type -TypeDefinition").count(),
+            1,
+            "types.ps1 must declare all of its P/Invoke in a single Add-Type"
+        );
+        // The foreground-window import used to be recompiled on every
+        // `automate window` call.
+        assert!(!LIB_ACTIONS.contains("public class Win32 {"));
+        assert!(LIB_ACTIONS.contains("[AgentDesktop]::GetForegroundWindow()"));
+    }
+
     /// Waited runs and finished stream polls report when the process
     /// exited, by the remote clock: the freshness marker for their output.
     #[test]

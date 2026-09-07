@@ -601,7 +601,11 @@ pub enum AutomateAction {
         #[arg(long)]
         hidden: bool,
 
-        /// Process timeout in milliseconds when waiting (default: 10000)
+        /// Process timeout in milliseconds when waiting (default: 10000).
+        /// On expiry the command and everything it started are killed and
+        /// the kill is verified; if anything survives, the error says so
+        /// (`kill_failed:`) and names it. On a CPU-saturated host a
+        /// PowerShell start alone can take past 30s - use 90000-120000.
         #[arg(long = "process-timeout")]
         process_timeout: Option<u64>,
 

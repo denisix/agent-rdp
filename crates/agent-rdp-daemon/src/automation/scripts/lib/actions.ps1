@@ -494,16 +494,10 @@ function Invoke-Window {
             $window = Find-Element -Selector $Params.selector
         }
     } else {
-        # Get foreground window
-        Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32 {
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
-}
-"@
-        $hwnd = [Win32]::GetForegroundWindow()
+        # Get foreground window. The import lives in types.ps1 with the rest
+        # of the P/Invoke: declared here it was recompiled by Add-Type on
+        # every single window call, which is real cost on a loaded host.
+        $hwnd = [AgentDesktop]::GetForegroundWindow()
         $window = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
     }
 
@@ -647,36 +641,259 @@ function Start-RunChild {
     $startedUnix = Get-UnixNow
 
     if ($Wait) {
-        # Use async reading to avoid deadlock when buffer fills
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-
-        $exited = $process.WaitForExit($TimeoutMs)
-
-        if (-not $exited) {
-            try { $process.Kill() } catch {}
-            throw "Process timed out after $TimeoutMs ms and was killed"
+        # Put the child in a job before it can spawn anything, so a timeout
+        # can kill the whole tree rather than just the wrapper shell. A host
+        # that refuses the assignment (nested jobs need Win8/2012+) falls
+        # back to the snapshot walk in Stop-RunTree.
+        $job = [IntPtr]::Zero
+        $assigned = $false
+        try {
+            $job = [AgentJob]::Create()
+            $assigned = [AgentJob]::Assign($job, $process.Handle)
+            if (-not $assigned) {
+                Write-Log "Could not assign the run child to a job object; a timeout will fall back to a process-tree walk" "WARN"
+            }
+        } catch {
+            Write-Log "Job object unavailable ($($_.Exception.Message)); a timeout will fall back to a process-tree walk" "WARN"
         }
 
-        # Wait for async reads to complete (with short timeout since process exited)
-        [void]$stdoutTask.Wait(5000)
-        [void]$stderrTask.Wait(5000)
+        try {
+            # Use async reading to avoid deadlock when buffer fills
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
 
-        return @{
-            exit_code = $process.ExitCode
-            stdout = $stdoutTask.Result
-            stderr = $stderrTask.Result
-            started_unix = $startedUnix
-            # The freshness marker for this output: the caller can tell a
-            # reply produced now from one replayed out of the journal, and
-            # correlate it with `file stat` on the same clock.
-            finished_unix = Get-UnixNow
+            $exited = $process.WaitForExit($TimeoutMs)
+
+            if (-not $exited) {
+                $kill = Stop-RunTree -Process $process -Job $job -Assigned $assigned
+                throw (Get-RunTimeoutMessage -TimeoutMs $TimeoutMs -Kill $kill)
+            }
+
+            # Wait for async reads to complete (with short timeout since process exited)
+            [void]$stdoutTask.Wait(5000)
+            [void]$stderrTask.Wait(5000)
+
+            return @{
+                exit_code = $process.ExitCode
+                stdout = $stdoutTask.Result
+                stderr = $stderrTask.Result
+                started_unix = $startedUnix
+                # The freshness marker for this output: the caller can tell a
+                # reply produced now from one replayed out of the journal, and
+                # correlate it with `file stat` on the same clock.
+                finished_unix = Get-UnixNow
+            }
+        } finally {
+            try { [AgentJob]::Close($job) } catch {}
         }
     } else {
         $launch = Get-LaunchResult -Process $process
         $launch.started_unix = $startedUnix
         return $launch
     }
+}
+
+# How long a killed tree is given to actually disappear before the survivors
+# are reported as survivors.
+$script:KillVerifyMs = 2000
+
+# Host CPU busy percentage, or $null if it cannot be measured. Sampled over
+# a short window because an instantaneous reading does not exist.
+function Get-HostCpuPercent {
+    try {
+        $busy = [AgentCpu]::BusyPercent(500)
+        if ($busy -lt 0) { return $null }
+        return $busy
+    } catch {
+        return $null
+    }
+}
+
+# Kill a timed-out run and everything it started, then prove it.
+#
+# Two mechanisms, in order. The job object is the reliable one: it owns
+# every descendant however it was spawned, and its ActiveProcesses count is
+# an exact answer that no PID can be reused out from under. The snapshot
+# walk is the fallback for a host that would not assign the job, and the
+# double-check when the job says processes are still alive.
+#
+# Returns @{ killed; survivors; errors; total_processes; started }.
+# `survivors` is what makes the difference the caller cares about: an empty
+# list means the tree is verifiably gone.
+function Stop-RunTree {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [IntPtr]$Job,
+        [bool]$Assigned
+    )
+
+    $result = @{
+        killed = @()
+        survivors = @()
+        errors = @()
+        total_processes = -1
+        started = $false
+    }
+
+    if ($Assigned) {
+        try {
+            $result.total_processes = [AgentJob]::TotalProcesses($Job)
+            # More than the wrapper shell itself means the command really
+            # did start something.
+            if ($result.total_processes -gt 1) { $result.started = $true }
+            [void][AgentJob]::Terminate($Job)
+
+            $deadline = (Get-Date).AddMilliseconds($script:KillVerifyMs)
+            $active = [AgentJob]::ActiveProcesses($Job)
+            while ($active -gt 0 -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 100
+                $active = [AgentJob]::ActiveProcesses($Job)
+            }
+            [void]$Process.WaitForExit(500)
+            if ($active -eq 0) {
+                # The job is authoritative here: everything it held is gone.
+                $result.killed = @($Process.Id)
+                return $result
+            }
+            $result.errors += "the job still reported $active live process(es) after $($script:KillVerifyMs)ms"
+        } catch {
+            $result.errors += "job termination failed: $($_.Exception.Message)"
+        }
+    }
+
+    # Fallback: snapshot the tree, take handles before killing (a pid alone
+    # could be reused by an unrelated process between the walk and the
+    # check), kill, re-walk once for anything spawned in between, then wait
+    # on the handles we hold.
+    try {
+        $descendants = Get-ProcessDescendant -RootPid $Process.Id
+        if ($descendants.Count -gt 0) { $result.started = $true }
+        if (-not $result.started) {
+            try {
+                if ($Process.TotalProcessorTime.TotalMilliseconds -gt 1000) { $result.started = $true }
+            } catch {}
+        }
+
+        $targets = New-Object System.Collections.Generic.List[object]
+        foreach ($pid_ in @($Process.Id) + $descendants) {
+            if ($pid_ -eq $PID) { continue }
+            try {
+                $targets.Add([System.Diagnostics.Process]::GetProcessById($pid_))
+            } catch {
+                # Already gone between the walk and here - the outcome we
+                # wanted anyway.
+            }
+        }
+
+        foreach ($target in $targets) {
+            try {
+                if (-not $target.HasExited) { $target.Kill() }
+                $result.killed += $target.Id
+            } catch {
+                $result.errors += "pid $($target.Id): $($_.Exception.Message)"
+            }
+        }
+
+        # Anything the tree spawned while we were killing it.
+        foreach ($pid_ in Get-ProcessDescendant -RootPid $Process.Id) {
+            if ($pid_ -eq $PID) { continue }
+            try {
+                $late = [System.Diagnostics.Process]::GetProcessById($pid_)
+                $late.Kill()
+                $targets.Add($late)
+                $result.killed += $late.Id
+            } catch {}
+        }
+
+        foreach ($target in $targets) {
+            try {
+                [void]$target.WaitForExit($script:KillVerifyMs)
+                if (-not $target.HasExited) {
+                    $result.survivors += "pid $($target.Id) ($($target.ProcessName))"
+                }
+            } catch {
+                # A handle we can no longer query is one we cannot vouch
+                # for; say so rather than claiming success.
+                $result.survivors += "pid $($target.Id) (could not be verified)"
+            }
+        }
+    } catch {
+        $result.errors += "process-tree walk failed: $($_.Exception.Message)"
+        $result.survivors += "pid $($Process.Id) (could not be verified)"
+    }
+
+    return $result
+}
+
+# Every descendant pid of a root pid, breadth-first. Uses CIM only here, on
+# the fallback path, because WMI on a saturated host is slow - exactly the
+# condition under which timeouts fire.
+function Get-ProcessDescendant {
+    param([int]$RootPid)
+
+    $found = New-Object System.Collections.Generic.List[int]
+    try {
+        $all = Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId -OperationTimeoutSec 5 -ErrorAction Stop
+    } catch {
+        return $found
+    }
+
+    $byParent = @{}
+    foreach ($proc in $all) {
+        $parent = [int]$proc.ParentProcessId
+        if (-not $byParent.ContainsKey($parent)) {
+            $byParent[$parent] = New-Object System.Collections.Generic.List[int]
+        }
+        $byParent[$parent].Add([int]$proc.ProcessId)
+    }
+
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $queue.Enqueue($RootPid)
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        if (-not $byParent.ContainsKey($current)) { continue }
+        foreach ($child in $byParent[$current]) {
+            # Never the agent itself, and never a cycle.
+            if ($child -eq $PID -or $child -eq $RootPid -or $found.Contains($child)) { continue }
+            $found.Add($child)
+            $queue.Enqueue($child)
+        }
+    }
+    return $found
+}
+
+# What the caller is told when a run overran its budget.
+#
+# The distinction that matters is whether the tree is verifiably gone: a
+# caller that is told "killed" restarts its test assuming a clean slate, and
+# a survivor writing to the same database behind its back is how that turns
+# into corrupted data. Survivors therefore get their own `kill_failed:`
+# prefix and are named individually.
+#
+# The wording avoids "not found", "disabled" and "no longer exists": the
+# daemon appends a stale-ref hint to any agent error containing those.
+function Get-RunTimeoutMessage {
+    param(
+        [int]$TimeoutMs,
+        $Kill
+    )
+
+    $cpu = Get-HostCpuPercent
+    $load = if ($null -ne $cpu) { " Host CPU load was $cpu% at the kill." } else { "" }
+    $started = if ($Kill.started) {
+        " The command had started and was running."
+    } else {
+        " The shell had not finished starting; a PowerShell start alone has been measured past 30s on a saturated host - use --process-timeout 90000-120000 there."
+    }
+
+    if ($Kill.survivors.Count -gt 0) {
+        $who = $Kill.survivors -join ", "
+        $detail = if ($Kill.errors.Count -gt 0) { " (" + ($Kill.errors -join "; ") + ")" } else { "" }
+        return "kill_failed: Process timed out after $TimeoutMs ms and could not be fully stopped: $who still running after $($script:KillVerifyMs)ms$detail; stop them by hand before retrying - anything they were writing is still being written.$load$started"
+    }
+
+    $count = $Kill.killed.Count
+    return "Process timed out after $TimeoutMs ms and was killed ($count process(es) terminated, verified gone).$load$started"
 }
 
 # Seconds since the Unix epoch by this machine's clock - the same clock

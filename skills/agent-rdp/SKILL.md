@@ -141,9 +141,15 @@ push` a `.ps1` and run it with `-File`. That path has no quoting layer at all.
 vCPU): the transport and the agent stay up since 0.7.14, but anything that
 *spawns a process* can take 30s+ instead of 1s. A `run` without `--wait`
 gets a 90s spawn budget on its own; for `--wait`, give such commands
-`--process-timeout 60000` or more (the IPC and watchdog budgets follow it);
-a process that overruns is killed and reported as `command_failed: Process
-timed out`, with the command line. Health check with `automate status
+`--process-timeout 90000` to `120000` (the IPC and watchdog budgets follow
+it; 60000 is often not enough at 100% CPU). A process that overruns is
+killed **with everything it started** and the kill is verified: the plain
+`command_failed: Process timed out ... and was killed (N process(es)
+terminated, verified gone)` means the tree really is gone, while
+`kill_failed:` names each survivor and means something is still running and
+still writing. Both report the host CPU load at the kill and whether the
+command had started or the shell was still starting up — that is how to tell
+a too-short budget from a genuinely stuck command. Health check with `automate status
 --json`: `last_rtt_ms` (round trip of the last request; hundreds of ms under
 load is normal), `consecutive_failures` (non-zero = degraded), `relaunches`
 (the agent died and was brought back), `last_error` / `next_retry_secs`
