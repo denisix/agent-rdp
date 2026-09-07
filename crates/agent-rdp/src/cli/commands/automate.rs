@@ -360,6 +360,13 @@ fn automate_timeout_ms(request: &Request, base_timeout_ms: u64) -> u64 {
         return base_timeout_ms;
     };
 
+    // `status` is answered from daemon state within its own short probe
+    // deadline and never enters the recovery ladder, so it neither needs nor
+    // should get the extra budget.
+    if matches!(automate, AutomateRequest::Status) {
+        return base_timeout_ms;
+    }
+
     let command_budget_ms = match automate {
         AutomateRequest::Run { wait: true, timeout_ms, .. } => *timeout_ms,
         // A launch that only returns a pid still pays for a full PowerShell
@@ -373,7 +380,16 @@ fn automate_timeout_ms(request: &Request, base_timeout_ms: u64) -> u64 {
         _ => 0,
     };
 
-    base_timeout_ms.saturating_add(command_budget_ms)
+    // A lost reply sends the daemon into its journal-lookup ladder, which
+    // takes the better part of a minute before it can answer "it ran" or "it
+    // never ran". Giving up before then throws away the answer the ladder
+    // exists to produce and reports a timeout instead.
+    let ladder_ms =
+        agent_rdp_daemon::handlers::automate::indeterminate_resolution_worst().as_millis() as u64;
+
+    base_timeout_ms
+        .saturating_add(command_budget_ms)
+        .saturating_add(ladder_ms)
 }
 
 /// Map a CLI action onto the wire request.
@@ -847,8 +863,9 @@ mod tests {
             stream: false,
             idempotency_key: None,
         });
-        // Otherwise the CLI would abandon a 4-minute command at 30s.
-        assert_eq!(automate_timeout_ms(&request, 30_000), 270_000);
+        // Otherwise the CLI would abandon a 4-minute command at 30s. Plus
+        // the daemon's recovery ladder, in case the reply is lost.
+        assert_eq!(automate_timeout_ms(&request, 30_000), 270_000 + ladder_ms());
     }
 
     #[test]
@@ -858,7 +875,7 @@ mod tests {
             timeout_ms: 60_000,
             state: WaitState::Visible,
         });
-        assert_eq!(automate_timeout_ms(&request, 30_000), 90_000);
+        assert_eq!(automate_timeout_ms(&request, 30_000), 90_000 + ladder_ms());
     }
 
     #[test]
@@ -880,10 +897,75 @@ mod tests {
         // The process timeout is irrelevant (nothing waits for the process),
         // but the spawn itself gets the daemon's spawn deadline plus the base.
         let spawn_ms = agent_rdp_daemon::handlers::automate::SPAWN_TIMEOUT.as_millis() as u64;
-        assert_eq!(automate_timeout_ms(&detached, 30_000), 30_000 + spawn_ms);
+        assert_eq!(automate_timeout_ms(&detached, 30_000), 30_000 + spawn_ms + ladder_ms());
         assert!(
             automate_timeout_ms(&detached, 30_000) > spawn_ms,
             "the CLI must outlast the daemon's DVC deadline, or it decides the real limit"
+        );
+    }
+
+    fn ladder_ms() -> u64 {
+        agent_rdp_daemon::handlers::automate::indeterminate_resolution_worst().as_millis() as u64
+    }
+
+    /// When a reply is lost the daemon spends up to 36s asking the agent
+    /// whether the command ran. That answer is the difference between a safe
+    /// retry and applying a mutation twice, so the CLI must not give up
+    /// before it arrives - it used to, at 30s, discarding the answer.
+    #[test]
+    fn the_cli_outlasts_the_daemons_recovery_ladder() {
+        let cases = [
+            Request::Automate(AutomateRequest::Click {
+                selector: "@1".into(),
+                double_click: false,
+            }),
+            Request::Automate(AutomateRequest::Snapshot {
+                interactive_only: false,
+                compact: false,
+                max_depth: 10,
+                selector: None,
+                focused: false,
+            }),
+            Request::Automate(AutomateRequest::Run {
+                command: "build.cmd".into(),
+                args: Vec::new(),
+                wait: true,
+                hidden: false,
+                timeout_ms: 240_000,
+                shell: None,
+                stream: false,
+                idempotency_key: None,
+            }),
+            Request::Automate(AutomateRequest::WaitFor {
+                selector: "@e1".into(),
+                timeout_ms: 60_000,
+                state: WaitState::Visible,
+            }),
+        ];
+
+        for request in cases {
+            let Request::Automate(ref automate) = request else { unreachable!() };
+            let daemon_worst = agent_rdp_daemon::handlers::automate::dvc_deadline(automate)
+                .as_millis() as u64
+                + ladder_ms();
+            assert!(
+                automate_timeout_ms(&request, 30_000) > daemon_worst,
+                "the CLI budget must clear the daemon's worst case for {automate:?}"
+            );
+        }
+    }
+
+    /// `status` is the exception: it is answered from daemon state within a
+    /// short probe deadline and never reaches the ladder, so it must stay
+    /// quick rather than inheriting a minute of budget.
+    #[test]
+    fn a_status_stays_on_the_base_timeout() {
+        let request = Request::Automate(AutomateRequest::Status);
+        assert_eq!(automate_timeout_ms(&request, 30_000), 30_000);
+        let probe = agent_rdp_daemon::handlers::automate::STATUS_PROBE_TIMEOUT.as_millis() as u64;
+        assert!(
+            automate_timeout_ms(&request, 30_000) > probe,
+            "the CLI must outlast the daemon's own probe deadline"
         );
     }
 

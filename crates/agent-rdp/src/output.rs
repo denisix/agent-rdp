@@ -298,6 +298,9 @@ impl Output {
                         status.total_launches
                     );
                 }
+                if let Some(ref probe) = status.probe_error {
+                    println!("Status probe: {}", probe);
+                }
                 if let Some(ref err) = status.last_error {
                     println!("Last launch error: {}", err);
                 }

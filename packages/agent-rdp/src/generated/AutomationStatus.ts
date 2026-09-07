@@ -93,4 +93,14 @@ last_error?: string,
  * agent on its own (only while the agent is down and a retry is
  * scheduled; retries wait for the session to be idle first).
  */
-next_retry_secs?: number, };
+next_retry_secs?: number, 
+/**
+ * Why this status came from the daemon rather than from the agent: the
+ * agent holds the channel but did not answer the probe. Says whether
+ * it is busy with another command (it runs one at a time, so a long
+ * `run --wait` blocks everything) or silent with nothing in flight,
+ * which is the shape of a frozen agent. `None` when the agent
+ * answered normally, and when it is plainly down (`last_error` covers
+ * that case).
+ */
+probe_error?: string, };

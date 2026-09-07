@@ -226,6 +226,15 @@ silently launching detached. If you redirect inside the command instead
 (`*> out.txt`), remember Windows PowerShell 5.1 writes UTF-16LE — use
 `| Out-File -Encoding utf8` before `file pull`.
 
+**`automate status` always answers, and quickly.** It probes the agent for 5
+seconds and then reports what the daemon knows regardless, so it stays useful
+in exactly the moment it is needed — during a reconnect, or against an agent
+that has stopped answering. When the probe fails, `probe_error` says which
+of the two it is: *busy* (another command holds the agent — it runs one at a
+time — and this is not counted as a channel failure) or *silent with nothing
+in flight*, which is what a frozen agent looks like. It never spends the
+recovery ladder's 36 seconds, which is what used to make it time out at 30s.
+
 **"Channel unresponsive" is usually transient.** Re-probe with `automate
 status` — it reports agent uptime, last DVC round-trip, consecutive-failure
 count and `relaunches`, so you can tell "degraded but working" from "dead".

@@ -55,9 +55,12 @@ const STALE_AGENT_SHUTDOWN_REPLY: Duration = Duration::from_secs(5);
 /// without waiting (the channel layer has already released it as primary).
 const STALE_AGENT_EXIT_WAIT: Duration = Duration::from_secs(5);
 
-/// The `automate status` probe `restart` makes of the new agent (the
-/// `DvcIpc` default request timeout).
-const STATUS_PROBE: Duration = Duration::from_secs(10);
+/// The `automate status` probe `restart` makes of the new agent. Longer
+/// than the `STATUS_PROBE_TIMEOUT` an ordinary `automate status` uses: this
+/// one questions an agent that handshook moments ago on a host slow enough
+/// to have needed a relaunch, and there is no caller waiting in the dark
+/// for it - `restart` has its own budget.
+const STATUS_PROBE: Duration = crate::handlers::automate::DEFAULT_DVC_TIMEOUT;
 
 /// How long `connect` waits for an agent that outlived the previous
 /// transport drop to re-open its channel, before typing Win+R for a new one.
@@ -692,16 +695,14 @@ impl AutomationBootstrap {
     }
 
     /// Launch the automation agent on the remote Windows machine via Win+R.
+    /// Takes the drive name rather than the `AutomationState`: it is all
+    /// this needs, and the caller must not hold that lock while typing.
     pub async fn launch_agent(
         &self,
         rdp: &RdpSession,
-        state: &AutomationState,
+        drive_name: &str,
     ) -> anyhow::Result<()> {
         info!("Launching automation agent on remote Windows machine");
-
-        // Wait for desktop to stabilize after RDP connection
-        debug!("Waiting for remote desktop to stabilize...");
-        sleep(Duration::from_secs(2)).await;
 
         // The command to run via Win+R
         // Uses the mapped drive path: \\TSCLIENT\<drive_name>\scripts\agent.ps1
@@ -710,8 +711,8 @@ impl AutomationBootstrap {
         // anything the agent could compute about itself.
         let ps_command = format!(
             "powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File \"\\\\TSCLIENT\\{}\\scripts\\agent.ps1\" -BasePath \"\\\\TSCLIENT\\{}\" -BuildId \"{}\"",
-            state.drive_name,
-            state.drive_name,
+            drive_name,
+            drive_name,
             expected_build_id()
         );
 
@@ -1032,9 +1033,17 @@ impl AutomationBootstrap {
     ) -> Result<(), String> {
         let mut last_reason = String::new();
 
-        let dvc_state = match automation_state.lock().await.dvc_state.clone() {
-            Some(state) => state,
-            None => return Err("Automation DVC state not initialized".to_string()),
+        // Both taken once, here: `launch_agent` needs nothing else from the
+        // automation state, and holding that lock while typing parked every
+        // concurrent `automate` command behind ~5s of keystrokes and up to
+        // 15s of clipboard round trip - `automate status`, the one command
+        // whose whole job is to answer during a recovery, most of all.
+        let (dvc_state, drive_name) = {
+            let state = automation_state.lock().await;
+            match state.dvc_state.clone() {
+                Some(dvc_state) => (dvc_state, state.drive_name.clone()),
+                None => return Err("Automation DVC state not initialized".to_string()),
+            }
         };
 
         if adopt_first {
@@ -1072,11 +1081,15 @@ impl AutomationBootstrap {
                 info!("Previous agent launch is still starting; waiting instead of relaunching");
                 true
             } else {
+                // Outside both locks: nothing here needs them, and they
+                // would otherwise be held for the whole settle time.
+                debug!("Waiting for remote desktop to stabilize...");
+                sleep(Duration::from_secs(2)).await;
+
                 let session = rdp_session.lock().await;
                 match session.as_ref() {
                     Some(rdp) => {
-                        let auto_state = automation_state.lock().await;
-                        match self.launch_agent(rdp, &auto_state).await {
+                        match self.launch_agent(rdp, &drive_name).await {
                             Ok(()) => true,
                             Err(e) => {
                                 warn!("Failed to launch automation agent: {}", e);
@@ -1230,6 +1243,30 @@ mod tests {
         // The main loop keys on the prefix, not on substrings.
         assert!(AGENT_SCRIPT.contains("$errorMsg.StartsWith($script:DvcFatalPrefix)"));
         assert!(!AGENT_SCRIPT.contains("$errorMsg -match \"Win32 error\""));
+    }
+
+    /// The launch keystrokes must not be typed while holding the automation
+    /// lock. `launch_agent` needs only the drive name, and holding the lock
+    /// across ~5s of sleeps plus a clipboard round trip parked every
+    /// concurrent `automate` command behind it - including `automate
+    /// status`, whose whole job is to answer during a recovery.
+    #[test]
+    fn the_launch_types_without_the_automation_lock() {
+        let source = include_str!("bootstrap.rs");
+        let body_at = source.find("pub async fn launch_and_wait").unwrap();
+        let body = &source[body_at..];
+        let end = body.find("\n    /// Clean up automation resources").unwrap();
+        let body = &body[..end];
+
+        let session_lock = body.find("let session = rdp_session.lock().await;").unwrap();
+        let launch = body.find("self.launch_agent(rdp, &drive_name)").unwrap();
+        assert!(session_lock < launch);
+        assert!(
+            !body[session_lock..launch].contains("automation_state.lock()"),
+            "the automation lock must not be held across the launch keystrokes"
+        );
+        // The settle sleep belongs outside both locks too.
+        assert!(body.contains("sleep(Duration::from_secs(2)).await;"));
     }
 
     /// A `run` that does not parse as Windows PowerShell is refused before

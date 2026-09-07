@@ -55,7 +55,7 @@ impl DvcIpc {
     pub fn new(state: SharedDvcState) -> Self {
         Self {
             state,
-            timeout: Duration::from_secs(10),
+            timeout: crate::handlers::automate::DEFAULT_DVC_TIMEOUT,
             consecutive_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             last_rtt_ms: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         }
@@ -116,6 +116,46 @@ impl DvcIpc {
     pub fn agent_uptime_secs(&self) -> Option<u64> {
         let state = self.state.lock();
         state.handshake_at.map(|at| at.elapsed().as_secs())
+    }
+
+    /// How many requests are waiting for a reply right now.
+    ///
+    /// The agent executes one command at a time, so this is what separates
+    /// "busy behind a long `run --wait`" from "not answering at all" when a
+    /// status probe times out - two states a caller has to act on
+    /// differently, and which look identical from the timeout alone.
+    pub fn pending_requests(&self) -> usize {
+        self.state.lock().pending.len()
+    }
+
+    /// Seed an in-flight request, so the busy-versus-frozen distinction can
+    /// be tested without a live channel.
+    #[cfg(test)]
+    pub fn insert_pending_for_test(
+        &self,
+        id: &str,
+        tx: tokio::sync::oneshot::Sender<crate::automation::dvc_channel::DvcResponse>,
+    ) {
+        self.state.lock().pending.insert(id.to_string(), tx);
+    }
+
+    /// A status round trip that will not be mistaken for a sick channel.
+    ///
+    /// `consecutive_failures` is the "channel degraded" signal, and a probe
+    /// that timed out only because a legitimate long command was occupying
+    /// the agent is not evidence of that. So the counter is only advanced
+    /// when nothing else was in flight.
+    pub async fn probe_status(&self, response_timeout: Duration) -> anyhow::Result<serde_json::Value> {
+        let busy = self.pending_requests() > 0;
+        let before = self.consecutive_failures();
+        let result = self
+            .send_request_with_timeout(&AutomateRequest::Status, response_timeout)
+            .await;
+        if result.is_err() && busy {
+            self.consecutive_failures
+                .store(before, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     /// Get the agent capabilities from the handshake.

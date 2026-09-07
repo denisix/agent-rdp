@@ -71,6 +71,14 @@ const RESTART_TIMEOUT_MS = 360_000;
 const TRANSFER_TIMEOUT_MS = 570_000;
 /** The daemon's spawn deadline for a detached `run`. */
 const SPAWN_TIMEOUT_MS = 90_000;
+/**
+ * The daemon's worst case for resolving a lost reply: three journal lookups
+ * of 10s with 2s and 4s of backoff between them. It answers "the command
+ * ran" or "it never ran", which is the difference between a safe retry and a
+ * double-apply - so no layer above may give up before it finishes.
+ * Mirrors `indeterminate_resolution_worst()` in the daemon.
+ */
+const INDETERMINATE_MS = 36_000;
 
 /**
  * Slack over the daemon's own deadline for a command, so the daemon is the
@@ -92,17 +100,25 @@ export function requestTimeout(request: Request, base: number): number {
       return Math.max(base, DAEMON_SLACK_MS) + TRANSFER_TIMEOUT_MS;
     case 'automate': {
       const op = request as { op?: string; wait?: boolean; timeout_ms?: number };
+      // `status` is answered from daemon state within a short probe deadline
+      // and never enters the recovery ladder below.
+      if (op.op === 'status') {
+        return base;
+      }
       // A remote command's own budget is the daemon's, which allows itself
-      // some margin past it; this must clear both.
+      // some margin past it; this must clear both. On top of that, a lost
+      // reply sends the daemon into its journal-lookup ladder, and giving up
+      // before that finishes discards the "it ran"/"it never ran" answer the
+      // ladder exists to produce.
       if (op.op === 'run') {
         return op.wait
-          ? Math.max(base, DAEMON_SLACK_MS) + (op.timeout_ms ?? 10_000)
-          : Math.max(base, DAEMON_SLACK_MS) + SPAWN_TIMEOUT_MS;
+          ? Math.max(base, DAEMON_SLACK_MS) + (op.timeout_ms ?? 10_000) + INDETERMINATE_MS
+          : Math.max(base, DAEMON_SLACK_MS) + SPAWN_TIMEOUT_MS + INDETERMINATE_MS;
       }
       if (op.op === 'wait_for') {
-        return Math.max(base, DAEMON_SLACK_MS) + (op.timeout_ms ?? 30_000);
+        return Math.max(base, DAEMON_SLACK_MS) + (op.timeout_ms ?? 30_000) + INDETERMINATE_MS;
       }
-      return base;
+      return base + INDETERMINATE_MS;
     }
     case 'locate': {
       const wait = (request as { wait_ms?: number }).wait_ms;

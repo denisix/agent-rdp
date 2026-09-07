@@ -144,26 +144,9 @@ pub async fn handle_restart(
         Ok(()) => {
             let (ipc, fallback) = {
                 let state = automation_state.lock().await;
-                let dvc_ipc = state.dvc_ipc.as_ref();
-                let mut fallback = AutomationStatus {
-                    agent_running: true,
-                    agent_pid: state.agent_pid,
-                    capabilities: dvc_ipc.map(|ipc| ipc.capabilities()).unwrap_or_default(),
-                    version: dvc_ipc.and_then(|ipc| ipc.agent_version()),
-                    log_path: None,
-                    relaunches: 0,
-                    uptime_secs: dvc_ipc.and_then(|ipc| ipc.agent_uptime_secs()),
-                    last_rtt_ms: None,
-                    consecutive_failures: 0,
-                    last_error: None,
-                    next_retry_secs: None,
-                    total_launches: 0,
-                    adopted: false,
-                    daemon_version: None,
-                    cli_version: None,
-                };
-                fill_daemon_fields(&mut fallback, &state);
-                (dvc_ipc.cloned(), fallback)
+                // The agent just handshook, so it is running whether or not
+                // it answers the probe below in time.
+                (state.dvc_ipc.clone(), handshake_view(&state, true))
             };
             // The real thing (log path, RTT) from the agent that just came
             // up; the handshake-only view if it does not answer in time.
@@ -179,6 +162,87 @@ pub async fn handle_restart(
             format!("Automation agent restart failed: {}", reason),
         ),
     }
+}
+
+/// Deadline for the `status` round trip.
+///
+/// Short on purpose, and short of the CLI's own socket timeout: `status` is
+/// the health check, and the moment a caller most needs it is exactly when
+/// the agent is least likely to answer. It used to take the ordinary 10s
+/// DVC deadline and then enter the indeterminate ladder - 46s of retries
+/// against an agent that had already stopped answering, which the CLI cut
+/// off at 30s with "Request timed out". The one question in the mud was the
+/// one question the tool would not answer.
+pub const STATUS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The status a stored handshake alone can answer: who the agent claims to
+/// be, without asking it anything.
+fn handshake_view(
+    state: &crate::automation::AutomationState,
+    agent_running: bool,
+) -> AutomationStatus {
+    let dvc_ipc = state.dvc_ipc.as_ref();
+    let mut status = AutomationStatus {
+        agent_running,
+        agent_pid: state.agent_pid,
+        capabilities: dvc_ipc.map(|ipc| ipc.capabilities()).unwrap_or_default(),
+        version: dvc_ipc.and_then(|ipc| ipc.agent_version()),
+        log_path: None,
+        relaunches: 0,
+        uptime_secs: dvc_ipc.and_then(|ipc| ipc.agent_uptime_secs()),
+        last_rtt_ms: dvc_ipc.and_then(|ipc| ipc.last_rtt_ms()),
+        consecutive_failures: dvc_ipc.map(|ipc| ipc.consecutive_failures()).unwrap_or(0),
+        last_error: None,
+        next_retry_secs: None,
+        total_launches: 0,
+        adopted: false,
+        daemon_version: None,
+        cli_version: None,
+        probe_error: None,
+    };
+    fill_daemon_fields(&mut status, state);
+    status
+}
+
+/// `automate status` when the agent holds the channel but did not answer
+/// the probe.
+///
+/// A success, not an error: the daemon knows plenty about the agent even
+/// when the agent is silent, and that knowledge is the whole point of the
+/// command. The distinction that decides what a caller does next is busy
+/// versus frozen - the agent runs one command at a time, so a long
+/// `run --wait` from another caller blocks the probe without anything being
+/// wrong.
+fn probe_fallback_status(
+    state: &crate::automation::AutomationState,
+    ipc: &crate::automation::DvcIpc,
+    error: &anyhow::Error,
+) -> Response {
+    let mut status = handshake_view(state, false);
+    let pending = ipc.pending_requests();
+    status.probe_error = Some(if pending > 0 {
+        format!(
+            "the agent holds the channel and is busy: {} request(s) in flight (it runs one \
+             command at a time, so a long `run --wait` blocks everything else). It did not \
+             answer a status probe within {}s; this is not counted as a channel failure",
+            pending,
+            STATUS_PROBE_TIMEOUT.as_secs()
+        )
+    } else {
+        let next = match status.next_retry_secs {
+            Some(0) => " A relaunch is due as soon as the session has been idle for 2 minutes.".to_string(),
+            Some(secs) => format!(" A relaunch is scheduled in {}s (once the session is idle).", secs),
+            None => " No relaunch is scheduled - `automate restart` relaunches it now.".to_string(),
+        };
+        format!(
+            "the agent holds the channel but did not answer a status probe within {}s with \
+             nothing else in flight, so it is not merely busy ({}).{}",
+            STATUS_PROBE_TIMEOUT.as_secs(),
+            error,
+            next
+        )
+    });
+    Response::success(ResponseData::AutomationStatus(status))
 }
 
 /// `automate status` while the agent cannot be asked: what the daemon
@@ -220,6 +284,9 @@ fn offline_status(state: &crate::automation::AutomationState) -> Response {
         adopted: state.adopted,
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         cli_version: None,
+        // The agent is not holding the channel at all here, so there was no
+        // probe to fail; `last_error` above is the explanation.
+        probe_error: None,
     }))
 }
 
@@ -238,7 +305,7 @@ fn fill_daemon_fields(status: &mut AutomationStatus, state: &crate::automation::
 /// folded in.
 async fn live_status(ipc: &crate::automation::DvcIpc) -> anyhow::Result<AutomationStatus> {
     let data = ipc
-        .send_request_with_timeout(&AutomateRequest::Status, std::time::Duration::from_secs(10))
+        .send_request_with_timeout(&AutomateRequest::Status, DEFAULT_DVC_TIMEOUT)
         .await?;
     let mut status = parse_status_response(data)?;
     status.uptime_secs = ipc.agent_uptime_secs();
@@ -335,6 +402,22 @@ pub async fn handle(
     // Clone the IPC to release the lock before async operation
     let ipc = dvc_ipc.clone();
     drop(state);
+
+    // `status` never enters the indeterminate ladder below. It is the
+    // health check: an answer built from what the daemon knows, now, beats
+    // 46 seconds of retries ending in a timeout the caller has to interpret.
+    if matches!(request, AutomateRequest::Status) {
+        return match ipc.probe_status(STATUS_PROBE_TIMEOUT).await {
+            Ok(data) => {
+                let mut response = convert_response(request, data, &ipc);
+                if let Some(ResponseData::AutomationStatus(ref mut status)) = response.data {
+                    fill_daemon_fields(status, &*automation_state.lock().await);
+                }
+                response
+            }
+            Err(e) => probe_fallback_status(&*automation_state.lock().await, &ipc, &e),
+        };
+    }
 
     // Send request to PowerShell agent via DVC, giving commands that carry
     // their own budget the time they asked for.
@@ -456,6 +539,33 @@ const QUERY_RESULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 /// Base backoff between lookups, multiplied by the attempt number.
 const QUERY_RESULT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The longest the recovery ladder above can run before it gives up.
+///
+/// Every layer that waits on an automate command has to clear this or it
+/// reports a timeout while the daemon is still working: the CLI socket
+/// timeout, the CLI watchdog and the SDK all derive their budgets from it.
+/// A `status` never reaches the ladder (`STATUS_PROBE_TIMEOUT`), which is
+/// why it alone does not pay for it.
+pub fn indeterminate_resolution_worst() -> std::time::Duration {
+    let attempts = QUERY_RESULT_TIMEOUT * QUERY_RESULT_ATTEMPTS;
+    // The backoff runs between attempts, growing by the attempt number:
+    // 1x after the first, 2x after the second, none after the last.
+    let backoff = QUERY_RESULT_BACKOFF * (1 + 2);
+    attempts + backoff
+}
+
+/// The daemon's own deadline for a request, exposed so the layers above can
+/// be asserted against it rather than restating the numbers.
+pub fn dvc_deadline(request: &AutomateRequest) -> std::time::Duration {
+    if matches!(request, AutomateRequest::Status) {
+        return STATUS_PROBE_TIMEOUT;
+    }
+    request_timeout(request, DEFAULT_DVC_TIMEOUT)
+}
+
+/// The DVC response deadline a fresh `DvcIpc` applies.
+pub const DEFAULT_DVC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn indeterminate_message(request: &AutomateRequest, error: &anyhow::Error) -> String {
     if is_read_only(request) {
@@ -1211,6 +1321,8 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
         adopted: false,
         daemon_version: None,
         cli_version: None,
+        // The agent answered, so there is nothing to explain.
+        probe_error: None,
     })
 }
 
@@ -1475,5 +1587,113 @@ mod late_handshake_tests {
         assert!(state.last_error.is_none());
         assert!(state.next_retry_at.is_none());
         assert!(state.adopted, "it came up without anyone typing Win+R");
+    }
+}
+
+#[cfg(test)]
+mod status_probe_tests {
+    use super::*;
+    use crate::automation::DvcHandshake;
+
+    fn ready_ipc(pid: u32) -> crate::automation::DvcIpc {
+        let dvc = crate::automation::new_shared_dvc_state();
+        {
+            let mut s = dvc.lock();
+            s.channel_id = Some(9);
+            s.handshake = Some(DvcHandshake {
+                version: "1.8.0".into(),
+                agent_pid: pid,
+                capabilities: vec![],
+                build_id: Some(crate::automation::expected_build_id()),
+            });
+            s.handshake_at = Some(std::time::Instant::now());
+        }
+        crate::automation::DvcIpc::new(dvc)
+    }
+
+    fn status_of(response: Response) -> AutomationStatus {
+        match response.data {
+            Some(ResponseData::AutomationStatus(status)) => status,
+            other => panic!("expected AutomationStatus, got {:?}", other),
+        }
+    }
+
+    /// A probe that goes unanswered is still an answer: the daemon knows
+    /// who the agent is and what it last did. Reporting a timeout instead
+    /// left the caller with nothing at the exact moment they needed it.
+    #[test]
+    fn a_silent_agent_still_produces_a_status() {
+        let ipc = ready_ipc(777);
+        let mut state = crate::automation::AutomationState::new(std::path::PathBuf::from("/x"));
+        state.agent_pid = Some(777);
+        state.total_launches = 3;
+        state.adopted = true;
+        state.dvc_ipc = Some(ipc.clone());
+
+        let err = anyhow::anyhow!("no reply");
+        let status = status_of(probe_fallback_status(&state, &ipc, &err));
+
+        assert!(!status.agent_running, "it did not answer this probe");
+        assert_eq!(status.agent_pid, Some(777), "the daemon still knows who it is");
+        assert_eq!(status.total_launches, 3, "daemon-side history survives");
+        assert!(status.adopted);
+        let probe = status.probe_error.expect("the reason must be reported");
+        assert!(probe.contains("frozen") || probe.contains("not merely busy"));
+        assert!(probe.contains("automate restart"));
+    }
+
+    /// The agent runs one command at a time, so a probe that times out
+    /// behind someone else's long `run --wait` means "busy", not "dead" -
+    /// and the two call for opposite reactions.
+    #[test]
+    fn a_busy_agent_is_reported_as_busy_not_frozen() {
+        let ipc = ready_ipc(777);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        ipc.insert_pending_for_test("other-request", tx);
+
+        let mut state = crate::automation::AutomationState::new(std::path::PathBuf::from("/x"));
+        state.dvc_ipc = Some(ipc.clone());
+
+        let err = anyhow::anyhow!("no reply");
+        let status = status_of(probe_fallback_status(&state, &ipc, &err));
+
+        let probe = status.probe_error.expect("the reason must be reported");
+        assert!(probe.contains("busy"), "got: {probe}");
+        assert!(probe.contains("1 request(s) in flight"), "got: {probe}");
+        assert!(
+            !probe.contains("frozen"),
+            "a busy agent must not be called frozen: {probe}"
+        );
+    }
+
+    #[test]
+    fn pending_requests_counts_what_is_in_flight() {
+        let ipc = ready_ipc(1);
+        assert_eq!(ipc.pending_requests(), 0);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        ipc.insert_pending_for_test("a", tx);
+        assert_eq!(ipc.pending_requests(), 1);
+    }
+
+    /// The status probe must be short enough that the CLI never gives up
+    /// first, and must not drag in the recovery ladder.
+    #[test]
+    fn the_status_probe_is_the_shortest_layer() {
+        assert!(STATUS_PROBE_TIMEOUT < DEFAULT_DVC_TIMEOUT);
+        assert_eq!(dvc_deadline(&AutomateRequest::Status), STATUS_PROBE_TIMEOUT);
+        assert!(
+            STATUS_PROBE_TIMEOUT < indeterminate_resolution_worst(),
+            "a status must never cost what the ladder costs"
+        );
+    }
+
+    /// Three lookups of 10s with 2s and 4s of backoff between them. Every
+    /// layer above derives its budget from this, so pin the arithmetic.
+    #[test]
+    fn the_recovery_ladder_worst_case_is_thirty_six_seconds() {
+        assert_eq!(
+            indeterminate_resolution_worst(),
+            std::time::Duration::from_secs(36)
+        );
     }
 }

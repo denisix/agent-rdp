@@ -307,6 +307,12 @@ shortest silently decides the real limit:
 2. the CLI's IPC socket timeout (`cli/commands/*.rs`)
 3. the CLI watchdog (`main.rs`, `watchdog_budget_ms`)
 4. the remote command's own budget (`--process-timeout`, `wait-for --timeout`)
+5. the daemon's recovery ladder for a lost reply
+   (`indeterminate_resolution_worst()`, 36s: three `query_result` lookups
+   plus backoff). Layers 2 and 3 and the SDK's `requestTimeout` all add it,
+   or they abandon the very answer it exists to produce - whether a mutating
+   command ran. `status` is the exception: it never reaches the ladder
+   (`STATUS_PROBE_TIMEOUT`, 5s) and so does not pay for it.
 
 A CLI-side loop (`run-poll --follow`) extends only layer 3 by its own budget;
 each iteration keeps the ordinary per-request layers. `--follow-timeout`

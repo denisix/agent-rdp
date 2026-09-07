@@ -573,6 +573,16 @@ pub struct AutomationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub next_retry_secs: Option<u64>,
+    /// Why this status came from the daemon rather than from the agent: the
+    /// agent holds the channel but did not answer the probe. Says whether
+    /// it is busy with another command (it runs one at a time, so a long
+    /// `run --wait` blocks everything) or silent with nothing in flight,
+    /// which is the shape of a frozen agent. `None` when the agent
+    /// answered normally, and when it is plainly down (`last_error` covers
+    /// that case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub probe_error: Option<String>,
 }
 
 /// Command run result.

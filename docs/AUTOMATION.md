@@ -392,6 +392,19 @@ DVC state. `automate status` reports `relaunches`, `last_error` and
 `next_retry_secs`, and is answered from daemon state alone
 (`offline_status`) while the agent cannot be reached.
 
+`status` is also the one command that never enters the indeterminate
+recovery ladder. It probes the agent for `STATUS_PROBE_TIMEOUT` (5s) and, on
+any failure, returns a success built from the stored handshake plus daemon
+state (`handshake_view`/`probe_fallback_status`) with `probe_error`
+explaining why. Before that it took the ordinary 10s deadline and then three
+journal lookups — 46s against an agent that had already stopped answering,
+which the CLI cut off at 30s, so the health check was least available
+exactly when a session was in trouble. `probe_error` distinguishes *busy*
+(`DvcIpc::pending_requests() > 0`; the agent runs one command at a time, and
+`probe_status` deliberately does not count that as a `consecutive_failures`)
+from *silent with nothing in flight*, which is what a frozen agent looks
+like.
+
 `relaunches` counts only the supervisor's and `automate restart`'s launches,
 and `initialize()` zeroes it on every `connect` — so on its own it cannot
 distinguish "the agent has been up all day" from "the session was rebuilt an
