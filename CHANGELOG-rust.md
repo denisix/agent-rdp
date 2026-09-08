@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.20](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.19...agent-rdp-rust-v0.7.20) (2026-09-08)
+
+
+### Features
+
+* **status:** report agent identity, replacements, and desktop liveness ([dba9774](https://github.com/denisix/agent-rdp/commit/dba9774263ef34acb121fbf448f37d385e378aad))
+
+
+### Bug Fixes
+
+* **agent:** kill the whole process tree on --process-timeout and verify it ([3cf6a87](https://github.com/denisix/agent-rdp/commit/3cf6a87d51098ee50e1963da18dbdd9ccb479074))
+* correct what an adversarial review found in the QA fixes ([b36b21a](https://github.com/denisix/agent-rdp/commit/b36b21a1f514119e9ac2616a25fe90f05b24d1c2))
+* **daemon:** answer automate status in 5s, and stop launches from blocking it ([0e209d0](https://github.com/denisix/agent-rdp/commit/0e209d02842eaabad3177e73fb0570ad9ab7da05))
+* **run:** honour --shell cmd.exe and refuse cmd syntax handed to PowerShell ([583595f](https://github.com/denisix/agent-rdp/commit/583595f2dad370ea9356385bab827d7636235c6e))
+
 ## [0.7.19](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.18...agent-rdp-rust-v0.7.19) (2026-09-07)
 
 
