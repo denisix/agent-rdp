@@ -588,9 +588,10 @@ pub enum AutomateAction {
     ///
     /// The command text is a Windows PowerShell 5.1 script: the agent parses
     /// it, wraps it in try/catch and hands it to powershell.exe. cmd.exe
-    /// syntax such as `2>nul` is therefore not understood and is refused
-    /// before anything runs - use `2>$null`, or `--shell cmd.exe` to run a
-    /// cmd command line exactly as written.
+    /// syntax such as `2>nul` is therefore not understood, and is refused
+    /// before anything runs (on the default shell, whose parser the agent
+    /// shares) - use `2>$null`, or `--shell cmd.exe` to run a cmd command
+    /// line exactly as written.
     Run {
         /// Command to run (Windows PowerShell 5.1 unless --shell says otherwise)
         command: String,

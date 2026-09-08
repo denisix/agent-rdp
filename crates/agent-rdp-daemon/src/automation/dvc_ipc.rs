@@ -168,13 +168,16 @@ impl DvcIpc {
     /// when nothing else was in flight.
     pub async fn probe_status(&self, response_timeout: Duration) -> anyhow::Result<serde_json::Value> {
         let busy = self.pending_requests() > 0;
-        let before = self.consecutive_failures();
         let result = self
             .send_request_with_timeout(&AutomateRequest::Status, response_timeout)
             .await;
         if result.is_err() && busy {
+            // Take back only this probe's own increment. Restoring a value
+            // read beforehand would erase a *concurrent* request's failure -
+            // and a concurrent request is precisely what `busy` means, so the
+            // clobber would happen exactly when it is possible.
             self.consecutive_failures
-                .store(before, std::sync::atomic::Ordering::Relaxed);
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
         result
     }

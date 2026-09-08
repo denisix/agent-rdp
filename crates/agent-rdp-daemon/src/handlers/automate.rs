@@ -63,6 +63,17 @@ fn reconcile_agent_identity(
     if !state.agent_ready {
         return;
     }
+    // A launch in flight owns this: it will call `record_ready` with
+    // `launched: true` once its agent handshakes. Racing it here - the
+    // handshake lands on the channel before the launch's poll loop notices -
+    // would record the launch's own agent as a replacement nobody launched,
+    // and the later `record_ready` would see the identity already current
+    // and leave that verdict standing. `automate status` would then tell a
+    // caller their agent "did not survive" about one this daemon had just
+    // deliberately started.
+    if state.relaunch_in_flight {
+        return;
+    }
     let Some(identity) = ipc.agent_identity() else {
         return;
     };
@@ -267,7 +278,14 @@ fn probe_fallback_status(
     ipc: &crate::automation::DvcIpc,
     error: &anyhow::Error,
 ) -> Response {
-    let mut status = handshake_view(state, false);
+    // `agent_running: true`: reaching here means the agent holds the
+    // channel - `handle` already answered from `offline_status` if it did
+    // not. Reporting `false` because one probe went unanswered is the same
+    // lie in a new place: a caller polling status during its own two-hour
+    // `run --wait` would read "the agent is down" and restart it, killing
+    // the command it was waiting on. `probe_error` carries the nuance that
+    // this boolean cannot.
+    let mut status = handshake_view(state, true);
     let pending = ipc.pending_requests();
     status.probe_error = Some(if pending > 0 {
         format!(
@@ -638,6 +656,17 @@ pub fn dvc_deadline(request: &AutomateRequest) -> std::time::Duration {
 /// The DVC response deadline a fresh `DvcIpc` applies.
 pub const DEFAULT_DVC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// What the agent may spend killing a timed-out process tree and proving it
+/// is gone, before it can reply.
+///
+/// Worst case is the fallback path (`Stop-RunTree` in `actions.ps1`, on a
+/// host that will not nest job objects): the job wait, two `Win32_Process`
+/// walks at 5s each, the verification wait and a 500ms CPU sample. Generous
+/// on purpose - the reply carries whether anything survived, and losing it
+/// to a transport deadline turns a definite answer into an indeterminate
+/// one on exactly the loaded hosts where timeouts fire.
+pub const KILL_VERIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
 fn indeterminate_message(request: &AutomateRequest, error: &anyhow::Error) -> String {
     if is_read_only(request) {
         format!("{} This command is read-only - retrying is safe.", error)
@@ -661,8 +690,22 @@ fn request_timeout(request: &AutomateRequest, default: std::time::Duration) -> s
         _ => None,
     };
 
+    // Only a waited `run` can end in a process-tree kill, and only that
+    // kill has to be verified before the agent can reply.
+    let kill_budget = match request {
+        AutomateRequest::Run { wait: true, .. } => KILL_VERIFY_BUDGET,
+        _ => std::time::Duration::ZERO,
+    };
+
     match command_budget_ms {
-        Some(ms) => std::time::Duration::from_millis(ms).saturating_add(default),
+        // Plus the time the agent spends killing and *verifying* a timed-out
+        // tree. On a host that refuses the job assignment that is two
+        // `Win32_Process` walks, the verification wait and a CPU sample -
+        // and blowing the deadline there loses the one answer that matters,
+        // whether anything survived, in favour of an indeterminate error.
+        Some(ms) => std::time::Duration::from_millis(ms)
+            .saturating_add(default)
+            .saturating_add(kill_budget),
         // A launch that only has to return a pid still pays for a whole
         // `powershell.exe` start, and on a host at 100% CPU that has been
         // measured past 20s - well past the 10s default. Blowing the deadline
@@ -706,6 +749,9 @@ fn targets_an_element(request: &AutomateRequest) -> bool {
             | AutomateRequest::Clear { .. }
             | AutomateRequest::Scroll { .. }
             | AutomateRequest::WaitFor { .. }
+            // Its selector is optional (absent means the foreground window),
+            // but when one is given it can go stale like any other.
+            | AutomateRequest::Window { .. }
     )
 }
 
@@ -823,9 +869,23 @@ mod is_read_only_tests {
     #[test]
     fn long_run_wait_gets_its_full_budget_plus_transport_slack() {
         let default = std::time::Duration::from_secs(10);
-        // A 4-minute command must not be cut off at the 10s default.
+        // A 4-minute command must not be cut off at the 10s default, and a
+        // command that overruns still has to kill its tree and prove it
+        // before it can reply.
         let got = request_timeout(&run_request(true, 240_000), default);
-        assert_eq!(got, std::time::Duration::from_secs(250));
+        assert_eq!(
+            got,
+            std::time::Duration::from_secs(250) + KILL_VERIFY_BUDGET
+        );
+        // Only a waited run can end in a kill; nothing else pays for one.
+        assert_eq!(
+            request_timeout(&AutomateRequest::WaitFor {
+                selector: "@1".into(),
+                timeout_ms: 240_000,
+                state: agent_rdp_protocol::WaitState::Visible,
+            }, default),
+            std::time::Duration::from_secs(250)
+        );
     }
 
     #[test]
@@ -1719,13 +1779,16 @@ mod status_probe_tests {
         let err = anyhow::anyhow!("no reply");
         let status = status_of(probe_fallback_status(&state, &ipc, &err));
 
-        assert!(!status.agent_running, "it did not answer this probe");
+        assert!(
+            status.agent_running,
+            "it holds the channel; a caller must not read one silent probe as `the agent is down`"
+        );
         assert_eq!(status.agent_pid, Some(777), "the daemon still knows who it is");
         assert_eq!(status.total_launches, 3, "daemon-side history survives");
         assert!(status.adopted);
         let probe = status.probe_error.expect("the reason must be reported");
-        assert!(probe.contains("frozen") || probe.contains("not merely busy"));
-        assert!(probe.contains("automate restart"));
+        assert!(probe.contains("not merely busy"), "got: {probe}");
+        assert!(probe.contains("automate restart"), "got: {probe}");
     }
 
     /// The agent runs one command at a time, so a probe that times out
@@ -1743,12 +1806,20 @@ mod status_probe_tests {
         let err = anyhow::anyhow!("no reply");
         let status = status_of(probe_fallback_status(&state, &ipc, &err));
 
+        assert!(
+            status.agent_running,
+            "a busy agent is the healthiest thing there is: it is doing work"
+        );
         let probe = status.probe_error.expect("the reason must be reported");
         assert!(probe.contains("busy"), "got: {probe}");
         assert!(probe.contains("1 request(s) in flight"), "got: {probe}");
         assert!(
-            !probe.contains("frozen"),
-            "a busy agent must not be called frozen: {probe}"
+            !probe.contains("not merely busy"),
+            "a busy agent must not be described as one that is not merely busy: {probe}"
+        );
+        assert!(
+            !probe.contains("automate restart"),
+            "restarting a busy agent kills the command it is running: {probe}"
         );
     }
 
@@ -1770,6 +1841,52 @@ mod status_probe_tests {
         assert!(
             STATUS_PROBE_TIMEOUT < indeterminate_resolution_worst(),
             "a status must never cost what the ladder costs"
+        );
+    }
+
+    /// The claim this whole change rests on: `handle` answers a status from
+    /// the probe and returns before it can reach `resolve_indeterminate`.
+    /// Asserted against the source because the alternative needs a live
+    /// channel, and the constants above would all still line up if the
+    /// branch were deleted.
+    #[test]
+    fn the_status_branch_returns_before_the_recovery_ladder() {
+        let source = include_str!("automate.rs");
+        let body_at = source.find("pub async fn handle(").unwrap();
+        let body = &source[body_at..];
+        let end = body.find("\n/// Turn \"we don't know what happened\"").unwrap();
+        let body = &body[..end];
+
+        let branch = body
+            .find("if matches!(request, AutomateRequest::Status) {")
+            .expect("the status branch exists");
+        let probe = body.find("ipc.probe_status(STATUS_PROBE_TIMEOUT)").unwrap();
+        let ladder = body.find("resolve_indeterminate(").unwrap();
+        assert!(branch < probe && probe < ladder, "the probe must come first");
+        assert!(
+            body[branch..probe].contains("return match"),
+            "the status branch must return, not fall through to the ladder"
+        );
+    }
+
+    /// A busy probe must not be counted as a channel failure, and the
+    /// give-back must not erase a concurrent request's failure.
+    #[test]
+    fn a_busy_probe_does_not_count_as_a_channel_failure() {
+        let source = include_str!("../automation/dvc_ipc.rs");
+        let at = source.find("pub async fn probe_status").unwrap();
+        let body = &source[at..];
+        let end = body.find("\n    }").unwrap();
+        let body = &body[..end];
+
+        assert!(body.contains("let busy = self.pending_requests() > 0;"));
+        assert!(
+            body.contains("fetch_sub(1"),
+            "it must take back only its own increment"
+        );
+        assert!(
+            !body.contains(".store("),
+            "restoring a previously read value would clobber a concurrent failure"
         );
     }
 

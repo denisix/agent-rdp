@@ -203,8 +203,25 @@ public class AgentDesktop {
     private static extern bool GetUserObjectInformationW(IntPtr hObj, int nIndex,
         StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int count);
+
     private const uint DESKTOP_READOBJECTS = 0x0001;
     private const int UOI_NAME = 2;
+
+    // Deliberately GetWindowText and not UI Automation: for a window owned
+    // by another process this returns the cached title without sending
+    // WM_GETTEXT, so a hung foreground window cannot block it. A UIA call
+    // here would block for seconds against exactly the wedged desktop these
+    // fields exist to report, and take the whole status reply down with it.
+    public static string ForegroundTitle() {
+        IntPtr hwnd = GetForegroundWindow();
+        if (hwnd == IntPtr.Zero) { return null; }
+        StringBuilder text = new StringBuilder(512);
+        int copied = GetWindowTextW(hwnd, text, text.Capacity);
+        if (copied <= 0) { return null; }
+        return text.ToString();
+    }
 
     public static bool InputDesktopOpen() {
         IntPtr desk = OpenInputDesktop(0, false, DESKTOP_READOBJECTS);

@@ -325,10 +325,21 @@ shortest silently decides the real limit:
 4. the remote command's own budget (`--process-timeout`, `wait-for --timeout`)
 5. the daemon's recovery ladder for a lost reply
    (`indeterminate_resolution_worst()`, 36s: three `query_result` lookups
-   plus backoff). Layers 2 and 3 and the SDK's `requestTimeout` all add it,
-   or they abandon the very answer it exists to produce - whether a mutating
-   command ran. `status` is the exception: it never reaches the ladder
-   (`STATUS_PROBE_TIMEOUT`, 5s) and so does not pay for it.
+   plus backoff) and, for a waited `run`, the process-tree kill it may have
+   to verify first (`KILL_VERIFY_BUDGET`, 20s). Layers 2 and 3 and the SDK's
+   `requestTimeout` all add the ladder, or they abandon the very answer it
+   exists to produce - whether a mutating command ran. `status` is the
+   exception: it never reaches the ladder (`STATUS_PROBE_TIMEOUT`, 5s) and so
+   does not pay for it.
+
+The CLI's automate timeout is *derived* from the daemon's own deadline
+(`dvc_deadline`) rather than recomputed from the same inputs, so "the daemon
+gives up first" holds by construction; every past drift between those two
+came from one side growing a term the other did not.
+`watchdog_tests::automate_layers_are_ordered` pins the ordering, and
+`run-poll --follow` must pass `automate_timeout_ms` on *every* iteration -
+its polls consume the output they return, so a poll abandoned early loses a
+chunk the ladder would have recovered.
 
 A CLI-side loop (`run-poll --follow`) extends only layer 3 by its own budget;
 each iteration keeps the ordinary per-request layers. `--follow-timeout`

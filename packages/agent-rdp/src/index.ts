@@ -79,6 +79,11 @@ const SPAWN_TIMEOUT_MS = 90_000;
  * Mirrors `indeterminate_resolution_worst()` in the daemon.
  */
 const INDETERMINATE_MS = 36_000;
+/**
+ * What the agent may spend killing a timed-out process tree and verifying it
+ * is gone before it can reply. Mirrors `KILL_VERIFY_BUDGET` in the daemon.
+ */
+const KILL_VERIFY_MS = 20_000;
 
 /**
  * Slack over the daemon's own deadline for a command, so the daemon is the
@@ -112,7 +117,10 @@ export function requestTimeout(request: Request, base: number): number {
       // ladder exists to produce.
       if (op.op === 'run') {
         return op.wait
-          ? Math.max(base, DAEMON_SLACK_MS) + (op.timeout_ms ?? 10_000) + INDETERMINATE_MS
+          ? Math.max(base, DAEMON_SLACK_MS) +
+              (op.timeout_ms ?? 10_000) +
+              KILL_VERIFY_MS +
+              INDETERMINATE_MS
           : Math.max(base, DAEMON_SLACK_MS) + SPAWN_TIMEOUT_MS + INDETERMINATE_MS;
       }
       if (op.op === 'wait_for') {

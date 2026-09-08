@@ -1363,18 +1363,22 @@ mod tests {
         assert!(LIB_ACTIONS.contains("[AgentJob]::ActiveProcesses($Job)"));
         // The fallback walk, for a host that will not nest jobs.
         assert!(LIB_ACTIONS.contains("function Get-ProcessDescendant"));
-        assert!(LIB_ACTIONS.contains("Win32_Process"));
+        assert!(LIB_ACTIONS.contains("-ClassName Win32_Process"));
+        assert!(LIB_ACTIONS.contains("-OperationTimeoutSec 5"));
         // Survivors get their own prefix: "killed" and "could not be
         // killed" must not read the same to a caller deciding whether its
         // test environment is clean.
         assert!(LIB_ACTIONS.contains("\"kill_failed: Process timed out after $TimeoutMs ms"));
         assert!(LIB_ACTIONS.contains("verified gone"));
-        // The old unverified claim is gone.
+        // The old unverified claim is gone: every "killed" now carries how
+        // it was established.
         assert!(
-            !LIB_ACTIONS.contains("ms and was killed\""),
-            "the bare `and was killed` claim must not survive"
+            !LIB_ACTIONS.contains("and was killed\"") && !LIB_ACTIONS.contains("and was killed`n"),
+            "no unqualified `and was killed` claim may survive"
         );
         assert!(!LIB_ACTIONS.contains("try { $process.Kill() } catch {}"));
+        // A job that held twelve processes must not report "1 terminated".
+        assert!(LIB_ACTIONS.contains("$count = $Kill.total_processes"));
         // The agent must never kill itself while walking the tree.
         assert!(LIB_ACTIONS.contains("if ($pid_ -eq $PID) { continue }"));
 

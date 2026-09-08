@@ -425,9 +425,13 @@ function Send-DvcHandshake {
         agent_pid = $PID
         capabilities = $Capabilities
         build_id = $BuildId
-        instance_id = $InstanceId
-        started_unix = $StartedUnix
     }
+    # Omitted rather than sent empty when unknown. The daemon compares two
+    # agents by instance id when both report one, and two agents both
+    # reporting "" would compare equal - a replacement mistaken for
+    # continuity, which is the exact confusion this field exists to end.
+    if ($InstanceId) { $handshake.instance_id = $InstanceId }
+    if ($StartedUnix -gt 0) { $handshake.started_unix = $StartedUnix }
 
     Write-DvcMessage -Handle $Handle -Message $handshake
 }

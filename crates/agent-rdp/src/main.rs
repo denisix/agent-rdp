@@ -222,7 +222,13 @@ fn watchdog_budget_ms(cli: &Cli) -> Option<u64> {
     let extension = match &cli.command {
         Commands::Connect(_) => cli.timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS),
         Commands::Locate(args) => args.wait.unwrap_or(0),
-        Commands::Automate(args) => match &args.action {
+        // Every automate command except `status` can spend the daemon's
+        // recovery ladder resolving a lost reply, and the IPC timeout now
+        // includes it. Leaving the watchdog on the grace period alone left
+        // only 24s of real slack, and made the ordering depend on the ladder
+        // staying smaller than `WATCHDOG_GRACE_MS` - a constant nobody
+        // changing `QUERY_RESULT_ATTEMPTS` would think to check.
+        Commands::Automate(args) => automate_ladder_ms(&args.action) + match &args.action {
             cli::AutomateAction::Run { wait: true, process_timeout, .. } => {
                 process_timeout.unwrap_or(10_000)
             }
@@ -266,6 +272,19 @@ fn watchdog_budget_ms(cli: &Cli) -> Option<u64> {
         _ => 0,
     };
     Some(base + extension + WATCHDOG_GRACE_MS)
+}
+
+/// The daemon's lost-reply recovery ladder, for the automate commands that
+/// can reach it.
+///
+/// `status` never does (it has its own short probe), and `restart` answers
+/// from its own budget, so neither pays for it.
+fn automate_ladder_ms(action: &cli::AutomateAction) -> u64 {
+    match action {
+        cli::AutomateAction::Status | cli::AutomateAction::Restart => 0,
+        _ => agent_rdp_daemon::handlers::automate::indeterminate_resolution_worst().as_millis()
+            as u64,
+    }
 }
 
 #[cfg(test)]
@@ -327,11 +346,11 @@ mod watchdog_tests {
             "automate", "run-poll", "42", "--follow", "--follow-timeout", "5000",
         ]))
         .unwrap();
-        assert_eq!(budget, DEFAULT_TIMEOUT_MS + 5000 + WATCHDOG_GRACE_MS);
+        assert_eq!(budget, DEFAULT_TIMEOUT_MS + 5000 + ladder_ms() + WATCHDOG_GRACE_MS);
         // Without --follow, a poll is an ordinary single round trip.
         assert_eq!(
             watchdog_budget_ms(&parse(&["automate", "run-poll", "42"])),
-            Some(DEFAULT_TIMEOUT_MS + WATCHDOG_GRACE_MS)
+            Some(DEFAULT_TIMEOUT_MS + ladder_ms() + WATCHDOG_GRACE_MS)
         );
     }
 
@@ -343,13 +362,14 @@ mod watchdog_tests {
             "automate", "run-poll", "42", "--follow-timeout", "300000",
         ]))
         .unwrap();
-        assert_eq!(budget, DEFAULT_TIMEOUT_MS + 300_000 + WATCHDOG_GRACE_MS);
+        assert_eq!(budget, DEFAULT_TIMEOUT_MS + 300_000 + ladder_ms() + WATCHDOG_GRACE_MS);
         // And a bare --follow uses the loop's default budget.
         assert_eq!(
             watchdog_budget_ms(&parse(&["automate", "run-poll", "42", "--follow"])),
             Some(
                 DEFAULT_TIMEOUT_MS
                     + cli::commands::automate::DEFAULT_FOLLOW_TIMEOUT_MS
+                    + ladder_ms()
                     + WATCHDOG_GRACE_MS
             )
         );
@@ -364,6 +384,7 @@ mod watchdog_tests {
             Some(
                 DEFAULT_TIMEOUT_MS
                     + cli::commands::automate::DEFAULT_WAIT_FOR_TIMEOUT_MS
+                    + ladder_ms()
                     + WATCHDOG_GRACE_MS
             )
         );
@@ -379,6 +400,46 @@ mod watchdog_tests {
             watchdog_budget_ms(&parse(&["file", "push", "/tmp/a", "C:\\a"])).unwrap();
         assert!(daemon_ms < ipc_ms, "daemon {daemon_ms} must give up before the CLI {ipc_ms}");
         assert!(ipc_ms < watchdog_ms, "CLI {ipc_ms} must give up before the watchdog {watchdog_ms}");
+    }
+
+    /// The daemon's lost-reply recovery ladder, which every automate
+    /// command's budget must clear.
+    fn ladder_ms() -> u64 {
+        agent_rdp_daemon::handlers::automate::indeterminate_resolution_worst().as_millis() as u64
+    }
+
+    /// The same ordering for automate commands: whatever the daemon may
+    /// spend (its DVC deadline plus the lost-reply recovery ladder) < the
+    /// CLI's socket timeout < the watchdog.
+    ///
+    /// The watchdog used to rest on `WATCHDOG_GRACE_MS` happening to exceed
+    /// the ladder. Raising `QUERY_RESULT_ATTEMPTS` would have inverted the
+    /// last two silently, which is the failure this ordering exists to
+    /// prevent.
+    #[test]
+    fn automate_layers_are_ordered() {
+        let cases: [(&[&str], u64); 4] = [
+            (&["automate", "click", "@1"], 0),
+            (&["automate", "run", "--wait", "--process-timeout", "600000", "x"], 600_000),
+            (&["automate", "wait-for", "@1", "--timeout", "600000"], 600_000),
+            (&["automate", "snapshot"], 0),
+        ];
+
+        for (args, command_budget_ms) in cases {
+            let daemon_ms = command_budget_ms
+                + agent_rdp_daemon::handlers::automate::DEFAULT_DVC_TIMEOUT.as_millis() as u64
+                + ladder_ms();
+            let watchdog_ms = watchdog_budget_ms(&parse(args)).unwrap();
+            assert!(
+                daemon_ms < watchdog_ms,
+                "{args:?}: daemon {daemon_ms} must give up before the watchdog {watchdog_ms}"
+            );
+        }
+
+        // A status never reaches the ladder, so it must not be budgeted for
+        // one - it is the command that has to answer quickly.
+        let status_ms = watchdog_budget_ms(&parse(&["automate", "status"])).unwrap();
+        assert_eq!(status_ms, DEFAULT_TIMEOUT_MS + WATCHDOG_GRACE_MS);
     }
 
     /// The `--timeout` help text quotes the connect default; keep it honest.

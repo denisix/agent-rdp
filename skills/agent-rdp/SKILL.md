@@ -115,9 +115,10 @@ agent-rdp automate run-poll <pid>                                    # single po
 **`automate run` is PowerShell, not cmd.** The command text is Windows
 PowerShell 5.1 source: the agent parses it, wraps it in try/catch and hands
 it to `powershell.exe`. So `2>nul` is not the null device — PowerShell reads
-it as a file named `nul` and .NET refuses to open it. Use `2>$null`, or
-`--shell cmd.exe` to run a cmd command line exactly as written (no parser
-gate, no wrapper). `--shell` takes only `powershell.exe`, `pwsh.exe` or
+it as a file named `nul` and .NET refuses to open it. The agent catches that
+before launching (`cmd_syntax:`) when the shell is `powershell.exe`, whose
+parser it shares. Use `2>$null`, or `--shell cmd.exe` to run a cmd command
+line exactly as written (no parser gate, no wrapper). `--shell` takes only `powershell.exe`, `pwsh.exe` or
 `cmd.exe`; anything else is refused rather than handed PowerShell's switches.
 
 **Inline `run` quoting: where each layer stops.** Three layers touch the
@@ -142,7 +143,9 @@ command text, and the reply tells you what survived them (`command_line` in
    `--shell pwsh.exe` the 5.1 parser is skipped and pwsh reports its own
    errors; with `--shell cmd.exe` there is no parser layer at all.) A
    redirection to a DOS device (`2>nul`, `>con`) is refused here too, as
-   `cmd_syntax:`, before anything is launched.
+   `cmd_syntax:`, before anything is launched — on `powershell.exe` only,
+   since that is the parser the agent shares; under `--shell pwsh.exe` it
+   reaches pwsh and fails there as before.
 
 Anything with pipelines, `$_`, here-strings or more than one line: `file
 push` a `.ps1` and run it with `-File`. That path has no quoting layer at all.

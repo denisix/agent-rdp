@@ -167,7 +167,8 @@ pub enum AutomateRequest {
     /// The command text is Windows PowerShell 5.1 source unless `shell`
     /// says otherwise: the agent parses it, wraps it in try/catch and
     /// passes it as `-EncodedCommand`. cmd.exe redirections such as
-    /// `2>nul` are refused before launch (`cmd_syntax`) because PowerShell
+    /// `2>nul` are refused before launch (`cmd_syntax`) when the shell is
+    /// `powershell.exe` - the parser the agent shares - because PowerShell
     /// would try to open a device as a file.
     Run {
         /// Command to run.

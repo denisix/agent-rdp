@@ -771,6 +771,7 @@ function Stop-RunTree {
         errors = @()
         total_processes = -1
         started = $false
+        verified_by_job = $false
     }
 
     if ($Assigned) {
@@ -789,8 +790,18 @@ function Stop-RunTree {
             }
             [void]$Process.WaitForExit(500)
             if ($active -eq 0) {
-                # The job is authoritative here: everything it held is gone.
+                # The job is authoritative for everything it held, which is
+                # every descendant created after the assignment however it
+                # was spawned. It cannot vouch for a process created on the
+                # command's behalf by a *service* (schtasks, WMI
+                # Win32_Process.Create): those belong to that service, not to
+                # this tree, and no mechanism here would see them.
                 $result.killed = @($Process.Id)
+                # What the job actually held, which is what the caller wants
+                # counted: reporting the single pid we hold a handle for as
+                # "1 process terminated" for a twelve-process tree reads like
+                # the tree escaped.
+                $result.verified_by_job = $true
                 return $result
             }
             $result.errors += "the job still reported $active live process(es) after $($script:KillVerifyMs)ms"
@@ -930,8 +941,16 @@ function Get-RunTimeoutMessage {
         return "kill_failed: Process timed out after $TimeoutMs ms and could not be fully stopped: $who still running after $($script:KillVerifyMs)ms$detail; stop them by hand before retrying - anything they were writing is still being written.$load$started"
     }
 
-    $count = $Kill.killed.Count
-    return "Process timed out after $TimeoutMs ms and was killed ($count process(es) terminated, verified gone).$load$started"
+    # The job knows how many processes it ever held; the fallback walk knows
+    # only what it managed to open a handle for.
+    if ($Kill.verified_by_job -and $Kill.total_processes -gt 0) {
+        $count = $Kill.total_processes
+        $how = "every process in the job is gone"
+    } else {
+        $count = $Kill.killed.Count
+        $how = "verified gone"
+    }
+    return "Process timed out after $TimeoutMs ms and was killed ($count process(es) terminated, $how).$load$started"
 }
 
 # Seconds since the Unix epoch by this machine's clock - the same clock
@@ -1435,12 +1454,11 @@ function Get-AgentStatus {
         $hwnd = [AgentDesktop]::GetForegroundWindow()
         $desktopAlive = ($hwnd -ne [IntPtr]::Zero)
         if ($desktopAlive) {
-            try {
-                $element = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-                if ($null -ne $element) { $foregroundWindow = $element.Current.Name }
-            } catch {
-                # A window we cannot describe is still a window.
-            }
+            # GetWindowText, not UI Automation: a UIA call against a hung
+            # foreground window blocks for seconds, and `status` has a 5s
+            # budget - losing the whole reply to the very condition these
+            # fields report would be the worst possible trade.
+            $foregroundWindow = [AgentDesktop]::ForegroundTitle()
         }
         $inputDesktopOpen = [AgentDesktop]::InputDesktopOpen()
         $inputDesktopName = [AgentDesktop]::InputDesktopName()
