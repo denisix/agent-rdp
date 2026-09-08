@@ -1851,7 +1851,7 @@ mod status_probe_tests {
     /// branch were deleted.
     #[test]
     fn the_status_branch_returns_before_the_recovery_ladder() {
-        let source = include_str!("automate.rs");
+        let source = crate::automation::lf(include_str!("automate.rs"));
         let body_at = source.find("pub async fn handle(").unwrap();
         let body = &source[body_at..];
         let end = body.find("\n/// Turn \"we don't know what happened\"").unwrap();
@@ -1873,7 +1873,7 @@ mod status_probe_tests {
     /// give-back must not erase a concurrent request's failure.
     #[test]
     fn a_busy_probe_does_not_count_as_a_channel_failure() {
-        let source = include_str!("../automation/dvc_ipc.rs");
+        let source = crate::automation::lf(include_str!("../automation/dvc_ipc.rs"));
         let at = source.find("pub async fn probe_status").unwrap();
         let body = &source[at..];
         let end = body.find("\n    }").unwrap();

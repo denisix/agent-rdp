@@ -645,6 +645,16 @@ pub fn spawn_relaunch_supervisor(
     });
 }
 
+/// Text with line endings normalised, for tests that slice on `\n}`.
+///
+/// A Windows checkout has CRLF, so such a slice finds nothing there while
+/// passing on the developer's machine - the tests then only fail in CI, on
+/// the platform this whole agent runs on.
+#[cfg(test)]
+pub fn lf(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 /// Embedded PowerShell agent script (main entry point).
 const AGENT_SCRIPT: &str = include_str!("scripts/agent.ps1");
 
@@ -1318,7 +1328,7 @@ mod tests {
     /// status`, whose whole job is to answer during a recovery.
     #[test]
     fn the_launch_types_without_the_automation_lock() {
-        let source = include_str!("bootstrap.rs");
+        let source = lf(include_str!("bootstrap.rs"));
         let body_at = source.find("pub async fn launch_and_wait").unwrap();
         let body = &source[body_at..];
         let end = body.find("\n    /// Clean up automation resources").unwrap();
@@ -1401,8 +1411,9 @@ mod tests {
     /// survivor must not be decorated with "re-run `automate snapshot`".
     #[test]
     fn kill_messages_cannot_trigger_the_stale_ref_hint() {
-        let start = LIB_ACTIONS.find("function Get-RunTimeoutMessage").unwrap();
-        let body = &LIB_ACTIONS[start..];
+        let actions = lf(LIB_ACTIONS);
+        let start = actions.find("function Get-RunTimeoutMessage").unwrap();
+        let body = &actions[start..];
         let end = body.find("\n}\n").unwrap();
         let body = body[..end].to_lowercase();
         for trigger in ["not found", "disabled", "no longer exists"] {
@@ -1462,8 +1473,9 @@ mod tests {
         assert!(LIB_TYPES.contains("GetUserObjectInformationW"));
 
         // A probe that throws must cost the status nothing else.
-        let status_at = LIB_ACTIONS.find("function Get-AgentStatus").unwrap();
-        let body = &LIB_ACTIONS[status_at..];
+        let actions = lf(LIB_ACTIONS);
+        let status_at = actions.find("function Get-AgentStatus").unwrap();
+        let body = &actions[status_at..];
         let end = body.find("\n}\n").unwrap();
         assert!(
             body[..end].contains("} catch {"),
@@ -1844,7 +1856,7 @@ mod retry_edge_tests {
     #[test]
     fn launch_keystrokes_do_not_count_as_operator_input() {
         // The restore call sits in `launch_agent`, around the typing.
-        let src = include_str!("bootstrap.rs");
+        let src = lf(include_str!("bootstrap.rs"));
         let mark_at = src.find("let input_mark = rdp.input_activity_mark();").unwrap();
         let type_at = src.find("self.type_launch_command(rdp, ps_command).await").unwrap();
         let restore_at = src.find("rdp.restore_input_activity(input_mark);").unwrap();
@@ -1914,7 +1926,7 @@ mod keep_alive_and_launch_count_tests {
     /// way the outcome recording is.
     #[test]
     fn typing_counts_even_when_the_session_is_gone_by_the_handshake() {
-        let source = include_str!("bootstrap.rs");
+        let source = lf(include_str!("bootstrap.rs"));
         let body_at = source.find("pub async fn launch_and_wait").unwrap();
         let body = &source[body_at..];
         let end = body.find("\n    /// Clean up automation resources").unwrap();
@@ -2000,7 +2012,7 @@ mod keep_alive_and_launch_count_tests {
     /// so it outlives a reconnect and resets only with the target.
     #[test]
     fn the_agent_history_survives_a_reconnect_and_resets_with_the_target() {
-        let source = include_str!("bootstrap.rs");
+        let source = lf(include_str!("bootstrap.rs"));
         let cleanup = source.split("pub async fn cleanup").nth(1).expect("cleanup exists");
         let body = &cleanup[..cleanup.find("\n    }").unwrap_or(cleanup.len())];
         for field in ["last_agent_identity", "agent_changes", "previous_agent_pid"] {
@@ -2030,7 +2042,7 @@ mod keep_alive_and_launch_count_tests {
     /// day" from "the session was rebuilt an hour ago".
     #[test]
     fn a_reconnect_resets_relaunches_but_not_total_launches() {
-        let source = include_str!("bootstrap.rs");
+        let source = lf(include_str!("bootstrap.rs"));
         let initialize = source
             .split("pub async fn initialize")
             .nth(1)
@@ -2114,7 +2126,7 @@ mod survivor_tests {
     /// launched it, not from anything the agent computes about itself.
     #[test]
     fn the_launch_command_carries_the_build_id() {
-        let src = include_str!("bootstrap.rs");
+        let src = lf(include_str!("bootstrap.rs"));
         assert!(src.contains("-BuildId \\\"{}\\\""));
         assert!(AGENT_SCRIPT.contains("[string]$BuildId"));
         assert!(AGENT_SCRIPT.contains("-BuildId $BuildId"));
@@ -2163,7 +2175,7 @@ mod survivor_tests {
         // Only typing counts, and the adoption paths never type. Proven
         // against the source rather than by simulating them: none of them
         // may ever reach `note_launch_typed`.
-        let source = include_str!("bootstrap.rs");
+        let source = lf(include_str!("bootstrap.rs"));
         for function in ["async fn adopt_survivor", "pub async fn adopt_only"] {
             let at = source.find(function).expect("function exists");
             let body = &source[at..];

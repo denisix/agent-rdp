@@ -9,6 +9,8 @@ pub mod dvc_channel;
 pub mod dvc_encode;
 mod dvc_ipc;
 
+#[cfg(test)]
+pub use bootstrap::lf;
 pub use bootstrap::{
     adopt_only, connect_bootstrap_worst_case, expected_agent_version, expected_build_id,
     launch_and_wait_worst_case, note_agent, note_launch_typed, restart_worst_case,
