@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use super::{new_shared_dvc_state, AutomationState, DvcIpc, SharedDvcState};
+use super::{new_shared_dvc_state, AgentIdentity, AutomationState, DvcIpc, SharedDvcState};
 use crate::rdp_session::RdpSession;
 
 /// Launch attempts before `launch_and_wait` gives up.
@@ -202,13 +202,6 @@ pub fn record_launch_outcome(
             state.last_error = None;
             state.next_retry_at = None;
             state.launch_failures = 0;
-            // Counts `connect`'s bootstrap too, which `relaunches` does not:
-            // that launch types Win+R and pastes on the remote desktop, so it
-            // needs to be visible somewhere. An adopted agent is the one case
-            // that succeeded without typing anything, so it is not a launch.
-            if !state.adopted {
-                state.total_launches = state.total_launches.saturating_add(1);
-            }
         }
         Err(reason) => {
             state.launch_failures = state.launch_failures.saturating_add(1);
@@ -230,6 +223,59 @@ pub fn record_launch_outcome(
             }
         }
     }
+}
+
+/// Record that Win+R was typed on the remote desktop.
+///
+/// Counted here, at the keystrokes, rather than when the launch is judged a
+/// success. `total_launches` answers "how often has something appeared on
+/// that desktop", and typing is what makes that true - whether or not the
+/// agent then handshook, and whether or not the session survived long
+/// enough to record an outcome. Counting it at the outcome meant a launch
+/// whose transport dropped mid-bootstrap was never counted at all, while
+/// the next connect adopted the very agent it had produced: a session that
+/// reported `total_launches: 0`, `relaunches: 0` and `adopted: true` about
+/// an agent whose pid had visibly changed.
+///
+/// Deliberately not epoch-gated for the same reason: the keystrokes landed
+/// on a real desktop no matter which session has the state now.
+pub fn note_launch_typed(state: &mut AutomationState) {
+    state.total_launches = state.total_launches.saturating_add(1);
+}
+
+/// Record which agent is on the channel, and notice when it changed.
+///
+/// `launched` says whether *this daemon* typed Win+R to produce it. If the
+/// agent differs from the last one recorded and nobody launched it, the
+/// channel was taken over by a process this daemon never started - a queued
+/// extra promoted after the primary closed, or a survivor that reattached
+/// late. That is still an adoption, but `adopted` alone reads as "the same
+/// agent is still running", which is exactly the wrong conclusion.
+pub fn note_agent(
+    state: &mut AutomationState,
+    identity: AgentIdentity,
+    launched: bool,
+) {
+    let changed = match &state.last_agent_identity {
+        Some(previous) => !previous.is_same(&identity),
+        None => false,
+    };
+    if changed {
+        let previous = state.last_agent_identity.clone().expect("checked above");
+        warn!(
+            "The automation agent behind the channel changed: pid {} -> {} ({})",
+            previous.pid,
+            identity.pid,
+            if launched { "we launched it" } else { "we did not launch it" }
+        );
+        state.previous_agent_pid = Some(previous.pid);
+        state.agent_changes = state.agent_changes.saturating_add(1);
+        state.adopted_replacement = !launched;
+    }
+    state.agent_pid = Some(identity.pid);
+    state.agent_instance = identity.instance.clone();
+    state.last_agent_identity = Some(identity);
+    state.agent_ready = true;
 }
 
 /// The one launch path for an initialized session: `connect`'s bootstrap,
@@ -928,7 +974,8 @@ impl AutomationBootstrap {
                     debug!("A survivor handshook, but the session is gone; not adopting");
                     return Adoption::None;
                 }
-                Self::record_ready(&mut state);
+                // Nothing was typed to bring this one up.
+                Self::record_ready(&mut state, false);
                 state.adopted = true;
                 let ipc = state.dvc_ipc.clone();
                 drop(state);
@@ -999,13 +1046,20 @@ impl AutomationBootstrap {
     }
 
     /// Record a completed handshake in the automation state.
-    fn record_ready(state: &mut AutomationState) {
+    ///
+    /// `launched` distinguishes an agent this daemon typed Win+R for from
+    /// one it merely found on the channel - the difference between "the
+    /// agent restarted" and "the agent we already had came back".
+    fn record_ready(state: &mut AutomationState, launched: bool) {
         if let Some(ipc) = state.dvc_ipc.as_ref() {
             let version = ipc.agent_version().unwrap_or_default();
             let pid = ipc.agent_pid().unwrap_or(0);
             let caps = ipc.capabilities();
-            state.agent_ready = true;
-            state.agent_pid = Some(pid);
+            let identity = ipc.agent_identity().unwrap_or(AgentIdentity {
+                pid,
+                instance: None,
+            });
+            note_agent(state, identity, launched);
             info!(
                 "Automation agent ready via DVC: PID={}, version={}, capabilities={:?}",
                 pid, version, caps
@@ -1086,23 +1140,33 @@ impl AutomationBootstrap {
                 debug!("Waiting for remote desktop to stabilize...");
                 sleep(Duration::from_secs(2)).await;
 
-                let session = rdp_session.lock().await;
-                match session.as_ref() {
-                    Some(rdp) => {
-                        match self.launch_agent(rdp, &drive_name).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                warn!("Failed to launch automation agent: {}", e);
-                                last_reason = format!("Failed to launch automation agent: {}", e);
-                                false
+                let typed = {
+                    let session = rdp_session.lock().await;
+                    match session.as_ref() {
+                        Some(rdp) => {
+                            match self.launch_agent(rdp, &drive_name).await {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    warn!("Failed to launch automation agent: {}", e);
+                                    last_reason = format!("Failed to launch automation agent: {}", e);
+                                    false
+                                }
                             }
                         }
+                        None => {
+                            last_reason = "Not connected to an RDP server".to_string();
+                            false
+                        }
                     }
-                    None => {
-                        last_reason = "Not connected to an RDP server".to_string();
-                        false
-                    }
+                };
+                if typed {
+                    // Counted at the keystrokes, not at the outcome: they
+                    // landed on a real desktop whether or not this launch
+                    // goes on to succeed, or its session survives to record
+                    // anything.
+                    note_launch_typed(&mut *automation_state.lock().await);
                 }
+                typed
             };
 
             if launched {
@@ -1116,7 +1180,9 @@ impl AutomationBootstrap {
                         if auto_state.epoch != epoch {
                             return Err("the session this launch belonged to is gone".to_string());
                         }
-                        Self::record_ready(&mut auto_state);
+                        // This launch typed for it (or waited on keystrokes
+                        // an earlier attempt of this same launch sent).
+                        Self::record_ready(&mut auto_state, true);
                         return Ok(());
                     }
                     Err(e) => {
@@ -1373,6 +1439,34 @@ mod tests {
         assert!(LIB_ACTIONS.contains("[AgentDesktop]::GetForegroundWindow()"));
     }
 
+    /// The agent identifies its *process*, not just its pid, and reports
+    /// whether there is an interactive desktop to drive.
+    #[test]
+    fn the_agent_reports_its_identity_and_its_desktop() {
+        // Minted once per process, so it survives the channel reconnects a
+        // transport drop causes - which is the whole point.
+        assert!(AGENT_SCRIPT.contains("$script:InstanceId = [Guid]::NewGuid().ToString(\"N\")"));
+        assert!(AGENT_SCRIPT.contains("$script:StartedUnix = Get-UnixNow"));
+        assert!(AGENT_SCRIPT.contains("-InstanceId $script:InstanceId -StartedUnix $script:StartedUnix"));
+        assert!(LIB_DVC.contains("instance_id = $InstanceId"));
+        assert!(LIB_DVC.contains("started_unix = $StartedUnix"));
+
+        assert!(LIB_ACTIONS.contains("instance_id = $script:InstanceId"));
+        assert!(LIB_ACTIONS.contains("desktop_alive = $desktopAlive"));
+        assert!(LIB_ACTIONS.contains("input_desktop_name = $inputDesktopName"));
+        assert!(LIB_TYPES.contains("OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess)"));
+        assert!(LIB_TYPES.contains("GetUserObjectInformationW"));
+
+        // A probe that throws must cost the status nothing else.
+        let status_at = LIB_ACTIONS.find("function Get-AgentStatus").unwrap();
+        let body = &LIB_ACTIONS[status_at..];
+        let end = body.find("\n}\n").unwrap();
+        assert!(
+            body[..end].contains("} catch {"),
+            "the desktop probe must not be able to break `automate status`"
+        );
+    }
+
     /// `--shell cmd.exe` used to get PowerShell's own switches, so it could
     /// never have worked: cmd printed "'-NoProfile' is not recognized".
     /// A cmd line is now handed over as-is.
@@ -1452,7 +1546,7 @@ mod tests {
         // Duplicate ids no longer inflate the FIFO.
         assert!(LIB_ACTIONS.contains("if (-not $script:ResultJournalOrder.Contains($Id))"));
         assert!(AGENT_SCRIPT.contains("\"persistent_journal\""));
-        assert!(AGENT_SCRIPT.contains("$script:Version = \"1.8.0\""));
+        assert!(AGENT_SCRIPT.contains("$script:Version = \"1.9.0\""));
     }
 
     #[test]
@@ -1781,24 +1875,150 @@ mod keep_alive_and_launch_count_tests {
         AutomationState::new(std::path::PathBuf::from("/tmp/agent-rdp-test"))
     }
 
-    /// Every successful launch counts, `connect`'s bootstrap included -
-    /// that one types Win+R on the remote desktop and was previously
-    /// invisible, because only `relaunch_agent` touched `relaunches`.
+    /// Launches are counted at the keystrokes, not at the outcome.
+    ///
+    /// `total_launches` answers "how often has something appeared on that
+    /// desktop". Counting it when a launch was *judged* successful meant a
+    /// launch whose transport dropped mid-bootstrap - which had typed Win+R
+    /// on a real desktop - was never counted at all, and the next connect
+    /// then adopted the agent it had produced. The field symptom was a
+    /// session reporting zero launches, zero relaunches and `adopted: true`
+    /// about an agent whose pid had visibly changed.
     #[test]
-    fn every_successful_launch_counts_including_the_bootstrap() {
+    fn a_launch_is_counted_when_it_types_not_when_it_succeeds() {
         let mut st = state();
         let now = std::time::Instant::now();
         assert_eq!(st.total_launches, 0);
 
-        record_launch_outcome(&mut st, &Ok(()), now);
+        note_launch_typed(&mut st);
         assert_eq!(st.total_launches, 1);
         assert_eq!(st.relaunches, 0, "the bootstrap is not a *re*launch");
 
-        record_launch_outcome(&mut st, &Err("no handshake".into()), now);
-        assert_eq!(st.total_launches, 1, "a failed launch does not count");
-
+        // The outcome, whichever it is, no longer moves the counter.
         record_launch_outcome(&mut st, &Ok(()), now);
+        assert_eq!(st.total_launches, 1);
+        record_launch_outcome(&mut st, &Err("no handshake".into()), now);
+        assert_eq!(st.total_launches, 1);
+
+        // A second attempt types again, and that is what counts.
+        note_launch_typed(&mut st);
         assert_eq!(st.total_launches, 2);
+    }
+
+    /// The keystrokes land on a real desktop whether or not the session
+    /// that sent them survives, so the count must not be epoch-gated the
+    /// way the outcome recording is.
+    #[test]
+    fn typing_counts_even_when_the_session_is_gone_by_the_handshake() {
+        let source = include_str!("bootstrap.rs");
+        let body_at = source.find("pub async fn launch_and_wait").unwrap();
+        let body = &source[body_at..];
+        let end = body.find("\n    /// Clean up automation resources").unwrap();
+        let body = &body[..end];
+
+        let typed = body.find("if typed {").unwrap();
+        let call = body.find("note_launch_typed(&mut *automation_state.lock().await)").unwrap();
+        let handshake = body.find("wait_for_handshake(").unwrap();
+        assert!(typed < call && call < handshake, "the count must precede the wait");
+        // And `record_launch_outcome`, which *is* epoch-gated, must not
+        // have taken the counter back.
+        let outcome_at = source.find("pub fn record_launch_outcome").unwrap();
+        let outcome = &source[outcome_at..];
+        let outcome_end = outcome.find("\n}\n").unwrap();
+        assert!(
+            !outcome[..outcome_end].contains("total_launches"),
+            "the outcome must not touch the launch count"
+        );
+    }
+
+    /// Which agent is on the channel, and when that changed.
+    #[test]
+    fn note_agent_notices_a_different_process() {
+        let id = |pid, instance: Option<&str>| AgentIdentity {
+            pid,
+            instance: instance.map(str::to_string),
+        };
+
+        // First sighting: nothing to compare against, so nothing changed.
+        let mut st = state();
+        note_agent(&mut st, id(100, Some("a")), true);
+        assert_eq!(st.agent_pid, Some(100));
+        assert_eq!(st.agent_changes, 0);
+        assert!(st.previous_agent_pid.is_none());
+        assert!(!st.adopted_replacement);
+        assert!(st.agent_ready);
+
+        // The same agent handshaking again after a channel reconnect.
+        note_agent(&mut st, id(100, Some("a")), false);
+        assert_eq!(st.agent_changes, 0, "the same process came back");
+        assert!(!st.adopted_replacement);
+
+        // A different process on the channel that nobody here launched.
+        note_agent(&mut st, id(200, Some("b")), false);
+        assert_eq!(st.agent_changes, 1);
+        assert_eq!(st.previous_agent_pid, Some(100));
+        assert!(st.adopted_replacement, "we did not launch this one");
+        assert_eq!(st.agent_pid, Some(200));
+
+        // A replacement we launched ourselves is a change, but not an
+        // adoption of someone else's agent.
+        note_agent(&mut st, id(300, Some("c")), true);
+        assert_eq!(st.agent_changes, 2);
+        assert_eq!(st.previous_agent_pid, Some(200));
+        assert!(!st.adopted_replacement);
+    }
+
+    /// Windows reuses pids, so a recycled pid with a new instance id is a
+    /// different agent - and an agent too old to report an instance id
+    /// still has to be compared somehow.
+    #[test]
+    fn identity_prefers_the_instance_id_and_falls_back_to_the_pid() {
+        let with = |pid, instance: Option<&str>| AgentIdentity {
+            pid,
+            instance: instance.map(str::to_string),
+        };
+
+        // Same pid, different process: the instance id is what knows.
+        assert!(!with(100, Some("a")).is_same(&with(100, Some("b"))));
+        assert!(with(100, Some("a")).is_same(&with(100, Some("a"))));
+        // A different pid carrying the same instance id is the same process
+        // (it cannot really happen, but the id is the stronger evidence).
+        assert!(with(100, Some("a")).is_same(&with(101, Some("a"))));
+        // No instance id anywhere: the pid is all there is.
+        assert!(with(100, None).is_same(&with(100, None)));
+        assert!(!with(100, None).is_same(&with(101, None)));
+        // One side too old to report one: fall back rather than guess.
+        assert!(with(100, Some("a")).is_same(&with(100, None)));
+    }
+
+    /// The identity history answers "is this the same agent as before the
+    /// drop?", which is a question about a machine, not about a session -
+    /// so it outlives a reconnect and resets only with the target.
+    #[test]
+    fn the_agent_history_survives_a_reconnect_and_resets_with_the_target() {
+        let source = include_str!("bootstrap.rs");
+        let cleanup = source.split("pub async fn cleanup").nth(1).expect("cleanup exists");
+        let body = &cleanup[..cleanup.find("\n    }").unwrap_or(cleanup.len())];
+        for field in ["last_agent_identity", "agent_changes", "previous_agent_pid"] {
+            assert!(
+                !body.contains(field),
+                "cleanup() must not reset {field}: it spans reconnects"
+            );
+        }
+
+        let mut st = state();
+        st.total_launches = 4;
+        st.agent_changes = 2;
+        st.previous_agent_pid = Some(9);
+        st.adopted_replacement = true;
+        st.last_agent_identity = Some(AgentIdentity { pid: 9, instance: None });
+
+        st.reset_target_counters();
+        assert_eq!(st.total_launches, 0);
+        assert_eq!(st.agent_changes, 0);
+        assert!(st.previous_agent_pid.is_none());
+        assert!(!st.adopted_replacement);
+        assert!(st.last_agent_identity.is_none());
     }
 
     /// `relaunches` is zeroed by every `connect`; `total_launches` is not,
@@ -1858,7 +2078,7 @@ mod survivor_tests {
     #[test]
     fn the_shipped_agent_version_is_readable() {
         let version = expected_agent_version().expect("the script declares a version");
-        assert_eq!(version, "1.8.0");
+        assert_eq!(version, "1.9.0");
         assert!(
             AGENT_SCRIPT.contains(&format!("$script:Version = \"{}\"", version)),
             "parsed out of the script, not hardcoded twice"
@@ -1936,13 +2156,23 @@ mod survivor_tests {
         let now = std::time::Instant::now();
         let mut state = AutomationState::new(std::path::PathBuf::from("/tmp/x"));
 
-        state.adopted = false;
-        record_launch_outcome(&mut state, &Ok(()), now);
-        assert_eq!(state.total_launches, 1);
+        // Only typing counts, and the adoption paths never type. Proven
+        // against the source rather than by simulating them: none of them
+        // may ever reach `note_launch_typed`.
+        let source = include_str!("bootstrap.rs");
+        for function in ["async fn adopt_survivor", "pub async fn adopt_only"] {
+            let at = source.find(function).expect("function exists");
+            let body = &source[at..];
+            let end = body.find("\n    }\n").or_else(|| body.find("\n}\n")).unwrap();
+            assert!(
+                !body[..end].contains("note_launch_typed"),
+                "{function} must not count a launch: it types nothing"
+            );
+        }
 
         state.adopted = true;
         record_launch_outcome(&mut state, &Ok(()), now);
-        assert_eq!(state.total_launches, 1, "an adoption typed nothing");
+        assert_eq!(state.total_launches, 0, "an adoption typed nothing");
 
         // It is still a success in every other respect.
         assert!(state.last_error.is_none());
@@ -2022,6 +2252,8 @@ mod adoption_tests {
             agent_pid: 4242,
             capabilities: vec!["run".into()],
             build_id: build_id.map(str::to_string),
+            instance_id: None,
+            started_unix: None,
         }
     }
 
@@ -2305,16 +2537,16 @@ mod adoption_tests {
 
         finish_launch(&mut state, &Ok(()), Instant::now(), epoch);
         assert!(!state.relaunch_in_flight);
-        assert_eq!(state.total_launches, 3, "must not count against the next host");
         assert_eq!(state.launch_failures, 2, "must not clear bookkeeping it does not own");
 
         finish_launch(&mut state, &Err("late".into()), Instant::now(), epoch);
         assert!(state.next_retry_at.is_none(), "must not arm a retry for a dead session");
 
-        // Against a live session it records normally.
+        // Against a live session it records normally. The launch count is
+        // not among the things it records - typing already did that.
         state.enabled = true;
         finish_launch(&mut state, &Ok(()), Instant::now(), epoch);
-        assert_eq!(state.total_launches, 4);
+        assert_eq!(state.total_launches, 3);
         assert_eq!(state.launch_failures, 0);
     }
 
@@ -2343,7 +2575,10 @@ mod adoption_tests {
         let current = state.epoch;
         finish_launch(&mut state, &Ok(()), Instant::now(), current);
         assert!(!state.relaunch_in_flight);
-        assert_eq!(state.total_launches, 6);
+        // Unchanged by the outcome either way: the count belongs to the
+        // keystrokes, which is why a launch abandoned by a drop is still
+        // counted while its failure is not.
+        assert_eq!(state.total_launches, 5);
     }
 
     /// `initialize()` and `cleanup()` each move the epoch, so a launch

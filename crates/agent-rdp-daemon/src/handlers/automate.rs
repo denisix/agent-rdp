@@ -34,10 +34,47 @@ pub fn should_sync_late_handshake(
 /// Record an agent that came up without going through a launch: nothing
 /// typed anything to bring it up, so it is an adoption.
 fn sync_late_handshake(state: &mut crate::automation::AutomationState, ipc: &crate::automation::DvcIpc) {
+    if let Some(identity) = ipc.agent_identity() {
+        crate::automation::note_agent(state, identity, false);
+    }
     state.agent_ready = true;
-    state.agent_pid = ipc.agent_pid();
     state.last_error = None;
     state.next_retry_at = None;
+    state.adopted = true;
+}
+
+/// Notice that the agent behind a channel we already consider ready is not
+/// the one we recorded.
+///
+/// Several paths swap it with nothing observing: an extra channel is
+/// promoted to primary when the primary closes (including inside the
+/// supervisor's settle window, so the supervisor sees an agent up and does
+/// nothing), and a survivor can reattach late. `should_sync_late_handshake`
+/// cannot catch those - it requires `!agent_ready`, and `agent_ready` is
+/// still true from the agent that left. The result was a status reporting
+/// the *live* agent's pid beside counters describing a process that had
+/// already exited: a field report saw the pid change across a reconnect
+/// while `relaunches`, `total_launches` and `adopted` all insisted nothing
+/// had happened.
+fn reconcile_agent_identity(
+    state: &mut crate::automation::AutomationState,
+    ipc: &crate::automation::DvcIpc,
+) {
+    if !state.agent_ready {
+        return;
+    }
+    let Some(identity) = ipc.agent_identity() else {
+        return;
+    };
+    let known = crate::automation::AgentIdentity {
+        pid: state.agent_pid.unwrap_or(0),
+        instance: state.agent_instance.clone(),
+    };
+    if known.is_same(&identity) {
+        return;
+    }
+    crate::automation::note_agent(state, identity, false);
+    // Nothing typed Win+R for this one, as far as this daemon knows.
     state.adopted = true;
 }
 
@@ -199,6 +236,18 @@ fn handshake_view(
         daemon_version: None,
         cli_version: None,
         probe_error: None,
+        // Everything below is filled by `fill_daemon_fields`, which is the
+        // only place that knows both the handshake and the daemon's history.
+        agent_instance_id: None,
+        agent_started_unix: None,
+        previous_agent_pid: None,
+        adopted_replacement: false,
+        agent_changes: 0,
+        // The agent is not answering, so it cannot describe its desktop.
+        desktop_alive: None,
+        input_desktop_open: None,
+        input_desktop_name: None,
+        foreground_window: None,
     };
     fill_daemon_fields(&mut status, state);
     status
@@ -287,6 +336,16 @@ fn offline_status(state: &crate::automation::AutomationState) -> Response {
         // The agent is not holding the channel at all here, so there was no
         // probe to fail; `last_error` above is the explanation.
         probe_error: None,
+        agent_instance_id: None,
+        agent_started_unix: None,
+        previous_agent_pid: state.previous_agent_pid,
+        adopted_replacement: state.adopted_replacement,
+        agent_changes: state.agent_changes,
+        // Nothing on the remote side to ask.
+        desktop_alive: None,
+        input_desktop_open: None,
+        input_desktop_name: None,
+        foreground_window: None,
     }))
 }
 
@@ -299,6 +358,13 @@ fn fill_daemon_fields(status: &mut AutomationStatus, state: &crate::automation::
     status.total_launches = state.total_launches;
     status.adopted = state.adopted;
     status.daemon_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    status.previous_agent_pid = state.previous_agent_pid;
+    status.adopted_replacement = state.adopted_replacement;
+    status.agent_changes = state.agent_changes;
+    if let Some(ipc) = state.dvc_ipc.as_ref() {
+        status.agent_instance_id = ipc.agent_instance_id();
+        status.agent_started_unix = ipc.agent_started_unix();
+    }
 }
 
 /// A `status` round trip to the agent, with the daemon's DVC bookkeeping
@@ -364,6 +430,11 @@ pub async fn handle(
         if let Some(ipc) = state.dvc_ipc.clone() {
             sync_late_handshake(&mut state, &ipc);
         }
+    } else if let Some(ipc) = state.dvc_ipc.clone() {
+        // Cheap on every command: two lock-free reads of the handshake. The
+        // alternative is a status that describes an agent which is no longer
+        // there.
+        reconcile_agent_identity(&mut state, &ipc);
     }
     if matches!(request, AutomateRequest::Status) && !agent_reachable {
         return offline_status(&state);
@@ -1311,6 +1382,17 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
         capabilities,
         version,
         log_path,
+        desktop_alive: data["desktop_alive"].as_bool(),
+        input_desktop_open: data["input_desktop_open"].as_bool(),
+        input_desktop_name: data["input_desktop_name"].as_str().map(|s| s.to_string()),
+        foreground_window: data["foreground_window"].as_str().map(|s| s.to_string()),
+        // Identity is filled from the handshake in `fill_daemon_fields`:
+        // it is what the channel layer accepted, not what a reply claims.
+        agent_instance_id: None,
+        agent_started_unix: None,
+        previous_agent_pid: None,
+        adopted_replacement: false,
+        agent_changes: 0,
         relaunches: 0,
         uptime_secs: None,
         last_rtt_ms: None,
@@ -1569,6 +1651,8 @@ mod late_handshake_tests {
                 agent_pid: 777,
                 capabilities: vec![],
                 build_id: Some(crate::automation::expected_build_id()),
+                instance_id: None,
+                started_unix: None,
             });
             s.handshake_at = Some(std::time::Instant::now());
         }
@@ -1605,6 +1689,8 @@ mod status_probe_tests {
                 agent_pid: pid,
                 capabilities: vec![],
                 build_id: Some(crate::automation::expected_build_id()),
+                instance_id: None,
+                started_unix: None,
             });
             s.handshake_at = Some(std::time::Instant::now());
         }
@@ -1695,5 +1781,138 @@ mod status_probe_tests {
             indeterminate_resolution_worst(),
             std::time::Duration::from_secs(36)
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_identity_tests {
+    use super::*;
+    use crate::automation::{AgentIdentity, DvcHandshake};
+
+    fn ipc_with(pid: u32, instance: Option<&str>) -> crate::automation::DvcIpc {
+        let dvc = crate::automation::new_shared_dvc_state();
+        {
+            let mut s = dvc.lock();
+            s.channel_id = Some(1);
+            s.handshake = Some(DvcHandshake {
+                version: "1.9.0".into(),
+                agent_pid: pid,
+                capabilities: vec![],
+                build_id: Some(crate::automation::expected_build_id()),
+                instance_id: instance.map(str::to_string),
+                started_unix: Some(1_700_000_000),
+            });
+            s.handshake_at = Some(std::time::Instant::now());
+        }
+        crate::automation::DvcIpc::new(dvc)
+    }
+
+    /// The bug this exists for: an agent can be swapped behind a channel
+    /// the daemon already considers ready - an extra promoted to primary
+    /// when the primary closed, inside the supervisor's settle window, so
+    /// nothing else observes it. The status then reported the live agent's
+    /// pid beside counters describing a process that had already exited.
+    #[test]
+    fn a_changed_agent_behind_a_ready_channel_is_reconciled() {
+        let ipc = ipc_with(6848, Some("new"));
+        let mut state = crate::automation::AutomationState::new(std::path::PathBuf::from("/x"));
+        state.agent_ready = true;
+        state.agent_pid = Some(5960);
+        state.agent_instance = Some("old".into());
+        state.last_agent_identity = Some(AgentIdentity {
+            pid: 5960,
+            instance: Some("old".into()),
+        });
+
+        reconcile_agent_identity(&mut state, &ipc);
+
+        assert_eq!(state.agent_pid, Some(6848));
+        assert_eq!(state.previous_agent_pid, Some(5960));
+        assert_eq!(state.agent_changes, 1);
+        assert!(state.adopted, "nothing here typed Win+R for it");
+        assert!(
+            state.adopted_replacement,
+            "adopted alone would read as `the same agent is still running`"
+        );
+    }
+
+    /// The common case must stay silent: the agent that is there is the one
+    /// we recorded, so nothing is a change.
+    #[test]
+    fn an_unchanged_agent_is_not_reconciled() {
+        let ipc = ipc_with(777, Some("same"));
+        let mut state = crate::automation::AutomationState::new(std::path::PathBuf::from("/x"));
+        state.agent_ready = true;
+        state.agent_pid = Some(777);
+        state.agent_instance = Some("same".into());
+        state.last_agent_identity = Some(AgentIdentity {
+            pid: 777,
+            instance: Some("same".into()),
+        });
+
+        reconcile_agent_identity(&mut state, &ipc);
+
+        assert_eq!(state.agent_changes, 0);
+        assert!(state.previous_agent_pid.is_none());
+        assert!(!state.adopted_replacement);
+    }
+
+    /// Nothing to reconcile against before a handshake has been recorded;
+    /// `should_sync_late_handshake` owns that path.
+    #[test]
+    fn an_agent_that_was_never_recorded_is_left_to_the_late_handshake_path() {
+        let ipc = ipc_with(777, Some("x"));
+        let mut state = crate::automation::AutomationState::new(std::path::PathBuf::from("/x"));
+        state.agent_ready = false;
+
+        reconcile_agent_identity(&mut state, &ipc);
+
+        assert!(state.agent_pid.is_none());
+        assert_eq!(state.agent_changes, 0);
+    }
+
+    /// The identity and desktop fields come from the daemon's own view of
+    /// the handshake, not from whatever a reply claims.
+    #[test]
+    fn the_status_carries_the_agents_identity() {
+        let ipc = ipc_with(777, Some("inst-1"));
+        let mut state = crate::automation::AutomationState::new(std::path::PathBuf::from("/x"));
+        state.dvc_ipc = Some(ipc);
+        state.previous_agent_pid = Some(5960);
+        state.adopted_replacement = true;
+        state.agent_changes = 2;
+
+        let mut status = parse_status_response(serde_json::json!({"agent_running": true})).unwrap();
+        fill_daemon_fields(&mut status, &state);
+
+        assert_eq!(status.agent_instance_id.as_deref(), Some("inst-1"));
+        assert_eq!(status.agent_started_unix, Some(1_700_000_000));
+        assert_eq!(status.previous_agent_pid, Some(5960));
+        assert!(status.adopted_replacement);
+        assert_eq!(status.agent_changes, 2);
+    }
+
+    /// An agent from before these fields existed reports none of them, and
+    /// must not be read as "the desktop is dead".
+    #[test]
+    fn an_older_agent_reports_no_desktop_state_rather_than_a_false_one() {
+        let status = parse_status_response(serde_json::json!({"agent_running": true})).unwrap();
+        assert_eq!(status.desktop_alive, None);
+        assert_eq!(status.input_desktop_open, None);
+        assert_eq!(status.input_desktop_name, None);
+        assert_eq!(status.foreground_window, None);
+
+        let live = parse_status_response(serde_json::json!({
+            "agent_running": true,
+            "desktop_alive": false,
+            "input_desktop_open": true,
+            "input_desktop_name": "Winlogon",
+            "foreground_window": "Notepad",
+        }))
+        .unwrap();
+        assert_eq!(live.desktop_alive, Some(false));
+        assert_eq!(live.input_desktop_open, Some(true));
+        assert_eq!(live.input_desktop_name.as_deref(), Some("Winlogon"));
+        assert_eq!(live.foreground_window.as_deref(), Some("Notepad"));
     }
 }

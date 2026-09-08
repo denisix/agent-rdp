@@ -112,6 +112,27 @@ impl DvcIpc {
         state.handshake.as_ref().map(|h| h.agent_pid)
     }
 
+    /// The agent process's own id, when it reports one.
+    pub fn agent_instance_id(&self) -> Option<String> {
+        let state = self.state.lock();
+        state.handshake.as_ref().and_then(|h| h.instance_id.clone())
+    }
+
+    /// When the agent process started, by the remote clock.
+    pub fn agent_started_unix(&self) -> Option<u64> {
+        let state = self.state.lock();
+        state.handshake.as_ref().and_then(|h| h.started_unix)
+    }
+
+    /// Who is on the channel right now, as the daemon can best tell.
+    pub fn agent_identity(&self) -> Option<crate::automation::AgentIdentity> {
+        let state = self.state.lock();
+        state.handshake.as_ref().map(|h| crate::automation::AgentIdentity {
+            pid: h.agent_pid,
+            instance: h.instance_id.clone(),
+        })
+    }
+
     /// Seconds since the current agent's handshake was received.
     pub fn agent_uptime_secs(&self) -> Option<u64> {
         let state = self.state.lock();

@@ -135,8 +135,24 @@ now keeps re-opening its channel for `ReconnectWindowSec` (600s, per outage)
 instead of exiting, and `connect` polls `SURVIVOR_WAIT` (6s) for it before
 launching. Adoption sets `adopted` and does **not** increment `total_launches`
 (which counts launches that typed something; `relaunches` still counts only
-self-heal restarts since the last connect, and `record_launch_outcome` is where
-both are decided). Two agents can be alive at once, so `dvc_channel.rs` keeps
+self-heal restarts since the last connect). **`total_launches` is counted at
+the keystrokes** (`note_launch_typed`, called right after `launch_agent`
+returns Ok and deliberately *not* epoch-gated), not at the outcome:
+`finish_launch` records nothing for a launch whose session went away, so a
+bootstrap that typed Win+R and then lost its transport left no trace while
+the next connect adopted the agent it had produced.
+
+**`adopted` is not continuity.** It only says nothing typed Win+R. The
+handshake carries `instance_id` (a GUID per agent process; a pid cannot do
+this - Windows reuses them) and `note_agent` compares it against
+`last_agent_identity`, setting `previous_agent_pid`, `agent_changes` and
+`adopted_replacement` when a *different* process holds the channel.
+`reconcile_agent_identity` runs on every automate command because the paths
+that swap the agent silently - an extra promoted to primary inside the
+supervisor's settle window above all - leave `agent_ready` true, which is
+exactly what `should_sync_late_handshake` refuses to act on. That history
+survives `cleanup()`/`initialize()` and resets only with `total_launches`
+(`reset_target_counters`, on a host change). Two agents can be alive at once, so `dvc_channel.rs` keeps
 the first channel opened and `shutdown`s any other, with an id-guarded
 `close()` - a rejected agent exiting must not clear the live one's handshake.
 **Build id beats first-opener**: `DvcSharedState.expected_build_id` (set by

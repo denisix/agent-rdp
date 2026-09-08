@@ -271,7 +271,9 @@ pub async fn handle(
             let target = format!("{}:{}", params.host, params.port);
             let mut auto_state = automation_state.lock().await;
             if auto_state.launch_target.as_deref() != Some(target.as_str()) {
-                auto_state.total_launches = 0;
+                // The agent-identity history goes with it: "is this the same
+                // agent as before?" is meaningless across machines.
+                auto_state.reset_target_counters();
                 auto_state.launch_target = Some(target);
             }
         }

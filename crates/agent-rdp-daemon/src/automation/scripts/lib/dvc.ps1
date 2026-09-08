@@ -410,15 +410,23 @@ function Send-DvcHandshake {
         [IntPtr]$Handle,
         [string]$Version,
         [string[]]$Capabilities,
-        [string]$BuildId = ""
+        [string]$BuildId = "",
+        [string]$InstanceId = "",
+        [long]$StartedUnix = 0
     )
 
+    # `instance_id` identifies this agent *process*, which a pid cannot:
+    # Windows reuses pids, and a survivor and its replacement are both just
+    # a powershell.exe. It is what lets the daemon notice that the agent
+    # behind the channel changed while it was not looking.
     $handshake = @{
         type = "handshake"
         version = $Version
         agent_pid = $PID
         capabilities = $Capabilities
         build_id = $BuildId
+        instance_id = $InstanceId
+        started_unix = $StartedUnix
     }
 
     Write-DvcMessage -Handle $Handle -Message $handshake

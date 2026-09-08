@@ -583,6 +583,61 @@ pub struct AutomationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub probe_error: Option<String>,
+    /// Identifies the agent *process*, across every reconnect of its
+    /// channel. A pid cannot: Windows reuses them, and a survivor and its
+    /// replacement are both just a `powershell.exe`. `None` from an agent
+    /// that predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_instance_id: Option<String>,
+    /// When the agent process started, by the remote clock. Unlike
+    /// `uptime_secs` this survives the channel reconnects that a transport
+    /// drop causes, so it is the honest answer to "how long has this agent
+    /// been running".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub agent_started_unix: Option<u64>,
+    /// The pid of the agent before the current one, when it was replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub previous_agent_pid: Option<u32>,
+    /// The current agent is a *different process* from the one this daemon
+    /// last recorded, and no launch of ours produced it. `adopted` on its
+    /// own only says "we did not type Win+R", which reads as "the same
+    /// agent is still running" - false whenever another process took the
+    /// channel. Check this before treating an adoption as continuity.
+    #[serde(default)]
+    pub adopted_replacement: bool,
+    /// How many times the agent process behind this session's channel has
+    /// changed, counted against the same target as `total_launches`.
+    /// `relaunches` only counts restarts this daemon performed, so it
+    /// cannot see an agent that was replaced some other way.
+    #[serde(default)]
+    pub agent_changes: u32,
+    /// Whether the remote session has a foreground window, i.e. whether
+    /// there is an interactive desktop to drive at all. `State: Connected`
+    /// does not imply this: the two drift apart, and every GUI action sent
+    /// while it is false is doomed before it leaves. `None` from an agent
+    /// that predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub desktop_alive: Option<bool>,
+    /// Whether the input desktop could be opened at all - true even in some
+    /// cases where no window has foreground, so it separates "briefly
+    /// nothing focused" from "no usable desktop".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub input_desktop_open: Option<bool>,
+    /// The input desktop's name: `Default` in ordinary use, `Winlogon` on
+    /// the lock or secure screen. The sharpest signal of *why* GUI
+    /// automation is failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub input_desktop_name: Option<String>,
+    /// Title of the foreground window, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub foreground_window: Option<String>,
 }
 
 /// Command run result.
@@ -954,5 +1009,68 @@ mod qa_0_7_17_field_tests {
             AutomateRequest::FileWriteChunk { transfer_id, .. } => assert!(transfer_id.is_empty()),
             other => panic!("expected a write chunk, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod qa_0_7_20_field_tests {
+    use super::*;
+
+    /// An agent from before 1.9.0 reports no identity and no desktop state.
+    /// The absence has to stay distinguishable from a negative answer:
+    /// `desktop_alive: false` means "there is no interactive desktop", and
+    /// reading an old agent's silence that way would condemn a healthy one.
+    #[test]
+    fn identity_and_desktop_fields_are_absent_rather_than_false_on_an_old_agent() {
+        let status: AutomationStatus = serde_json::from_str(r#"{"agent_running":true}"#).unwrap();
+        assert_eq!(status.desktop_alive, None);
+        assert_eq!(status.input_desktop_open, None);
+        assert_eq!(status.input_desktop_name, None);
+        assert_eq!(status.foreground_window, None);
+        assert_eq!(status.agent_instance_id, None);
+        assert_eq!(status.agent_started_unix, None);
+        assert_eq!(status.previous_agent_pid, None);
+        assert_eq!(status.probe_error, None);
+        // Counters, though, are answered by a zero.
+        assert!(!status.adopted_replacement);
+        assert_eq!(status.agent_changes, 0);
+
+        // And nothing unset is serialized, so `--json` output stays clean.
+        let json = serde_json::to_string(&status).unwrap();
+        for absent in [
+            "desktop_alive",
+            "input_desktop_name",
+            "agent_instance_id",
+            "previous_agent_pid",
+            "probe_error",
+        ] {
+            assert!(!json.contains(absent), "{absent} must not be serialized when unset");
+        }
+    }
+
+    /// Set, they survive a round trip.
+    #[test]
+    fn the_new_status_fields_round_trip() {
+        let status: AutomationStatus = serde_json::from_str(
+            r#"{"agent_running":true,"desktop_alive":false,"input_desktop_open":true,
+                "input_desktop_name":"Winlogon","foreground_window":"Notepad",
+                "agent_instance_id":"abc","agent_started_unix":1700000000,
+                "previous_agent_pid":5960,"adopted_replacement":true,"agent_changes":2,
+                "probe_error":"busy"}"#,
+        )
+        .unwrap();
+        assert_eq!(status.desktop_alive, Some(false));
+        assert_eq!(status.input_desktop_name.as_deref(), Some("Winlogon"));
+        assert_eq!(status.agent_instance_id.as_deref(), Some("abc"));
+        assert_eq!(status.agent_started_unix, Some(1_700_000_000));
+        assert_eq!(status.previous_agent_pid, Some(5960));
+        assert!(status.adopted_replacement);
+        assert_eq!(status.agent_changes, 2);
+        assert_eq!(status.probe_error.as_deref(), Some("busy"));
+
+        let back: AutomationStatus =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(back.previous_agent_pid, Some(5960));
+        assert_eq!(back.input_desktop_name.as_deref(), Some("Winlogon"));
     }
 }

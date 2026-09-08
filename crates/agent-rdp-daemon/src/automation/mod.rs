@@ -11,7 +11,7 @@ mod dvc_ipc;
 
 pub use bootstrap::{
     adopt_only, connect_bootstrap_worst_case, expected_agent_version, expected_build_id,
-    launch_and_wait_worst_case, restart_worst_case,
+    launch_and_wait_worst_case, note_agent, note_launch_typed, restart_worst_case,
     launch_guarded, relaunch_agent, spawn_relaunch_supervisor, AutomationBootstrap,
     RelaunchBudget, LAUNCH_ATTEMPTS, MAX_LAUNCH_FAILURES, RETRY_INPUT_QUIET, SURVIVOR_WAIT,
 };
@@ -26,6 +26,30 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// Which agent process is on the other end of the channel.
+///
+/// PID alone cannot answer that: Windows reuses them, and a survivor and its
+/// replacement are both just "a powershell.exe". The agent therefore mints an
+/// instance id once per process and reports it in its handshake; an agent old
+/// enough not to send one falls back to the pid, which is still better than
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentIdentity {
+    pub pid: u32,
+    pub instance: Option<String>,
+}
+
+impl AgentIdentity {
+    /// Whether this is the same agent process as `other`. Instance ids
+    /// decide it when both sides have one; otherwise the pid does.
+    pub fn is_same(&self, other: &AgentIdentity) -> bool {
+        match (&self.instance, &other.instance) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.pid == other.pid,
+        }
+    }
+}
 
 /// Automation state that persists across requests.
 #[derive(Debug)]
@@ -99,6 +123,30 @@ pub struct AutomationState {
     /// closes the channel, which would otherwise arm an automatic launch
     /// five seconds later); `automate restart` clears it.
     pub launch_deferred: bool,
+    /// The instance id of the agent currently on the channel, when it
+    /// reports one.
+    pub agent_instance: Option<String>,
+    /// The last agent this daemon recorded on the channel. Compared against
+    /// what the channel actually holds to notice that the process changed -
+    /// several paths can swap the agent with nothing else observing it (an
+    /// extra channel promoted to primary, a late handshake). Survives
+    /// `cleanup()`/`initialize()` like `total_launches`, because the
+    /// question it answers ("is this the same agent as before the drop?")
+    /// spans reconnects by definition.
+    pub last_agent_identity: Option<AgentIdentity>,
+    /// The pid of the agent before the current one, when it was replaced.
+    pub previous_agent_pid: Option<u32>,
+    /// The current agent is not the one this daemon last recorded, and no
+    /// launch of ours produced it. `adopted` alone said "we did not type
+    /// Win+R", which a caller reasonably reads as "the same agent is still
+    /// running" - and that was false whenever a *different* process had
+    /// taken the channel.
+    pub adopted_replacement: bool,
+    /// How many times the agent process behind this channel has changed.
+    /// Counted against the same target as `total_launches`: monitoring that
+    /// asks "did the agent stay up all day?" needs an answer that survives
+    /// a reconnect.
+    pub agent_changes: u32,
 }
 
 impl AutomationState {
@@ -128,7 +176,27 @@ impl AutomationState {
             adopted: false,
             epoch: 0,
             launch_deferred: false,
+            agent_instance: None,
+            last_agent_identity: None,
+            previous_agent_pid: None,
+            adopted_replacement: false,
+            agent_changes: 0,
         }
+    }
+
+    /// Forget everything counted against one target machine.
+    ///
+    /// `total_launches` and the agent-identity history deliberately outlive
+    /// a reconnect, so the only thing that may reset them is pointing this
+    /// daemon at a different host - one counter spanning two machines would
+    /// be worse than none. Kept together in one place because a partial
+    /// reset is how these two drift into disagreeing.
+    pub fn reset_target_counters(&mut self) {
+        self.total_launches = 0;
+        self.last_agent_identity = None;
+        self.previous_agent_pid = None;
+        self.adopted_replacement = false;
+        self.agent_changes = 0;
     }
 
     /// Seconds until the next automatic relaunch attempt, if one is

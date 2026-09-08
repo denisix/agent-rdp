@@ -285,10 +285,54 @@ impl Output {
                     println!("Relaunches since connect: {}", status.relaunches);
                 }
                 if status.adopted {
-                    println!(
-                        "Adopted: yes (this agent survived the last drop; no Win+R was typed \
-                         on the remote desktop)"
-                    );
+                    if status.adopted_replacement {
+                        println!(
+                            "Adopted: yes, but it is a DIFFERENT agent process than the one \
+                             before (no Win+R was typed, but the agent did not survive - do not \
+                             assume anything it was running is still running)"
+                        );
+                    } else {
+                        println!(
+                            "Adopted: yes (this agent survived the last drop; no Win+R was typed \
+                             on the remote desktop)"
+                        );
+                    }
+                }
+                if status.agent_changes > 0 {
+                    match status.previous_agent_pid {
+                        Some(pid) => println!(
+                            "Agent process changed: {} time(s) against this host (previous PID {})",
+                            status.agent_changes, pid
+                        ),
+                        None => println!(
+                            "Agent process changed: {} time(s) against this host",
+                            status.agent_changes
+                        ),
+                    }
+                }
+                match (status.desktop_alive, status.input_desktop_name.as_deref()) {
+                    (Some(true), name) => {
+                        let window = status.foreground_window.as_deref().unwrap_or("unknown");
+                        match name {
+                            Some(desk) => println!(
+                                "Desktop: alive (foreground: {}, input desktop: {})",
+                                window, desk
+                            ),
+                            None => println!("Desktop: alive (foreground: {})", window),
+                        }
+                    }
+                    (Some(false), name) => {
+                        // The session can report Connected while this is
+                        // false; every GUI action sent meanwhile is doomed.
+                        let desk = name.unwrap_or("unknown");
+                        println!(
+                            "Desktop: NO foreground window (input desktop: {}) - UI automation \
+                             will fail until the interactive desktop is back; `run` and file \
+                             transfers are unaffected",
+                            desk
+                        );
+                    }
+                    (None, _) => {}
                 }
                 if status.total_launches > 0 {
                     // `relaunches` resets on every connect, so on its own it

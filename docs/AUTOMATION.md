@@ -408,11 +408,45 @@ like.
 `relaunches` counts only the supervisor's and `automate restart`'s launches,
 and `initialize()` zeroes it on every `connect` — so on its own it cannot
 distinguish "the agent has been up all day" from "the session was rebuilt an
-hour ago". `total_launches` (incremented in `record_launch_outcome`, so it
+hour ago". `total_launches` (incremented by `note_launch_typed`, so it
 covers `connect`'s bootstrap too, and deliberately *not* reset by
 `initialize()`/`cleanup()`) answers that. It resets only when a `connect`
-targets a different `host:port`, since one count spanning two machines would
-be worse than none. `status` also carries `daemon_version` and, filled in
+targets a different `host:port` (`reset_target_counters`), since one count
+spanning two machines would be worse than none.
+
+It is counted **at the keystrokes**, not when the launch is judged
+successful. `finish_launch` is epoch-gated and records nothing for a launch
+whose session went away — so a bootstrap that typed Win+R and then lost its
+transport used to leave no trace at all, while the next `connect` adopted
+the agent that launch had produced. Typing is a fact about the desktop
+regardless of which session survives to hear about it.
+
+**Agent identity.** The handshake carries `instance_id` (a GUID minted once
+per agent process) and `started_unix` alongside the pid, because a pid
+cannot answer "is this the same agent?" — Windows reuses them, and a
+survivor and its replacement are both a `powershell.exe`. `note_agent`
+compares what the channel holds against `AutomationState.last_agent_identity`
+and, on a mismatch, records `previous_agent_pid`, bumps `agent_changes` and
+sets `adopted_replacement` when no launch of ours produced it. Three paths
+can swap the agent with nothing else observing: an extra channel promoted to
+primary in `process()` (including inside the supervisor's 5s settle window,
+after which it sees an agent up and does nothing), a late handshake
+(`sync_late_handshake`), and an adoption. `reconcile_agent_identity` runs on
+every automate command precisely because `should_sync_late_handshake`
+requires `!agent_ready` and therefore cannot see the first case. This
+history survives `cleanup()`/`initialize()` like `total_launches`: whether
+the agent is the same one as before a drop is a question that spans the
+drop.
+
+**Desktop liveness.** `status` reports `desktop_alive`
+(`GetForegroundWindow() != 0`), `input_desktop_open` and
+`input_desktop_name` (`OpenInputDesktop` + `GetUserObjectInformationW`:
+`Default` in ordinary use, `Winlogon` on the lock or secure screen) and the
+foreground window title. `State: Connected` does not imply any of it — a
+field report saw the transport report Connected at 14:37 and the interactive
+desktop die at 14:39, staying dead for 25 minutes while every UI action was
+doomed before it was sent. The probe is wrapped in `try/catch`, so a host
+that refuses it degrades to `None` rather than breaking `status`. `status` also carries `daemon_version` and, filled in
 CLI-side, `cli_version`, so one call answers which three versions are running.
 
 Every launch types Win+R and pastes into the Run dialog, which takes

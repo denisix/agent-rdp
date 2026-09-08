@@ -103,4 +103,61 @@ next_retry_secs?: number,
  * answered normally, and when it is plainly down (`last_error` covers
  * that case).
  */
-probe_error?: string, };
+probe_error?: string, 
+/**
+ * Identifies the agent *process*, across every reconnect of its
+ * channel. A pid cannot: Windows reuses them, and a survivor and its
+ * replacement are both just a `powershell.exe`. `None` from an agent
+ * that predates this field.
+ */
+agent_instance_id?: string, 
+/**
+ * When the agent process started, by the remote clock. Unlike
+ * `uptime_secs` this survives the channel reconnects that a transport
+ * drop causes, so it is the honest answer to "how long has this agent
+ * been running".
+ */
+agent_started_unix?: number, 
+/**
+ * The pid of the agent before the current one, when it was replaced.
+ */
+previous_agent_pid?: number, 
+/**
+ * The current agent is a *different process* from the one this daemon
+ * last recorded, and no launch of ours produced it. `adopted` on its
+ * own only says "we did not type Win+R", which reads as "the same
+ * agent is still running" - false whenever another process took the
+ * channel. Check this before treating an adoption as continuity.
+ */
+adopted_replacement: boolean, 
+/**
+ * How many times the agent process behind this session's channel has
+ * changed, counted against the same target as `total_launches`.
+ * `relaunches` only counts restarts this daemon performed, so it
+ * cannot see an agent that was replaced some other way.
+ */
+agent_changes: number, 
+/**
+ * Whether the remote session has a foreground window, i.e. whether
+ * there is an interactive desktop to drive at all. `State: Connected`
+ * does not imply this: the two drift apart, and every GUI action sent
+ * while it is false is doomed before it leaves. `None` from an agent
+ * that predates this field.
+ */
+desktop_alive?: boolean, 
+/**
+ * Whether the input desktop could be opened at all - true even in some
+ * cases where no window has foreground, so it separates "briefly
+ * nothing focused" from "no usable desktop".
+ */
+input_desktop_open?: boolean, 
+/**
+ * The input desktop's name: `Default` in ordinary use, `Winlogon` on
+ * the lock or secure screen. The sharpest signal of *why* GUI
+ * automation is failing.
+ */
+input_desktop_name?: string, 
+/**
+ * Title of the foreground window, when there is one.
+ */
+foreground_window?: string, };

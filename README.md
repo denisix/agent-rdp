@@ -494,8 +494,25 @@ agent keeps re-opening its channel for about 10 minutes rather than exiting, so
 a `connect` in that window adopts the running agent instead of launching one —
 no Win+R, no foreground change on a desktop someone else may be using.
 `automate status` reports `adopted` when that happened, `total_launches` (every
-launch that did type Win+R, including each `connect`'s bootstrap) and
-`relaunches` (self-heal restarts since the last connect). `connect
+launch that did type Win+R, including each `connect`'s bootstrap — counted at
+the keystrokes, so a launch whose transport dropped before it finished still
+counts) and `relaunches` (self-heal restarts since the last connect).
+
+**Adopted does not always mean "the same agent".** The agent reports an
+instance id identifying its process, so the daemon can tell the agent it knew
+coming back from a different process taking the channel. When it is a
+different one, `adopted_replacement` is true and `previous_agent_pid` names
+the one before it; `agent_changes` counts how often that has happened against
+this host. Without those, an adoption reads as continuity, and anything the
+old agent was running is quietly gone.
+
+**`desktop_alive` says whether there is a desktop to drive.** `State:
+Connected` does not imply it — the two drift apart, and a session has been
+seen reporting Connected while its interactive desktop was dead for 25
+minutes. `automate status` reports `desktop_alive`, `input_desktop_name`
+(`Default` in ordinary use, `Winlogon` on the lock screen) and the foreground
+window title, so GUI automation can check before acting rather than after
+failing. `run` and file transfers work either way. `connect
 --defer-agent` (which needs `--enable-win-automation`) skips the launch
 entirely and leaves the agent to `automate restart` — including when the
 survivor it found was running older scripts and had to be evicted, which

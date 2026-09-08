@@ -1420,13 +1420,49 @@ function Invoke-WaitFor {
 }
 
 function Get-AgentStatus {
+    # Whether there is an interactive desktop to drive. "The RDP session is
+    # Connected" and "the desktop is alive" are different facts that drift
+    # apart: a field report saw the session report Connected while the
+    # desktop was dead for 25 minutes, and every GUI action in that window
+    # was doomed before it was sent. The input desktop's name separates the
+    # ordinary case ("Default") from the lock/secure screen ("Winlogon") and
+    # from a disconnected session.
+    $desktopAlive = $null
+    $inputDesktopOpen = $null
+    $inputDesktopName = $null
+    $foregroundWindow = $null
+    try {
+        $hwnd = [AgentDesktop]::GetForegroundWindow()
+        $desktopAlive = ($hwnd -ne [IntPtr]::Zero)
+        if ($desktopAlive) {
+            try {
+                $element = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+                if ($null -ne $element) { $foregroundWindow = $element.Current.Name }
+            } catch {
+                # A window we cannot describe is still a window.
+            }
+        }
+        $inputDesktopOpen = [AgentDesktop]::InputDesktopOpen()
+        $inputDesktopName = [AgentDesktop]::InputDesktopName()
+    } catch {
+        Write-Log "Desktop liveness probe failed: $($_.Exception.Message)" "WARN"
+    }
+
     return @{
         agent_running = $true
         agent_pid = $PID
+        # Identifies this process across channel reconnects; a pid alone
+        # cannot, since Windows reuses them.
+        instance_id = $script:InstanceId
+        started_unix = $script:StartedUnix
         version = $script:Version
         # Where this agent writes its own log, so `agent-rdp diagnose` can
         # pull it into the bug-report bundle.
         log_path = $script:LocalLogPath
+        desktop_alive = $desktopAlive
+        input_desktop_open = $inputDesktopOpen
+        input_desktop_name = $inputDesktopName
+        foreground_window = $foregroundWindow
         capabilities = @(
             "snapshot", "invoke", "select", "toggle", "expand", "collapse",
             "context_menu", "focus", "get", "fill", "clear",

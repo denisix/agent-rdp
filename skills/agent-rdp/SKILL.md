@@ -6,7 +6,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.19. Check with `agent-rdp session info` (shows
+Tested against agent-rdp 0.7.20. Check with `agent-rdp session info` (shows
 both CLI and daemon versions, also in `--json` as `cli_version` /
 `daemon_version`) — a `daemon_version_mismatch` error means an older daemon
 survived an upgrade; run `connect` again to replace it.
@@ -306,7 +306,24 @@ so a `connect` within that window adopts the running agent and types nothing.
 `automate status` shows `adopted: yes` when that happened, and `total_launches`
 counts the launches that did type Win+R (every agent launch against this host,
 `connect`'s bootstrap included) next to `relaunches`, which only counts
-self-heal restarts since the last connect. Launching still costs a real
+self-heal restarts since the last connect.
+
+**Check `adopted_replacement` before trusting an adoption.** `adopted: yes`
+only means nothing typed Win+R; it does not mean the same agent is still
+running. The agent reports an instance id, so the daemon can tell "the agent
+I knew came back" from "a different process took the channel" — the latter
+sets `adopted_replacement: true` with `previous_agent_pid`, and
+`agent_changes` counts how often it has happened against this host. If it is
+true, anything the previous agent was running is gone, whatever the counters
+say.
+
+**`desktop_alive` before UI automation.** A session can report `Connected`
+while its interactive desktop is dead (seen for 25 minutes straight), and
+every click sent meanwhile fails for reasons that look like selector
+problems. `automate status --json` carries `desktop_alive`,
+`input_desktop_name` (`Default` normally, `Winlogon` on the lock screen) and
+`foreground_window`. `run` and file transfers are unaffected by a dead
+desktop, so they are the way through until it comes back. Launching still costs a real
 foreground change — Win+R, paste, Enter into the Run dialog — so if someone
 else's automation shares that desktop it will notice. Two ways to avoid it:
 reconnect promptly (a fast reconnect finds the agent still there), and keep

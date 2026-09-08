@@ -27,6 +27,10 @@ pub enum DvcProtocolMessage {
         capabilities: Vec<String>,
         #[serde(default)]
         build_id: Option<String>,
+        #[serde(default)]
+        instance_id: Option<String>,
+        #[serde(default)]
+        started_unix: Option<u64>,
     },
     /// Request sent from Rust to PowerShell.
     Request {
@@ -67,6 +71,18 @@ pub struct DvcHandshake {
     /// version contract exists to prevent, one layer down. `None` from an
     /// agent that predates this field.
     pub build_id: Option<String>,
+    /// Identifies the agent *process*, minted once when it starts and kept
+    /// across every reconnect of its channel. A pid cannot do this job:
+    /// Windows reuses them, and a survivor and its replacement are both
+    /// just a `powershell.exe`. Without it, an agent swapped behind the
+    /// channel - a queued extra promoted to primary, a late handshake -
+    /// looked exactly like the one that was there before. `None` from an
+    /// agent that predates this field.
+    pub instance_id: Option<String>,
+    /// When the agent process started, by the remote clock. Survives the
+    /// channel reconnects that reset the daemon-side handshake timestamp,
+    /// so it is the honest answer to "how long has this agent been up".
+    pub started_unix: Option<u64>,
 }
 
 /// Response data for pending requests.
@@ -349,6 +365,8 @@ impl DvcProcessor for AutomationDvc {
                 agent_pid,
                 capabilities,
                 build_id,
+                instance_id,
+                started_unix,
             } => {
                 // Decided fresh, under the lock, rather than from `is_extra`
                 // above: the primary can have closed since `start()` ran (the
@@ -411,6 +429,8 @@ impl DvcProcessor for AutomationDvc {
                     agent_pid,
                     capabilities,
                     build_id,
+                    instance_id,
+                    started_unix,
                 };
 
                 // Store handshake and notify
@@ -574,6 +594,8 @@ mod tests {
             agent_pid: 1234,
             capabilities: vec!["snapshot".to_string(), "click".to_string()],
             build_id: Some("deadbeef".to_string()),
+            instance_id: Some("abc123".to_string()),
+            started_unix: Some(1_700_000_000),
         };
 
         let encoded = AutomationDvc::encode_message(&msg).unwrap();
@@ -585,11 +607,15 @@ mod tests {
                 agent_pid,
                 capabilities,
                 build_id,
+                instance_id,
+                started_unix,
             } => {
                 assert_eq!(version, "1.0.0");
                 assert_eq!(agent_pid, 1234);
                 assert_eq!(capabilities.len(), 2);
                 assert_eq!(build_id.as_deref(), Some("deadbeef"));
+                assert_eq!(instance_id.as_deref(), Some("abc123"));
+                assert_eq!(started_unix, Some(1_700_000_000));
             }
             _ => panic!("Expected handshake"),
         }
@@ -671,6 +697,8 @@ mod two_agent_tests {
             agent_pid: pid,
             capabilities: vec!["run".to_string()],
             build_id: None,
+            instance_id: None,
+            started_unix: None,
         })
         .unwrap()
     }
@@ -830,6 +858,8 @@ mod two_agent_tests {
             agent_pid: pid,
             capabilities: vec!["run".to_string()],
             build_id: Some(build_id.to_string()),
+            instance_id: None,
+            started_unix: None,
         })
         .unwrap()
     }
