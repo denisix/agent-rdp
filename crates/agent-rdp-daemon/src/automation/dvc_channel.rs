@@ -136,6 +136,23 @@ pub struct DvcSharedState {
     /// Handshakes refused for a build-id mismatch this session, for status
     /// and for tests.
     pub stale_rejections: u32,
+    /// When the primary agent last said anything at all.
+    ///
+    /// Only the primary stamps it: a rejected agent's reply must not vouch
+    /// for the liveness of the one actually being talked to. Silence here
+    /// is not evidence of a problem - an idle agent blocks in the same read
+    /// a wedged one does - but it is the cue to go and ask.
+    pub last_inbound_at: Option<std::time::Instant>,
+    /// The furthest deadline this daemon has ever granted a request, as a
+    /// high-water mark.
+    ///
+    /// A `run --wait --process-timeout 3600000` legitimately occupies the
+    /// agent for an hour, and the daemon's own pending entry is removed long
+    /// before that when its timeout fires - so "nothing pending" does not
+    /// mean "idle". Never lowered by a reply, because the reply to a short
+    /// request says nothing about a long one still running. Reset when the
+    /// agent changes.
+    pub busy_until: Option<std::time::Instant>,
     /// Sender to send DVC data through the RDP session.
     pub command_tx: Option<DvcCommandSender>,
     /// Fired from `close()` so the session's relaunch supervisor learns that
@@ -154,6 +171,8 @@ impl Default for DvcSharedState {
             extras: std::collections::HashSet::new(),
             expected_build_id: None,
             stale_rejections: 0,
+            last_inbound_at: None,
+            busy_until: None,
             command_tx: None,
             closed_notify: None,
         }
@@ -196,6 +215,10 @@ impl DvcSharedState {
         self.channel_id = None;
         self.handshake = None;
         self.handshake_at = None;
+        // Both describe the agent that is going away. A deadline granted to
+        // it must not suppress wedge detection for its replacement.
+        self.last_inbound_at = None;
+        self.busy_until = None;
         self.extras.insert(channel_id);
         for (id, sender) in self.pending.drain() {
             warn!("Agent released, failing pending request {}", id);
@@ -446,6 +469,10 @@ impl DvcProcessor for AutomationDvc {
                     }
                     state.handshake = Some(handshake.clone());
                     state.handshake_at = Some(std::time::Instant::now());
+                    state.last_inbound_at = Some(std::time::Instant::now());
+                    // A deadline granted to the agent that just left says
+                    // nothing about the one that just arrived.
+                    state.busy_until = None;
                 }
 
                 if let Some(ref tx) = self.handshake_tx {
@@ -471,6 +498,10 @@ impl DvcProcessor for AutomationDvc {
                 // Route to pending request
                 let sender = {
                     let mut state = self.state.lock();
+                    // Proof of life from the agent we are actually talking
+                    // to, whether or not anything still awaits this id - a
+                    // late reply is exactly the case worth counting.
+                    state.last_inbound_at = Some(std::time::Instant::now());
                     state.pending.remove(&id)
                 };
 

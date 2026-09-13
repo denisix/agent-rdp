@@ -276,6 +276,10 @@ pub fn note_agent(
     state.agent_instance = identity.instance.clone();
     state.last_agent_identity = Some(identity);
     state.agent_ready = true;
+    // An agent that handshakes is answering, so whatever wedge verdict
+    // stood against its predecessor is spent.
+    state.wedge_strikes = 0;
+    state.wedge_declared = false;
 }
 
 /// The one launch path for an initialized session: `connect`'s bootstrap,
@@ -428,6 +432,176 @@ pub struct RetrySnapshot {
     pub last_input_age: Option<Duration>,
     pub auto_relaunch_disabled: bool,
     pub launch_deferred: bool,
+    /// The agent holds its channel but has stopped answering. Without this,
+    /// `handshake_done` alone means "the agent is up" forever, which is
+    /// exactly the state a wedged agent is stuck in.
+    pub wedge_declared: bool,
+}
+
+/// How long the agent may say nothing before the daemon spends a probe
+/// asking whether it is alive.
+///
+/// Two supervisor ticks. This decides nothing on its own - it is only the
+/// threshold past which one free `Status` round trip is worth making.
+pub const WEDGE_PROBE_AFTER: Duration = Duration::from_secs(60);
+
+/// How far past the longest deadline it was ever granted the agent may still
+/// legitimately be working.
+///
+/// Deliberately not derived from any request budget: the point of this
+/// number is to cover the agent *overrunning* one.
+pub const WEDGE_GRACE: Duration = Duration::from_secs(120);
+
+/// Unanswered probes, with nothing else in flight, before the agent is
+/// declared wedged. As `KEEP_ALIVE_MISSED_LIMIT`: one is noise on a host at
+/// 100% CPU, three consecutive is a pattern.
+pub const WEDGE_STRIKES: u32 = 3;
+
+/// Everything the wedge decision depends on, captured at one instant.
+#[derive(Debug, Clone, Copy)]
+pub struct WedgeSnapshot {
+    pub channel_ready: bool,
+    pub pending: usize,
+    pub silent_for: Duration,
+    pub busy_until: Option<std::time::Instant>,
+    pub strikes: u32,
+}
+
+/// Whether to spend a status probe on an agent that has gone quiet.
+///
+/// Silence alone is never a verdict. The agent blocks in the same read
+/// whether it is idle or wedged, so from outside the two are identical - and
+/// a session between benchmark phases is legitimately silent for hours. No
+/// silence threshold is both large enough to be safe and small enough to be
+/// useful. The daemon has to ask.
+pub fn should_probe_wedge(s: &WedgeSnapshot, now: std::time::Instant) -> bool {
+    s.channel_ready
+        && s.pending == 0
+        && s.silent_for >= WEDGE_PROBE_AFTER
+        // A long `run --wait` occupies the agent for its whole budget, and
+        // the daemon dropped its own pending entry when its timeout fired -
+        // so "nothing pending" does not mean "idle".
+        && s.busy_until.map_or(true, |b| now >= b + WEDGE_GRACE)
+}
+
+/// Whether the agent is wedged: holding the channel and answering nothing,
+/// with no work outstanding that could explain it.
+pub fn is_wedged(s: &WedgeSnapshot, now: std::time::Instant) -> bool {
+    should_probe_wedge(s, now) && s.strikes >= WEDGE_STRIKES
+}
+
+#[cfg(test)]
+mod wedge_tests {
+    use super::*;
+
+    fn quiet() -> WedgeSnapshot {
+        WedgeSnapshot {
+            channel_ready: true,
+            pending: 0,
+            silent_for: Duration::from_secs(6 * 60 * 60),
+            busy_until: None,
+            strikes: 0,
+        }
+    }
+
+    /// The hole this design started with, and the reason the predicate
+    /// needs probe evidence at all.
+    ///
+    /// An agent with nothing to do blocks in exactly the read a wedged one
+    /// blocks in. A session between benchmark phases is silent for hours and
+    /// is perfectly healthy. Declaring that a wedge would type Win+R onto
+    /// the desktop running the benchmark.
+    #[test]
+    fn an_idle_healthy_agent_is_never_wedged() {
+        let now = std::time::Instant::now();
+        assert!(!is_wedged(&quiet(), now), "silence is not evidence");
+        // Even after days.
+        let ancient = WedgeSnapshot {
+            silent_for: Duration::from_secs(72 * 60 * 60),
+            ..quiet()
+        };
+        assert!(!is_wedged(&ancient, now));
+        // Probing it is fine - that is the whole point.
+        assert!(should_probe_wedge(&quiet(), now));
+    }
+
+    /// Silence plus strikes, and nothing less.
+    #[test]
+    fn silence_alone_never_declares_a_wedge() {
+        let now = std::time::Instant::now();
+        for strikes in 0..WEDGE_STRIKES {
+            let s = WedgeSnapshot { strikes, ..quiet() };
+            assert!(!is_wedged(&s, now), "{strikes} strikes must not be enough");
+        }
+    }
+
+    #[test]
+    fn three_unanswered_probes_with_nothing_in_flight_is_a_wedge() {
+        let now = std::time::Instant::now();
+        let s = WedgeSnapshot { strikes: WEDGE_STRIKES, ..quiet() };
+        assert!(is_wedged(&s, now));
+    }
+
+    /// The case that would cost a customer their benchmark: a command with
+    /// a long budget legitimately occupies the agent, and the daemon has
+    /// already dropped its own pending entry for it.
+    #[test]
+    fn a_long_run_wait_is_not_a_wedge_even_after_the_pending_entry_is_gone() {
+        let now = std::time::Instant::now();
+        let s = WedgeSnapshot {
+            pending: 0,
+            silent_for: Duration::from_secs(50 * 60),
+            busy_until: Some(now + Duration::from_secs(55 * 60)),
+            strikes: 9,
+            ..quiet()
+        };
+        assert!(!should_probe_wedge(&s, now));
+        assert!(!is_wedged(&s, now));
+    }
+
+    /// And it stays covered for a grace period past that deadline, because
+    /// overrunning a granted budget is a thing the agent has been seen to do.
+    #[test]
+    fn the_grace_period_extends_past_the_granted_deadline() {
+        let now = std::time::Instant::now();
+        let just_over = WedgeSnapshot {
+            busy_until: Some(now - Duration::from_secs(60)),
+            strikes: 9,
+            ..quiet()
+        };
+        assert!(!is_wedged(&just_over, now), "still inside the grace period");
+
+        let well_past = WedgeSnapshot {
+            busy_until: Some(now - (WEDGE_GRACE + Duration::from_secs(1))),
+            strikes: 9,
+            ..quiet()
+        };
+        assert!(is_wedged(&well_past, now));
+    }
+
+    #[test]
+    fn a_request_in_flight_is_never_a_wedge() {
+        let now = std::time::Instant::now();
+        let s = WedgeSnapshot { pending: 1, strikes: 9, ..quiet() };
+        assert!(!is_wedged(&s, now), "it is answering someone");
+    }
+
+    /// A closed channel is the close path's business; it already relaunches.
+    #[test]
+    fn a_closed_channel_is_not_a_wedge() {
+        let now = std::time::Instant::now();
+        let s = WedgeSnapshot { channel_ready: false, strikes: 9, ..quiet() };
+        assert!(!is_wedged(&s, now));
+    }
+
+    /// A freshly spoken agent is not probed at all.
+    #[test]
+    fn a_recently_heard_agent_is_left_alone() {
+        let now = std::time::Instant::now();
+        let s = WedgeSnapshot { silent_for: Duration::from_secs(5), ..quiet() };
+        assert!(!should_probe_wedge(&s, now));
+        assert!(!is_wedged(&s, now));
+    }
 }
 
 /// Whether the supervisor should launch the agent now; the reason not to,
@@ -453,7 +627,7 @@ pub fn should_retry(s: &RetrySnapshot, now: std::time::Instant) -> Result<(), &'
     if s.relaunch_in_flight {
         return Err("a launch is in progress");
     }
-    if s.handshake_done {
+    if s.handshake_done && !s.wedge_declared {
         return Err("agent is up");
     }
     let Some(due) = s.next_retry_at else {
@@ -496,6 +670,7 @@ async fn retry_snapshot(
         dvc_state,
         auto_relaunch_disabled,
         launch_deferred,
+        wedge_declared,
     ) = {
         let state = automation_state.lock().await;
         (
@@ -510,6 +685,7 @@ async fn retry_snapshot(
             state.dvc_state.clone(),
             state.auto_relaunch_disabled,
             state.launch_deferred,
+            state.wedge_declared,
         )
     };
     let agent_starting = match dvc_state {
@@ -527,6 +703,7 @@ async fn retry_snapshot(
         last_input_age,
         auto_relaunch_disabled,
         launch_deferred,
+        wedge_declared,
     }
 }
 
@@ -566,6 +743,88 @@ async fn supervisor_attempt(
 /// now. IronRDP also fires the close callback on an ordinary disconnect, so
 /// both checks matter - a supervisor that outlived its session would relaunch
 /// the agent into the next one.
+/// Ask a quiet agent whether it is still there, and count the answer.
+///
+/// The probe is the evidence the wedge verdict rests on: silence alone
+/// cannot distinguish an idle agent from a wedged one, because both are
+/// blocked in the same read. A probe that goes unanswered while nothing else
+/// is in flight can.
+async fn check_for_wedge(automation_state: &Arc<Mutex<AutomationState>>) {
+    let (ipc, snapshot) = {
+        let state = automation_state.lock().await;
+        let Some(ipc) = state.dvc_ipc.clone() else {
+            return;
+        };
+        let snapshot = WedgeSnapshot {
+            channel_ready: ipc.is_ready(),
+            pending: ipc.pending_requests(),
+            silent_for: ipc.last_inbound_age().unwrap_or_default(),
+            busy_until: ipc.busy_until(),
+            strikes: state.wedge_strikes,
+        };
+        (ipc, snapshot)
+    };
+
+    if !should_probe_wedge(&snapshot, std::time::Instant::now()) {
+        return;
+    }
+
+    // Outside the lock: this is a round trip, and holding the automation
+    // state across it would block every `automate` command behind it.
+    let answered = ipc
+        .probe_status(crate::handlers::automate::STATUS_PROBE_TIMEOUT)
+        .await
+        .is_ok();
+
+    let mut state = automation_state.lock().await;
+    if answered {
+        state.wedge_strikes = 0;
+        state.wedge_declared = false;
+        return;
+    }
+    // Only count it if nothing else was in flight at the failure too: a
+    // probe that queued behind a real command proves nothing.
+    if ipc.pending_requests() > 0 {
+        return;
+    }
+    state.wedge_strikes = state.wedge_strikes.saturating_add(1);
+
+    let verdict = WedgeSnapshot {
+        strikes: state.wedge_strikes,
+        pending: 0,
+        silent_for: ipc.last_inbound_age().unwrap_or_default(),
+        busy_until: ipc.busy_until(),
+        channel_ready: ipc.is_ready(),
+    };
+    if !is_wedged(&verdict, std::time::Instant::now()) {
+        debug!(
+            "Automation agent missed a status probe ({} of {})",
+            state.wedge_strikes, WEDGE_STRIKES
+        );
+        return;
+    }
+
+    if !state.wedge_declared {
+        state.wedge_declared = true;
+        state.wedge_detections = state.wedge_detections.saturating_add(1);
+        state.agent_ready = false;
+        let silent = verdict.silent_for.as_secs();
+        warn!(
+            "The automation agent (pid {:?}) holds its channel but has not answered {} status \
+             probes and has said nothing for {}s; treating it as wedged",
+            state.agent_pid, WEDGE_STRIKES, silent
+        );
+        state.last_error = Some(format!(
+            "the agent holds its DVC channel but has not answered {} status probes and has said \
+             nothing for {}s - it is wedged, not busy",
+            WEDGE_STRIKES, silent
+        ));
+        if state.next_retry_at.is_none() {
+            state.next_retry_at = Some(std::time::Instant::now());
+        }
+    }
+}
+
 pub fn spawn_relaunch_supervisor(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     rdp_session: Arc<Mutex<Option<RdpSession>>>,
@@ -623,11 +882,17 @@ pub fn spawn_relaunch_supervisor(
                 }
             }
 
+            if !closed {
+                check_for_wedge(&automation_state).await;
+            }
+
             let snapshot =
                 retry_snapshot(&rdp_session, &automation_state, &session_generation, generation).await;
             match should_retry(&snapshot, std::time::Instant::now()) {
                 Ok(()) => {
-                    let reason = if closed {
+                    let reason = if snapshot.wedge_declared {
+                        "the agent holds the channel but stopped answering"
+                    } else if closed {
                         "DVC channel closed while the RDP session is alive"
                     } else {
                         "scheduled retry after a failed launch"
@@ -1729,6 +1994,61 @@ mod tests {
         assert_eq!(retry_backoff(50), Duration::from_secs(300), "no overflow, just the cap");
     }
 
+    /// A wedged agent still has a live handshake, so the ordinary "the
+    /// agent is up" gate would refuse to relaunch it forever - which is
+    /// exactly the state a field report sat in for 85 minutes.
+    #[test]
+    fn a_wedged_agent_is_relaunchable_despite_a_live_handshake() {
+        let now = std::time::Instant::now();
+        let mut s = ready_snapshot(now);
+        s.handshake_done = true;
+
+        assert_eq!(should_retry(&s, now), Err("agent is up"));
+
+        s.wedge_declared = true;
+        assert_eq!(should_retry(&s, now), Ok(()));
+    }
+
+    /// Relaunching types Win+R on a desktop that may be running someone
+    /// else's work, so every existing gate still applies to a wedge.
+    #[test]
+    fn every_gate_still_beats_a_wedge() {
+        let now = std::time::Instant::now();
+        let wedged = || {
+            let mut s = ready_snapshot(now);
+            s.handshake_done = true;
+            s.wedge_declared = true;
+            s
+        };
+
+        let mut s = wedged();
+        s.last_input_age = Some(Duration::from_secs(5));
+        assert_eq!(should_retry(&s, now), Err("session input is not quiet yet"));
+
+        let mut s = wedged();
+        s.auto_relaunch_disabled = true;
+        assert_eq!(
+            should_retry(&s, now),
+            Err("automatic relaunch disabled by AGENT_RDP_NO_AUTO_RELAUNCH")
+        );
+
+        let mut s = wedged();
+        s.launch_deferred = true;
+        assert!(should_retry(&s, now).is_err(), "--defer-agent still wins");
+
+        let mut s = wedged();
+        s.generation_matches = false;
+        assert_eq!(should_retry(&s, now), Err("session replaced"));
+
+        let mut s = wedged();
+        s.relaunch_in_flight = true;
+        assert_eq!(should_retry(&s, now), Err("a launch is in progress"));
+
+        let mut s = wedged();
+        s.session_alive = false;
+        assert_eq!(should_retry(&s, now), Err("RDP session is gone"));
+    }
+
     fn ready_snapshot(now: std::time::Instant) -> RetrySnapshot {
         RetrySnapshot {
             generation_matches: true,
@@ -1741,6 +2061,7 @@ mod tests {
             last_input_age: Some(RETRY_INPUT_QUIET + Duration::from_secs(1)),
             auto_relaunch_disabled: false,
             launch_deferred: false,
+            wedge_declared: false,
         }
     }
 
@@ -1974,6 +2295,7 @@ mod retry_edge_tests {
             last_input_age: None,
             auto_relaunch_disabled: true,
             launch_deferred: false,
+            wedge_declared: false,
         };
         assert_eq!(
             should_retry(&snap, now),

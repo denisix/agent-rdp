@@ -189,6 +189,20 @@ impl DvcIpc {
         result
     }
 
+    /// How long the primary agent has said nothing at all.
+    ///
+    /// `None` before it has ever spoken. Silence is not evidence of a
+    /// problem on its own - an idle agent blocks in the same read a wedged
+    /// one does - but it is the cue to spend a probe and find out.
+    pub fn last_inbound_age(&self) -> Option<Duration> {
+        self.state.lock().last_inbound_at.map(|at| at.elapsed())
+    }
+
+    /// The furthest deadline this daemon has granted the agent.
+    pub fn busy_until(&self) -> Option<std::time::Instant> {
+        self.state.lock().busy_until
+    }
+
     /// Get the agent capabilities from the handshake.
     pub fn capabilities(&self) -> Vec<String> {
         let state = self.state.lock();
@@ -283,6 +297,14 @@ impl DvcIpc {
                 .map_err(|_| anyhow::anyhow!("Failed to send DVC command"))?;
 
             state.pending.insert(request_id.clone(), tx);
+            // A high-water mark, never lowered: the reply to a short request
+            // says nothing about a long one still occupying the agent, and
+            // the daemon drops its own pending entry long before a
+            // multi-minute command finishes.
+            let until = std::time::Instant::now() + response_timeout;
+            if state.busy_until.map_or(true, |b| until > b) {
+                state.busy_until = Some(until);
+            }
             // Captured here, under the same lock that hands the request
             // over, so recovery can tell whether the agent that answers is
             // the one that received it.

@@ -144,6 +144,16 @@ pub struct AutomationState {
     /// running" - and that was false whenever a *different* process had
     /// taken the channel.
     pub adopted_replacement: bool,
+    /// Consecutive watchdog probes the agent has failed to answer with
+    /// nothing else in flight. Reset by any reply.
+    pub wedge_strikes: u32,
+    /// The agent has been judged wedged: it holds its channel and answers
+    /// nothing, with no outstanding work that could explain it. Lets the
+    /// relaunch gate past its "the agent is up" check, which a live
+    /// handshake would otherwise satisfy forever.
+    pub wedge_declared: bool,
+    /// How many times that verdict has been reached against this target.
+    pub wedge_detections: u32,
     /// How many times the agent process behind this channel has changed.
     /// Counted against the same target as `total_launches`: monitoring that
     /// asks "did the agent stay up all day?" needs an answer that survives
@@ -183,6 +193,9 @@ impl AutomationState {
             previous_agent_pid: None,
             adopted_replacement: false,
             agent_changes: 0,
+            wedge_strikes: 0,
+            wedge_declared: false,
+            wedge_detections: 0,
         }
     }
 
@@ -199,6 +212,7 @@ impl AutomationState {
         self.previous_agent_pid = None;
         self.adopted_replacement = false;
         self.agent_changes = 0;
+        self.wedge_detections = 0;
     }
 
     /// Seconds until the next automatic relaunch attempt, if one is

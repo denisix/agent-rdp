@@ -639,6 +639,23 @@ pub struct AutomationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub foreground_window: Option<String>,
+    /// The agent holds its DVC channel but has stopped answering status
+    /// probes, with nothing outstanding that would explain it.
+    ///
+    /// Distinct from busy: the agent runs one command at a time, so a long
+    /// `run --wait` legitimately silences it and is *not* reported here.
+    /// This is the state that used to leave an operator staring at timeouts
+    /// for up to an hour with no way to tell a stuck agent from a working
+    /// one.
+    #[serde(default)]
+    pub wedged: bool,
+    /// Consecutive status probes the agent has failed to answer. Non-zero
+    /// before `wedged` is set: the verdict needs several.
+    #[serde(default)]
+    pub wedge_strikes: u32,
+    /// How many times this agent has been found wedged against this host.
+    #[serde(default)]
+    pub wedge_detections: u32,
 }
 
 /// Command run result.

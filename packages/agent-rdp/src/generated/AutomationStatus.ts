@@ -160,4 +160,24 @@ input_desktop_name?: string,
 /**
  * Title of the foreground window, when there is one.
  */
-foreground_window?: string, };
+foreground_window?: string, 
+/**
+ * The agent holds its DVC channel but has stopped answering status
+ * probes, with nothing outstanding that would explain it.
+ *
+ * Distinct from busy: the agent runs one command at a time, so a long
+ * `run --wait` legitimately silences it and is *not* reported here.
+ * This is the state that used to leave an operator staring at timeouts
+ * for up to an hour with no way to tell a stuck agent from a working
+ * one.
+ */
+wedged: boolean, 
+/**
+ * Consecutive status probes the agent has failed to answer. Non-zero
+ * before `wedged` is set: the verdict needs several.
+ */
+wedge_strikes: number, 
+/**
+ * How many times this agent has been found wedged against this host.
+ */
+wedge_detections: number, };

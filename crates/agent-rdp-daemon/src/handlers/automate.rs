@@ -254,6 +254,9 @@ fn handshake_view(
         previous_agent_pid: None,
         adopted_replacement: false,
         agent_changes: 0,
+        wedged: false,
+        wedge_strikes: 0,
+        wedge_detections: 0,
         // The agent is not answering, so it cannot describe its desktop.
         desktop_alive: None,
         input_desktop_open: None,
@@ -364,6 +367,9 @@ fn offline_status(state: &crate::automation::AutomationState) -> Response {
         input_desktop_open: None,
         input_desktop_name: None,
         foreground_window: None,
+        wedged: state.wedge_declared,
+        wedge_strikes: state.wedge_strikes,
+        wedge_detections: state.wedge_detections,
     }))
 }
 
@@ -379,6 +385,9 @@ fn fill_daemon_fields(status: &mut AutomationStatus, state: &crate::automation::
     status.previous_agent_pid = state.previous_agent_pid;
     status.adopted_replacement = state.adopted_replacement;
     status.agent_changes = state.agent_changes;
+    status.wedged = state.wedge_declared;
+    status.wedge_strikes = state.wedge_strikes;
+    status.wedge_detections = state.wedge_detections;
     if let Some(ipc) = state.dvc_ipc.as_ref() {
         status.agent_instance_id = ipc.agent_instance_id();
         status.agent_started_unix = ipc.agent_started_unix();
@@ -1582,6 +1591,9 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
         previous_agent_pid: None,
         adopted_replacement: false,
         agent_changes: 0,
+        wedged: false,
+        wedge_strikes: 0,
+        wedge_detections: 0,
         relaunches: 0,
         uptime_secs: None,
         last_rtt_ms: None,

@@ -400,6 +400,30 @@ DVC state. `automate status` reports `relaunches`, `last_error` and
 `next_retry_secs`, and is answered from daemon state alone
 (`offline_status`) while the agent cannot be reached.
 
+**A wedged agent.** The agent is a single loop: it reads one DVC message,
+runs it to completion, then replies. So it answers nothing at all while a
+command runs — a `run --wait` holds it for the whole `--process-timeout`,
+and that is *not* a fault. What is a fault is holding the channel and
+answering nothing with no work outstanding, which a field report sat in for
+up to 85 minutes with no way to tell the two apart and no self-healing.
+
+The supervisor now distinguishes them, and it does so by asking rather than
+by waiting. Silence alone cannot tell an idle agent from a wedged one —
+both are blocked in the same read — so silence past `WEDGE_PROBE_AFTER`
+(60s) only buys a `Status` probe. `WEDGE_STRIKES` (3) consecutive
+unanswered probes, with nothing pending *and* past every deadline the daemon
+ever granted plus `WEDGE_GRACE` (120s), is the verdict. Any inbound message
+clears the strikes. `busy_until` is the high-water mark of granted
+deadlines, which is what stops an hour-long `run --wait` being mistaken for
+a wedge after the daemon has dropped its own pending entry for it.
+
+A verdict sets `wedged` in `automate status` and unblocks the relaunch gate,
+which a live handshake would otherwise satisfy forever. Every other gate is
+unchanged: input quiet, the relaunch budget, `--defer-agent`, the session
+generation, and `AGENT_RDP_NO_AUTO_RELAUNCH`. The relaunch types Win+R, so
+it is reported before it happens — and a long command is better run with
+`run --stream` plus `run-poll`, which never occupies the loop at all.
+
 `status` is also the one command that never enters the indeterminate
 recovery ladder. It probes the agent for `STATUS_PROBE_TIMEOUT` (5s) and, on
 any failure, returns a success built from the stored handshake plus daemon

@@ -381,6 +381,25 @@ impl Output {
                         status.total_launches
                     );
                 }
+                if status.wedged {
+                    println!(
+                        "WEDGED: the agent holds its channel but has stopped answering, with \
+                         nothing outstanding to explain it. This is not the same as busy. The \
+                         daemon relaunches it once the session has been idle for 2 minutes; \
+                         `automate restart` does it now (both type Win+R on the remote desktop)."
+                    );
+                } else if status.wedge_strikes > 0 {
+                    println!(
+                        "Missed status probes: {} (not yet a verdict; any reply clears it)",
+                        status.wedge_strikes
+                    );
+                }
+                if status.wedge_detections > 0 {
+                    println!(
+                        "Times found wedged against this host: {}",
+                        status.wedge_detections
+                    );
+                }
                 if let Some(ref probe) = status.probe_error {
                     println!("Status probe: {}", probe);
                 }
