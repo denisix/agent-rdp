@@ -248,6 +248,7 @@ pub const KEEP_ALIVE_MISSED_LIMIT: u32 = 3;
 pub struct KeepAliveWatch {
     unanswered: u32,
     armed: bool,
+    send_failures: u32,
 }
 
 /// How soon after a refresh an inbound PDU counts as its answer.
@@ -278,7 +279,29 @@ impl KeepAliveWatch {
         if promptly_answered {
             self.armed = true;
         }
+        self.send_failures = 0;
         self.armed && self.unanswered >= KEEP_ALIVE_MISSED_LIMIT
+    }
+
+    /// Record that the keep-alive could not even be written. Returns `true`
+    /// once that has happened `KEEP_ALIVE_MISSED_LIMIT` times in a row.
+    ///
+    /// Deliberately independent of arming. Arming exists for one reason: the
+    /// protocol lets a server that never advertised `refreshRectSupport`
+    /// ignore a Refresh Rect, and such a server must not be killed for
+    /// staying silent. A server that cannot accept our *bytes* is not
+    /// exercising that right - the excuse does not apply one layer down. A
+    /// failing write used to record nothing at all, so a socket that could
+    /// not be written accrued no strikes and the session stood until
+    /// something else noticed, which in the field took over six hours.
+    pub fn record_send_failure(&mut self) -> bool {
+        self.send_failures = self.send_failures.saturating_add(1);
+        self.send_failures >= KEEP_ALIVE_MISSED_LIMIT
+    }
+
+    /// Consecutive keep-alive sends that could not be written.
+    pub fn send_failures(&self) -> u32 {
+        self.send_failures
     }
 
     /// Consecutive unanswered sends so far.
@@ -1298,15 +1321,22 @@ async fn run_frame_processor(
                         }
                         Err(e) => {
                             if !keep_alive_failing {
-                                warn!(
-                                    "Keep-alive send failed: {} (the read arm reports the drop \
-                                     if the transport is gone)",
+                                warn!("Keep-alive send failed: {}", e);
+                                keep_alive_failing = true;
+                            }
+                            if keep_alive_watch.record_send_failure() {
+                                drop_reason = format!(
+                                    "the keep-alive could not be written to the transport {} \
+                                     times in a row (last error: {}); the connection is gone",
+                                    keep_alive_watch.send_failures(),
                                     e
                                 );
-                                keep_alive_failing = true;
+                                error!("{}", drop_reason);
+                                break;
                             }
                         }
                     },
+                    // Our own bug, not the transport's: nothing to strike.
                     Err(e) => warn!("Failed to encode keep-alive: {}", e),
                 }
             }
@@ -2112,6 +2142,46 @@ mod liveness_tests {
     /// dead service.
     /// A watch that has seen a refresh answered on a quiet link, the
     /// precondition for the verdict.
+    /// A write that fails is stronger evidence than silence, and must not
+    /// wait for the verdict to be armed.
+    ///
+    /// Arming exists because the protocol lets a server ignore a Refresh
+    /// Rect; a server that cannot take our bytes at all is not doing that.
+    /// A failing write used to record nothing, so a socket that could not be
+    /// written accrued no strikes at all - in the field a dead transport
+    /// stood for over six hours before anything noticed.
+    #[test]
+    fn keep_alive_write_failures_count_toward_the_verdict() {
+        let mut watch = KeepAliveWatch::default();
+        assert!(!watch.armed(), "deliberately never armed in this test");
+
+        for strike in 1..KEEP_ALIVE_MISSED_LIMIT {
+            assert!(
+                !watch.record_send_failure(),
+                "{strike} failures must not be a verdict on their own"
+            );
+        }
+        assert!(
+            watch.record_send_failure(),
+            "a write that keeps failing is a dead transport, armed or not"
+        );
+        assert_eq!(watch.send_failures(), KEEP_ALIVE_MISSED_LIMIT);
+    }
+
+    /// A send that gets through clears the failure run: a single blip on an
+    /// otherwise working socket must not accumulate toward a drop.
+    #[test]
+    fn a_successful_send_clears_the_failure_count() {
+        let mut watch = KeepAliveWatch::default();
+        assert!(!watch.record_send_failure());
+        assert!(!watch.record_send_failure());
+        assert_eq!(watch.send_failures(), 2);
+
+        watch.record_send(true, false);
+        assert_eq!(watch.send_failures(), 0, "the socket is working again");
+        assert!(!watch.record_send_failure(), "the count starts over");
+    }
+
     fn armed_watch() -> KeepAliveWatch {
         let mut watch = KeepAliveWatch::default();
         assert!(!watch.record_send(true, false), "first send, nothing to compare against");
