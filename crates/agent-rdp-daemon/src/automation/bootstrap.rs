@@ -1508,6 +1508,32 @@ mod tests {
         assert!(LIB_ACTIONS.contains("[AgentDesktop]::GetForegroundWindow()"));
     }
 
+    /// One capability list, declared once and reported everywhere.
+    ///
+    /// The handshake list and the `status` list were separate copies and had
+    /// drifted: `status` advertised `invoke` (no dispatch arm implements it)
+    /// and omitted ten real capabilities. Since the daemon answers `status`
+    /// from the handshake whenever the agent is too busy to reply, the same
+    /// agent reported *more* capabilities the busier it got.
+    #[test]
+    fn the_status_reply_reuses_the_handshake_capability_list() {
+        assert!(AGENT_SCRIPT.contains("$script:Capabilities = @("));
+        assert!(AGENT_SCRIPT.contains("-Capabilities $script:Capabilities"));
+        assert!(LIB_ACTIONS.contains("capabilities = $script:Capabilities"));
+        // The stale copy and its phantom capability are gone.
+        assert!(
+            !LIB_ACTIONS.contains("\"invoke\""),
+            "nothing implements `invoke`; advertising it traps feature detection"
+        );
+        // One array literal, in one file. The second copy is what drifted.
+        assert_eq!(
+            AGENT_SCRIPT.matches("\"persistent_journal\"").count(),
+            1,
+            "the capability list must exist in exactly one place"
+        );
+        assert!(!LIB_ACTIONS.contains("\"persistent_journal\""));
+    }
+
     /// The agent identifies its *process*, not just its pid, and reports
     /// whether there is an interactive desktop to drive.
     #[test]

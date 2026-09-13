@@ -41,6 +41,22 @@ $script:Version = "1.9.0"  # process tree kill, cmd.exe shell, agent identity an
 # and the daemon needs to tell "the agent I already knew came back" from "a
 # different agent took the channel".
 $script:InstanceId = [Guid]::NewGuid().ToString("N")
+# What this agent can do, declared once.
+#
+# The handshake and `status` both report this list. They used to carry two
+# hand-maintained copies, and the status one had drifted: it advertised
+# "invoke", which no dispatch arm implements, and omitted ten capabilities
+# the agent has. Since the daemon answers `status` from the handshake when
+# the agent is too busy to reply, the same agent reported *more*
+# capabilities the busier it got - and callers feature-detect on this.
+$script:Capabilities = @(
+    "snapshot", "click", "select", "toggle", "expand", "collapse",
+    "context_menu", "focus", "get", "fill", "clear",
+    "scroll", "window", "run", "run_poll", "wait_for", "status",
+    "file_write_chunk", "file_read_chunk", "file_stat", "query_result",
+    "persistent_journal", "shutdown", "survives_reconnect",
+    "agent_identity", "desktop_liveness"
+)
 # Local log path on Windows machine (RDPDR not used for logging anymore)
 $script:LocalLogPath = "$env:TEMP\agent-rdp-automation.log"
 $script:DvcHandle = [IntPtr]::Zero
@@ -103,18 +119,8 @@ function Start-Agent {
         throw
     }
 
-    # Send handshake
-    $capabilities = @(
-        "snapshot", "click", "select", "toggle", "expand", "collapse",
-        "context_menu", "focus", "get", "fill", "clear",
-        "scroll", "window", "run", "run_poll", "wait_for", "status",
-        "file_write_chunk", "file_read_chunk", "file_stat", "query_result",
-        "persistent_journal", "shutdown", "survives_reconnect",
-        "agent_identity", "desktop_liveness"
-    )
-
     try {
-        Send-DvcHandshake -Handle $script:DvcHandle -Version $script:Version -Capabilities $capabilities -BuildId $BuildId -InstanceId $script:InstanceId -StartedUnix $script:StartedUnix
+        Send-DvcHandshake -Handle $script:DvcHandle -Version $script:Version -Capabilities $script:Capabilities -BuildId $BuildId -InstanceId $script:InstanceId -StartedUnix $script:StartedUnix
         Write-Log "DVC handshake sent: version=$($script:Version)"
         # Not the moment a client took us: the write can succeed on a channel
         # with nobody behind it (the session's client is gone; reads then

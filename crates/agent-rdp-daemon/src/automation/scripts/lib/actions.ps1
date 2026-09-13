@@ -1516,11 +1516,9 @@ function Get-AgentStatus {
         input_desktop_open = $inputDesktopOpen
         input_desktop_name = $inputDesktopName
         foreground_window = $foregroundWindow
-        capabilities = @(
-            "snapshot", "invoke", "select", "toggle", "expand", "collapse",
-            "context_menu", "focus", "get", "fill", "clear",
-            "scroll", "window", "run", "wait_for", "status"
-        )
+        # The same list the handshake carries. Two hand-maintained copies
+        # had drifted apart; see agent.ps1.
+        capabilities = $script:Capabilities
     }
 }
 

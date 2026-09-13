@@ -1005,6 +1005,14 @@ fn convert_response(
                     status.uptime_secs = ipc.agent_uptime_secs();
                     status.last_rtt_ms = ipc.last_rtt_ms();
                     status.consecutive_failures = ipc.consecutive_failures();
+                    // The handshake is the authority on what the agent can
+                    // do, here as everywhere else: `resolve_indeterminate`
+                    // already gates on it, and a status answered from the
+                    // handshake (a busy or silent agent) reports it too. An
+                    // older agent whose `status` reply carries a stale list
+                    // would otherwise make the same agent look different
+                    // depending on which path answered.
+                    status.capabilities = ipc.capabilities();
                     // `relaunches` is filled by `handle`, which owns the state.
                     Response::success(ResponseData::AutomationStatus(status))
                 }
@@ -1918,7 +1926,7 @@ mod agent_identity_tests {
             s.handshake = Some(DvcHandshake {
                 version: "1.9.0".into(),
                 agent_pid: pid,
-                capabilities: vec![],
+                capabilities: vec!["snapshot".into(), "query_result".into()],
                 build_id: Some(crate::automation::expected_build_id()),
                 instance_id: instance.map(str::to_string),
                 started_unix: Some(1_700_000_000),
@@ -2011,6 +2019,34 @@ mod agent_identity_tests {
         assert_eq!(status.previous_agent_pid, Some(5960));
         assert!(status.adopted_replacement);
         assert_eq!(status.agent_changes, 2);
+    }
+
+    /// The handshake decides what the agent can do, even when the agent's
+    /// own status reply says otherwise - an older agent's list is stale, and
+    /// a busy agent's status is answered from the handshake anyway, so the
+    /// two must not be able to disagree.
+    #[test]
+    fn a_live_status_reports_the_handshake_capabilities() {
+        let ipc = ipc_with(777, Some("i"));
+        let stale = serde_json::json!({
+            "agent_running": true,
+            "capabilities": ["snapshot", "invoke"],
+        });
+
+        let response = convert_response(AutomateRequest::Status, stale, &ipc);
+        let Some(ResponseData::AutomationStatus(status)) = response.data else {
+            panic!("expected a status");
+        };
+
+        assert!(
+            status.capabilities.iter().any(|c| c == "query_result"),
+            "the handshake's capabilities must win: {:?}",
+            status.capabilities
+        );
+        assert!(
+            !status.capabilities.iter().any(|c| c == "invoke"),
+            "the agent's stale claim must not survive"
+        );
     }
 
     /// An agent from before these fields existed reports none of them, and
