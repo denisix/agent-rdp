@@ -250,6 +250,45 @@ impl Output {
                     }
                 }
             }
+            ResponseData::JournaledResult(entry) => {
+                if entry.known {
+                    println!(
+                        "The agent ran this request and it {}.",
+                        if entry.success { "succeeded" } else { "failed" }
+                    );
+                    if let Some(ref err) = entry.error {
+                        println!("Error: {}", err);
+                    }
+                    if let Some(at) = entry.at_unix {
+                        println!("Recorded at: {} (remote clock, unix)", at);
+                    }
+                    if let Some(ref data) = entry.data {
+                        println!("Result: {}", data);
+                    }
+                    println!("Do NOT re-run it: this is what it did.");
+                } else if entry.evicted {
+                    // The distinction the whole command exists for.
+                    println!(
+                        "Unknown: the agent's record of this request was evicted from its \
+                         journal, so it cannot say whether it ran. Check the effect on the \
+                         remote machine before retrying."
+                    );
+                } else if entry.journal.as_deref() == Some("memory") {
+                    println!(
+                        "Unknown: this agent has no on-disk journal, so a record would not \
+                         have survived a restart. Check the effect on the remote machine \
+                         before retrying."
+                    );
+                } else {
+                    println!(
+                        "The agent has no record of this request, so it never ran - retrying \
+                         is safe."
+                    );
+                }
+                if let Some(ref instance) = entry.instance_id {
+                    println!("Answered by agent instance: {}", instance);
+                }
+            }
             ResponseData::AutomationStatus(status) => {
                 println!("Agent running: {}", status.agent_running);
                 if let Some(pid) = status.agent_pid {

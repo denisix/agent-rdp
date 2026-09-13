@@ -1,8 +1,8 @@
 //! Response types for daemon to CLI communication.
 
 use crate::automation::{
-    AccessibilitySnapshot, AutomationStatus, ClickResult, ElementValue, RunPollResult, RunResult,
-    WindowInfo,
+    AccessibilitySnapshot, AutomationStatus, ClickResult, ElementValue, JournaledResult,
+    RunPollResult, RunResult, WindowInfo,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -191,6 +191,9 @@ pub enum ResponseData {
 
     /// Automation agent status.
     AutomationStatus(AutomationStatus),
+
+    /// What the agent recorded about an earlier request.
+    JournaledResult(JournaledResult),
 
     /// Command run result.
     RunResult(RunResult),

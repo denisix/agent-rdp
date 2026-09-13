@@ -27,6 +27,7 @@ export type { FileStatRequest } from './FileStatRequest.js';
 export type { FileStatResult } from './FileStatResult.js';
 export type { FileTransferResult } from './FileTransferResult.js';
 export type { ImageFormat } from './ImageFormat.js';
+export type { JournaledResult } from './JournaledResult.js';
 export type { KeyboardRequest } from './KeyboardRequest.js';
 export type { LastDisconnect } from './LastDisconnect.js';
 export type { LocateRequest } from './LocateRequest.js';

@@ -687,6 +687,18 @@ pub enum AutomateAction {
     /// Get automation agent status
     Status,
 
+    /// Ask the agent what it did with an earlier request
+    ///
+    /// The answer to an `automation_indeterminate` error, which names the
+    /// request id. Says whether the command ran, whether it succeeded, and -
+    /// when the agent cannot know, because it restarted or the record aged
+    /// out of its journal - says that instead of guessing.
+    QueryResult {
+        /// Request id, as printed in the indeterminate error (or the
+        /// `--idempotency-key` the run carried).
+        id: String,
+    },
+
     /// Relaunch the UI Automation agent without a full RDP reconnect
     ///
     /// Use this when the agent died mid-session or never came up after

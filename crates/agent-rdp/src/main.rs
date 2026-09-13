@@ -174,6 +174,7 @@ fn command_label(cli: &Cli) -> String {
                 cli::AutomateAction::WaitFor { .. } => "wait-for",
                 cli::AutomateAction::Restart => "restart",
                 cli::AutomateAction::Status => "status",
+                cli::AutomateAction::QueryResult { .. } => "query-result",
                 cli::AutomateAction::Snapshot { .. } => "snapshot",
                 _ => "action",
             };
@@ -281,7 +282,9 @@ fn watchdog_budget_ms(cli: &Cli) -> Option<u64> {
 /// from its own budget, so neither pays for it.
 fn automate_ladder_ms(action: &cli::AutomateAction) -> u64 {
     match action {
-        cli::AutomateAction::Status | cli::AutomateAction::Restart => 0,
+        cli::AutomateAction::Status
+        | cli::AutomateAction::QueryResult { .. }
+        | cli::AutomateAction::Restart => 0,
         _ => agent_rdp_daemon::handlers::automate::indeterminate_resolution_worst().as_millis()
             as u64,
     }

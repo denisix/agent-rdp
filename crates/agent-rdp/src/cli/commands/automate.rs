@@ -371,7 +371,9 @@ fn automate_timeout_ms(request: &Request, base_timeout_ms: u64) -> u64 {
     // `status` is answered from daemon state within its own short probe
     // deadline and never enters the recovery ladder, so it neither needs nor
     // should get the extra budget.
-    if matches!(automate, AutomateRequest::Status) {
+    // Answered from the daemon or from one short round trip, and neither
+    // enters the recovery ladder, so neither pays for it.
+    if agent_rdp_daemon::handlers::automate::skips_recovery_ladder(automate) {
         return base_timeout_ms;
     }
 
@@ -566,6 +568,8 @@ fn build_request(action: AutomateAction) -> Result<AutomateRequest, String> {
         }
 
         AutomateAction::Status => AutomateRequest::Status,
+
+        AutomateAction::QueryResult { id } => AutomateRequest::QueryResult { id },
 
         // Handled directly in `run` before this function is called - it maps
         // to a top-level `Request` variant, not an `AutomateRequest`.

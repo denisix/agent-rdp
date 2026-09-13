@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use agent_rdp_protocol::{
     AccessibilityElement, AccessibilitySnapshot, AutomateRequest, AutomationStatus, ClickResult,
-    ElementBounds, ElementValue, ErrorCode, Response, ResponseData, RunPollResult, RunResult,
-    WindowInfo,
+    ElementBounds, ElementValue, ErrorCode, JournaledResult, Response, ResponseData,
+    RunPollResult, RunResult, WindowInfo,
 };
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -526,6 +526,11 @@ pub async fn handle(
                 e.downcast_ref::<crate::automation::DvcIndeterminate>()
             {
                 error!("Automation request outcome unknown: {}", e);
+                if skips_recovery_ladder(&request) {
+                    // A lookup is what the ladder *is*; sending one through
+                    // it would ask the agent about the lookup itself.
+                    return Response::error(ErrorCode::AutomationIndeterminate, e.to_string());
+                }
                 return resolve_indeterminate(&ipc, &request, &indeterminate.request_id, &e).await;
             }
             error!("Automation request failed: {}", e);
@@ -651,6 +656,20 @@ pub fn dvc_deadline(request: &AutomateRequest) -> std::time::Duration {
         return STATUS_PROBE_TIMEOUT;
     }
     request_timeout(request, DEFAULT_DVC_TIMEOUT)
+}
+
+/// Whether this request is answered without ever entering the lost-reply
+/// recovery ladder.
+///
+/// `status` is the health check and must be quick. `query_result` is the
+/// ladder's own instrument: sending it *through* the ladder would, on a lost
+/// lookup reply, issue another lookup for the failed lookup - which is never
+/// journaled, so the daemon would report that the lookup "never ran".
+pub fn skips_recovery_ladder(request: &AutomateRequest) -> bool {
+    matches!(
+        request,
+        AutomateRequest::Status | AutomateRequest::QueryResult { .. }
+    )
 }
 
 /// The DVC response deadline a fresh `DvcIpc` applies.
@@ -996,6 +1015,11 @@ fn convert_response(
         // The agent answers and exits; there is no result to parse.
         AutomateRequest::Shutdown => Response::ok(),
 
+        AutomateRequest::QueryResult { .. } => {
+            // Without this arm the lookup fell to `_ => Response::ok()` and
+            // the answer - the whole point of the request - was discarded.
+            Response::success(ResponseData::JournaledResult(parse_journaled_result(data)))
+        }
         AutomateRequest::Status => {
             match parse_status_response(data) {
                 Ok(mut status) => {
@@ -1481,6 +1505,26 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
 }
 
 /// Parse click response from PowerShell agent.
+/// Read the agent's journal lookup.
+///
+/// Absent fields mean "an agent too old to report this", which is why none
+/// of them default to something that would read as an answer.
+fn parse_journaled_result(data: serde_json::Value) -> JournaledResult {
+    JournaledResult {
+        known: data["known"].as_bool().unwrap_or(false),
+        evicted: data["evicted"].as_bool().unwrap_or(false),
+        journal: data["journal"].as_str().map(|s| s.to_string()),
+        instance_id: data["instance_id"].as_str().map(|s| s.to_string()),
+        success: data["success"].as_bool().unwrap_or(false),
+        data: data.get("data").filter(|v| !v.is_null()).cloned(),
+        error: data["error"]["message"]
+            .as_str()
+            .map(|s| s.to_string())
+            .or_else(|| data["error"].as_str().map(|s| s.to_string())),
+        at_unix: data["at_unix"].as_u64(),
+    }
+}
+
 fn parse_click_response(data: serde_json::Value) -> anyhow::Result<ClickResult> {
     tracing::debug!("Click response data: {}", data);
     let clicked = data["clicked"].as_bool().unwrap_or(false);
@@ -1900,6 +1944,62 @@ mod status_probe_tests {
             !body.contains(".store("),
             "restoring a previously read value would clobber a concurrent failure"
         );
+    }
+
+    /// The lookup's answer must reach the caller. It used to fall through
+    /// `convert_response`'s catch-all and be replaced by a bare ok, so the
+    /// one command that answers "did this run?" answered nothing.
+    #[test]
+    fn query_result_is_rendered_not_discarded() {
+        let ipc = ready_ipc(1);
+        let payload = serde_json::json!({
+            "known": true,
+            "success": false,
+            "error": { "message": "it blew up" },
+            "at_unix": 1_700_000_000,
+            "instance_id": "abc",
+            "journal": "disk",
+        });
+
+        let response = convert_response(
+            AutomateRequest::QueryResult { id: "d7913ec8".into() },
+            payload,
+            &ipc,
+        );
+
+        let Some(ResponseData::JournaledResult(entry)) = response.data else {
+            panic!("the lookup's answer was discarded");
+        };
+        assert!(entry.known);
+        assert!(!entry.success);
+        assert_eq!(entry.error.as_deref(), Some("it blew up"));
+        assert_eq!(entry.journal.as_deref(), Some("disk"));
+        assert_eq!(entry.instance_id.as_deref(), Some("abc"));
+    }
+
+    /// A lookup must never be sent through the ladder: the ladder's own
+    /// instrument is a lookup, so a lost lookup reply would make the daemon
+    /// ask the agent about the lookup - which is never journaled, so it
+    /// would report that the lookup itself "never ran".
+    #[test]
+    fn query_result_never_enters_the_recovery_ladder() {
+        let query = AutomateRequest::QueryResult { id: "x".into() };
+        assert!(skips_recovery_ladder(&query));
+        assert!(skips_recovery_ladder(&AutomateRequest::Status));
+        assert!(!skips_recovery_ladder(&AutomateRequest::Click {
+            selector: "@1".into(),
+            double_click: false,
+        }));
+        assert_eq!(dvc_deadline(&query), DEFAULT_DVC_TIMEOUT);
+
+        let source = crate::automation::lf(include_str!("automate.rs"));
+        let at = source.find("pub async fn handle(").unwrap();
+        let body = &source[at..];
+        let end = body.find("\n/// Turn \"we don't know what happened\"").unwrap();
+        let body = &body[..end];
+        let guard = body.find("if skips_recovery_ladder(&request) {").unwrap();
+        let ladder = body.find("return resolve_indeterminate(").unwrap();
+        assert!(guard < ladder, "the guard must precede the ladder");
     }
 
     /// Three lookups of 10s with 2s and 4s of backoff between them. Every

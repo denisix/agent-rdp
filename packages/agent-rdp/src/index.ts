@@ -105,9 +105,10 @@ export function requestTimeout(request: Request, base: number): number {
       return Math.max(base, DAEMON_SLACK_MS) + TRANSFER_TIMEOUT_MS;
     case 'automate': {
       const op = request as { op?: string; wait?: boolean; timeout_ms?: number };
-      // `status` is answered from daemon state within a short probe deadline
-      // and never enters the recovery ladder below.
-      if (op.op === 'status') {
+      // Answered from daemon state or one short round trip, and neither
+      // enters the recovery ladder below, so neither pays for it. A lookup
+      // in particular must not: the ladder's own instrument is a lookup.
+      if (op.op === 'status' || op.op === 'query_result') {
         return base;
       }
       // A remote command's own budget is the daemon's, which allows itself

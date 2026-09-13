@@ -735,6 +735,52 @@ pub struct RunPollResult {
     pub pending: bool,
 }
 
+/// What the agent recorded about an earlier request.
+///
+/// The answer to "did this actually run?" after a lost reply. The important
+/// distinction is between *the agent never saw it* — which makes a retry
+/// safe — and *the record is gone*, which does not. Confusing the two is how
+/// a caller applies a mutation twice, so the fields that separate them are
+/// carried explicitly rather than inferred.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct JournaledResult {
+    /// The agent has a record of this request.
+    #[serde(default)]
+    pub known: bool,
+    /// The request is unknown *because its record was evicted* from the
+    /// agent's bounded journal, not because it never arrived. Retrying is
+    /// not safe on the strength of `known: false` alone when this is set.
+    #[serde(default)]
+    pub evicted: bool,
+    /// Which tier answered: `disk` survives an agent restart, `memory` does
+    /// not. An unknown id from a memory-only journal on a *restarted* agent
+    /// says nothing about whether the request ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub journal: Option<String>,
+    /// The agent process that answered, so a caller can tell whether it is
+    /// the one that received the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub instance_id: Option<String>,
+    /// Whether the recorded request succeeded. Meaningless unless `known`.
+    #[serde(default)]
+    pub success: bool,
+    /// The recorded reply, if it succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "unknown")]
+    pub data: Option<serde_json::Value>,
+    /// The recorded failure, if it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<String>,
+    /// When the agent recorded it, by the remote clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub at_unix: Option<u64>,
+}
+
 /// Click action result.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]

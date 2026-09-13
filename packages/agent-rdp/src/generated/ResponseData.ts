@@ -6,6 +6,7 @@ import type { ClickResult } from "./ClickResult.js";
 import type { ElementValue } from "./ElementValue.js";
 import type { FileStatResult } from "./FileStatResult.js";
 import type { FileTransferResult } from "./FileTransferResult.js";
+import type { JournaledResult } from "./JournaledResult.js";
 import type { LocateResult } from "./LocateResult.js";
 import type { MappedDrive } from "./MappedDrive.js";
 import type { RunPollResult } from "./RunPollResult.js";
@@ -131,4 +132,4 @@ version: string, } | { "type": "snapshot" } & AccessibilitySnapshot | { "type": 
 /**
  * List of windows.
  */
-windows: Array<WindowInfo>, } | { "type": "automation_status" } & AutomationStatus | { "type": "run_result" } & RunResult | { "type": "run_poll_result" } & RunPollResult | { "type": "click_result" } & ClickResult | { "type": "locate_result" } & LocateResult | { "type": "click_at_result" } & ClickAtResult | { "type": "file_transfer_result" } & FileTransferResult | { "type": "file_stat" } & FileStatResult;
+windows: Array<WindowInfo>, } | { "type": "automation_status" } & AutomationStatus | { "type": "journaled_result" } & JournaledResult | { "type": "run_result" } & RunResult | { "type": "run_poll_result" } & RunPollResult | { "type": "click_result" } & ClickResult | { "type": "locate_result" } & LocateResult | { "type": "click_at_result" } & ClickAtResult | { "type": "file_transfer_result" } & FileTransferResult | { "type": "file_stat" } & FileStatResult;
