@@ -594,6 +594,41 @@ mod wedge_tests {
         assert!(!is_wedged(&s, now));
     }
 
+    /// The watchdog must not be able to suppress its own verdict.
+    ///
+    /// The probe is a request, and every request raises `busy_until` - the
+    /// mark that says "the agent may legitimately still be working". So the
+    /// probe marked the agent busy for its own duration, and the verdict,
+    /// re-reading that mark, could never fire. The feature was inert.
+    #[test]
+    fn the_probe_does_not_suppress_the_verdict_it_gathers_evidence_for() {
+        let ipc = crate::automation::lf(include_str!("dvc_ipc.rs"));
+        let at = ipc.find("\n    pub async fn probe_status").unwrap();
+        let body = &ipc[at..];
+        let end = body.find("\n    }").unwrap();
+        assert!(
+            body[..end].contains("send_request_inner(&AutomateRequest::Status, response_timeout, false)"),
+            "the watchdog's own probe must not count as the agent being busy"
+        );
+
+        let boot = crate::automation::lf(include_str!("bootstrap.rs"));
+        // Anchored on the definition: the needle also occurs in this test.
+        let at = boot.find("\nasync fn check_for_wedge(").unwrap();
+        let body = &boot[at..];
+        let end = body.find("\n}\n").unwrap();
+        let body = &body[..end];
+        // The verdict rests on the pre-probe snapshot, not on state the
+        // probe has since touched.
+        assert!(body.contains("..snapshot"));
+        let probe = body.find("probe_status(").unwrap();
+        let verdict = body.find("let verdict = WedgeSnapshot {").unwrap();
+        assert!(probe < verdict);
+        assert!(
+            !body[verdict..].contains("ipc.busy_until()"),
+            "re-reading busy_until after the probe is the bug"
+        );
+    }
+
     /// A freshly spoken agent is not probed at all.
     #[test]
     fn a_recently_heard_agent_is_left_alone() {
@@ -789,12 +824,13 @@ async fn check_for_wedge(automation_state: &Arc<Mutex<AutomationState>>) {
     }
     state.wedge_strikes = state.wedge_strikes.saturating_add(1);
 
+    // The evidence is the snapshot taken *before* the probe, with this
+    // probe's strike added. Re-reading the channel here would fold in what
+    // the probe itself just did to it, and a verdict that consults state its
+    // own evidence-gathering changed is not a verdict.
     let verdict = WedgeSnapshot {
         strikes: state.wedge_strikes,
-        pending: 0,
-        silent_for: ipc.last_inbound_age().unwrap_or_default(),
-        busy_until: ipc.busy_until(),
-        channel_ready: ipc.is_ready(),
+        ..snapshot
     };
     if !is_wedged(&verdict, std::time::Instant::now()) {
         debug!(

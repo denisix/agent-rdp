@@ -176,7 +176,7 @@ impl DvcIpc {
     pub async fn probe_status(&self, response_timeout: Duration) -> anyhow::Result<serde_json::Value> {
         let busy = self.pending_requests() > 0;
         let result = self
-            .send_request_with_timeout(&AutomateRequest::Status, response_timeout)
+            .send_request_inner(&AutomateRequest::Status, response_timeout, false)
             .await;
         if result.is_err() && busy {
             // Take back only this probe's own increment. Restoring a value
@@ -231,6 +231,19 @@ impl DvcIpc {
         &self,
         request: &AutomateRequest,
         response_timeout: Duration,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.send_request_inner(request, response_timeout, true).await
+    }
+
+    /// `occupies_agent` says whether this request's deadline should count
+    /// toward `busy_until`. The watchdog's own probe must not: it would
+    /// mark the agent busy for its own duration and suppress the verdict it
+    /// exists to gather evidence for.
+    async fn send_request_inner(
+        &self,
+        request: &AutomateRequest,
+        response_timeout: Duration,
+        occupies_agent: bool,
     ) -> anyhow::Result<serde_json::Value> {
         // A caller-supplied idempotency key becomes the request id itself:
         // the agent journals results by id and replays a known one, so a
@@ -301,9 +314,11 @@ impl DvcIpc {
             // says nothing about a long one still occupying the agent, and
             // the daemon drops its own pending entry long before a
             // multi-minute command finishes.
-            let until = std::time::Instant::now() + response_timeout;
-            if state.busy_until.map_or(true, |b| until > b) {
-                state.busy_until = Some(until);
+            if occupies_agent {
+                let until = std::time::Instant::now() + response_timeout;
+                if state.busy_until.map_or(true, |b| until > b) {
+                    state.busy_until = Some(until);
+                }
             }
             // Captured here, under the same lock that hands the request
             // over, so recovery can tell whether the agent that answers is
