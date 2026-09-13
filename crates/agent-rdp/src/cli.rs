@@ -596,7 +596,12 @@ pub enum AutomateAction {
         /// Command to run (Windows PowerShell 5.1 unless --shell says otherwise)
         command: String,
 
-        /// Command arguments
+        /// Command arguments. A flag-shaped argument (`-Filter`, `--force`)
+        /// reaches the command as a parameter name; everything else is
+        /// passed as a quoted string literal, so spaces and quotes survive.
+        /// Write `\-value` for a value that looks like a flag. Typed
+        /// arguments (numbers, `$false`) arrive as strings - put those in
+        /// the command string itself.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
 

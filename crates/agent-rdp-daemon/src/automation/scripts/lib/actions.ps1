@@ -572,10 +572,31 @@ function Invoke-Run {
                 if ($_ -eq "" -or $_ -match '\s') { '"' + $_ + '"' } else { $_ }
             }) -join " "
         } else {
-            # Single-quoted PowerShell string literals (doubling embedded
-            # single quotes) so args containing spaces or quotes survive as
-            # one token when re-parsed by the child.
-            ($Params.args | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join " "
+            # Values become single-quoted PowerShell string literals
+            # (doubling embedded single quotes) so spaces and quotes survive
+            # as one token when the child re-parses them.
+            #
+            # Parameter names must NOT be quoted. A quoted token is never a
+            # parameter name to PowerShell, so wrapping every argument turned
+            # `-Filter "x"` into two positional strings and silently dropped
+            # the parameter - a field report lost a `-Filter` this way and
+            # got results for the unfiltered query. For a native .exe the two
+            # forms are identical ('--force' and --force both arrive as
+            # --force), so nothing that worked before changes.
+            #
+            # A value that genuinely looks like a flag is written `\-value`;
+            # the backslash is stripped and the rest quoted as a value.
+            ($Params.args | ForEach-Object {
+                if ($_ -eq "--" -or $_ -eq "--%") {
+                    # End-of-options and stop-parsing are syntax, not values.
+                    $_
+                } elseif ($_ -match '^--?[A-Za-z_][A-Za-z0-9_-]*$') {
+                    $_
+                } else {
+                    $literal = if ($_ -match '^\\-') { $_.Substring(1) } else { $_ }
+                    "'" + ($literal -replace "'", "''") + "'"
+                }
+            }) -join " "
         }
     } else { "" }
 

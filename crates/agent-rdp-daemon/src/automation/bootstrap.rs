@@ -1508,6 +1508,56 @@ mod tests {
         assert!(LIB_ACTIONS.contains("[AgentDesktop]::GetForegroundWindow()"));
     }
 
+    /// A parameter name must reach the child bare.
+    ///
+    /// Every argument used to be wrapped in a single-quoted literal, and a
+    /// quoted token is never a parameter name to PowerShell - so
+    /// `-Filter "x"` arrived as two positional strings and the parameter was
+    /// silently dropped. A field report got unfiltered results this way.
+    #[test]
+    fn parameter_shaped_arguments_are_left_bare() {
+        let actions = lf(LIB_ACTIONS);
+        let start = actions.find("$commandArgs = if ($Params.args) {").unwrap();
+        let body = &actions[start..];
+        let end = body.find("\n    } else { \"\" }").unwrap();
+        let body = &body[..end];
+
+        assert!(body.contains("'^--?[A-Za-z_][A-Za-z0-9_-]*$'"));
+        // End-of-options and stop-parsing are syntax, not values.
+        assert!(body.contains("if ($_ -eq \"--\" -or $_ -eq \"--%\")"));
+        // The escape for a value that genuinely looks like a flag.
+        assert!(body.contains("if ($_ -match '^\\\\-') { $_.Substring(1) }"));
+    }
+
+    /// Only the flag *name* goes bare. Its value - a path with spaces, most
+    /// of all - must still be quoted, or `-File "C:\Program Files\x.ps1"`
+    /// breaks into two tokens.
+    #[test]
+    fn a_value_token_after_a_flag_is_still_quoted() {
+        let actions = lf(LIB_ACTIONS);
+        let start = actions.find("$commandArgs = if ($Params.args) {").unwrap();
+        let body = &actions[start..];
+        let end = body.find("\n    } else { \"\" }").unwrap();
+        let body = &body[..end];
+
+        // The quoting branch is the `else`, so anything that is not
+        // flag-shaped still gets a literal - including a path, which cannot
+        // match a regex anchored on `-`.
+        assert!(body.contains("\"'\" + ($literal -replace \"'\", \"''\") + \"'\""));
+        let regex_at = body.find("'^--?[A-Za-z_][A-Za-z0-9_-]*$'").unwrap();
+        let quote_at = body.find("$literal -replace").unwrap();
+        assert!(regex_at < quote_at, "the bare case is the exception, quoting the rule");
+    }
+
+    /// The cmd branch has its own quoting rules and must not drift with the
+    /// PowerShell one next to it.
+    #[test]
+    fn the_cmd_branch_quoting_is_unchanged() {
+        let actions = lf(LIB_ACTIONS);
+        assert!(actions.contains("if ($_ -eq \"\" -or $_ -match '\\s') { '\"' + $_ + '\"' } else { $_ }"));
+        assert!(actions.contains("cmd_syntax: a cmd.exe argument cannot contain a double quote"));
+    }
+
     /// One capability list, declared once and reported everywhere.
     ///
     /// The handshake list and the `status` list were separate copies and had

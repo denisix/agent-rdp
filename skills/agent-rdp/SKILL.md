@@ -131,10 +131,13 @@ command text, and the reply tells you what survived them (`command_line` in
    locally, or `--` is not enough: the expansion already happened. The CLI
    prints a note when the text looks like that.
 2. *Argument quoting.* Everything after the command is sent as a separate
-   argument and appended as a single-quoted PowerShell literal: `,`, `$` and
-   wildcards in an argument are literal, and there is no way to pass
-   PowerShell syntax through arguments. Put the syntax in the command string
-   (`automate run "powershell -File x.ps1 -Param '1,2'"`).
+   argument. A flag-shaped one (`-Filter`, `--force`, `--`, `--%`) is passed
+   through bare, so it binds as a parameter; every other argument becomes a
+   single-quoted PowerShell literal, so `,`, `$`, spaces and wildcards in it
+   are literal. Write `\-value` for a value that looks like a flag. Typed
+   arguments still do not survive — a number arrives as a string — so put
+   those in the command string (`automate run "powershell -File x.ps1
+   -Param '1,2'"`).
 3. *The agent's parser.* The command string is parsed as Windows PowerShell
    5.1 source before the wrapper is added. A text that does not parse is
    refused with `parse_error: … line N, column M: …` **without launching
