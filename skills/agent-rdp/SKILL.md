@@ -100,6 +100,21 @@ serviced by the same task that carries the automation channel, so reading the
 share from inside the agent deadlocks — the command hangs and the session stops
 responding until you reconnect. Use `file push`/`file pull` instead.
 
+**The agent answers one command at a time, and there is no polling around
+that.** It is a single loop: read one request, run it to completion, reply.
+While a `run --wait` is running, nothing else is even *read* — not `status`,
+not a poll. So a `--poll-interval` would not help and does not exist; an
+extra poll would just be one more request that times out. The mechanism that
+does work is `run --stream`, which returns a pid as soon as the child starts
+and leaves the loop free, with `run-poll --follow` collecting output. Use it
+for anything over about a minute. The CLI says so when a waited run asks for
+more than 120s.
+
+If the agent holds its channel and answers nothing *with nothing running*,
+that is a wedge rather than busyness, and `automate status` now says which
+(`wedged`, plus the missed-probe count). The daemon relaunches a wedged
+agent on its own once the session has been idle for two minutes.
+
 **Long commands are allowed to be long, but they block the agent.** Transport,
 IPC and watchdog budgets all extend to cover `--process-timeout` and `wait-for
 --timeout`, so a 4-minute command is not cut off. But the agent handles one

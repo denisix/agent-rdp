@@ -668,9 +668,12 @@ fn push_failure_advice(last: bool, indeterminate: bool) -> &'static str {
          swapped into place after the final chunk verifies, and that chunk was never sent. \
          The partial sidecar was discarded. Re-running is safe."
     } else if indeterminate {
-        "The outcome is unknown (the reply to the final chunk was lost): the verified file \
-         may or may not have been swapped into place. Check the destination with `file \
-         stat` before deciding whether to re-run."
+        // The instruction first: this is the one case where the caller has
+        // something to do right now, and burying it behind the explanation
+        // is how it gets skipped.
+        "Run `file stat` on the destination now, before deciding anything. The outcome is \
+         unknown: the reply to the final chunk was lost, so the verified file may or may not \
+         have been swapped into place."
     } else {
         "The agent rejected the final step (write, verification or the swap into place) \
          and discarded the staged copy; the destination was not replaced. Re-running \
@@ -1256,7 +1259,12 @@ mod push_integrity_tests {
 
         let last_lost = push_failure_advice(true, true);
         assert!(last_lost.contains("unknown"));
-        assert!(last_lost.contains("file stat"));
+        // The action the caller must take comes first, not after the
+        // explanation - buried advice is skipped advice.
+        assert!(
+            last_lost.starts_with("Run `file stat`"),
+            "the instruction must lead: {last_lost}"
+        );
 
         let last_error = push_failure_advice(true, false);
         assert!(last_error.contains("was not replaced"));

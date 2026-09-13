@@ -337,7 +337,9 @@ agent-rdp automate run-poll <pid> --json              # `pending: true` = alive,
 agent-rdp automate run "Add-Content C:\log.txt x" --wait --idempotency-key step-07
                                             # a retry with the same key replays, never re-runs
 
+agent-rdp status                            # same report, canonical spelling
 agent-rdp automate status                   # health: RTT, failures, relaunches; works while the agent is down
+agent-rdp automate query-result <id>        # what the agent did with a request an error left indeterminate
 agent-rdp automate restart                  # relaunch the agent now, keeping the RDP session
 ```
 

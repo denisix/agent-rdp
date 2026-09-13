@@ -156,6 +156,7 @@ fn command_label(cli: &Cli) -> String {
     match &cli.command {
         Commands::Connect(_) => "connect".into(),
         Commands::Disconnect => "disconnect".into(),
+        Commands::Status => "status".into(),
         Commands::Screenshot(_) => "screenshot".into(),
         Commands::Mouse(_) => "mouse".into(),
         Commands::Keyboard(_) => "keyboard".into(),
@@ -266,6 +267,8 @@ fn watchdog_budget_ms(cli: &Cli) -> Option<u64> {
         // file at both ends; the command's own IPC timeout is raised to
         // match, so the watchdog has to clear that too.
         Commands::File(_) => cli::commands::file::TRANSFER_TIMEOUT_MS,
+        // The alias budgets exactly like the command it delegates to.
+        Commands::Status => 0,
         Commands::Wait { ms } => *ms,
         // Several best-effort daemon round trips (ping, info, status,
         // screenshot, remote log pull), each with its own budget.
@@ -445,6 +448,20 @@ mod watchdog_tests {
         assert_eq!(status_ms, DEFAULT_TIMEOUT_MS + WATCHDOG_GRACE_MS);
     }
 
+    /// The top-level alias must budget exactly like the command it
+    /// delegates to, or one of them is wrong.
+    #[test]
+    fn the_status_alias_budgets_like_automate_status() {
+        assert_eq!(
+            watchdog_budget_ms(&parse(&["status"])),
+            watchdog_budget_ms(&parse(&["automate", "status"]))
+        );
+        assert_eq!(
+            watchdog_budget_ms(&parse(&["status"])),
+            Some(DEFAULT_TIMEOUT_MS + WATCHDOG_GRACE_MS)
+        );
+    }
+
     /// The `--timeout` help text quotes the connect default; keep it honest.
     #[test]
     fn timeout_help_quotes_the_real_connect_default() {
@@ -554,6 +571,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Diagnose(args) => {
             cli::commands::diagnose::run(&cli.session, args, &output).await
+        }
+        // An alias, not a second implementation: operators reach for
+        // `status` and find neither `automate status` nor `session info`.
+        Commands::Status => {
+            cli::commands::automate::run(
+                &cli.session,
+                cli::AutomateArgs { action: cli::AutomateAction::Status },
+                &output,
+                timeout,
+            )
+            .await
         }
     }
 }

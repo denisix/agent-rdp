@@ -63,6 +63,18 @@ pub async fn run(
     if let AutomateAction::Run { wait: true, stream: true, .. } = &args.action {
         eprintln!("Note: --stream is ignored when --wait is set; output is returned directly.");
     }
+    // The agent runs one command at a time, so a long waited run silences
+    // every other automate call - including `status` - for its whole budget.
+    // There is no polling around that: a poll is not read either. Streaming
+    // is, because it returns as soon as the child is started.
+    if let AutomateAction::Run { wait: true, process_timeout: Some(budget), .. } = &args.action {
+        if *budget > LONG_RUN_ADVICE_MS {
+            eprintln!(
+                "Note: this run may hold the agent for {}s, and the agent answers one command                  at a time - `automate status` and everything else will block until it                  finishes. Prefer `automate run --stream` plus `automate run-poll <pid>                  --follow`, which returns a pid immediately.",
+                budget / 1000
+            );
+        }
+    }
 
     let automate_request = match build_request(args.action) {
         Ok(request) => request,
@@ -118,6 +130,10 @@ pub async fn run(
 /// launch waits and a status probe of the new agent - see
 /// `restart_worst_case` in the daemon (≈340s).
 pub const RESTART_MIN_TIMEOUT_MS: u64 = 360_000;
+
+/// Past this, a waited run is long enough that blocking every other
+/// automate command for its duration is worth warning about.
+const LONG_RUN_ADVICE_MS: u64 = 120_000;
 
 /// Default wall-clock budget for `run-poll --follow`.
 pub const DEFAULT_FOLLOW_TIMEOUT_MS: u64 = 60_000;

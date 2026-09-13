@@ -91,6 +91,12 @@ pub enum Commands {
     /// Windows UI Automation operations
     Automate(AutomateArgs),
 
+    /// Health of the automation agent: the same report as `automate status`
+    ///
+    /// For the RDP connection itself - state, host, resolution, frame age -
+    /// use `session info`.
+    Status,
+
     /// OCR-based text location (find text on screen)
     Locate(LocateArgs),
 
