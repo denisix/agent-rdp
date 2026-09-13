@@ -660,11 +660,15 @@ pub const DEFAULT_DVC_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// is gone, before it can reply.
 ///
 /// Worst case is the fallback path (`Stop-RunTree` in `actions.ps1`, on a
-/// host that will not nest job objects): the job wait, two `Win32_Process`
-/// walks at 5s each, the verification wait and a 500ms CPU sample. Generous
-/// on purpose - the reply carries whether anything survived, and losing it
-/// to a transport deadline turns a definite answer into an indeterminate
-/// one on exactly the loaded hosts where timeouts fire.
+/// host that will not nest job objects): two `Win32_Process` walks at 5s
+/// each, one shared `KillVerifyMs` (2s) deadline covering every process at
+/// once, and a 500ms CPU sample - about 13s. The verification wait used to
+/// be *per process*, which no constant could have covered: a wide tree
+/// overran this budget, and the caller got `automation_indeterminate` for a
+/// run the agent had answered definitively. Generous on purpose - the reply
+/// carries whether anything survived, and losing it to a transport deadline
+/// turns a definite answer into an unknown one on exactly the loaded hosts
+/// where timeouts fire.
 pub const KILL_VERIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn indeterminate_message(request: &AutomateRequest, error: &anyhow::Error) -> String {

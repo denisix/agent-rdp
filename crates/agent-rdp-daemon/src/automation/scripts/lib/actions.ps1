@@ -814,6 +814,10 @@ function Stop-RunTree {
     # could be reused by an unrelated process between the walk and the
     # check), kill, re-walk once for anything spawned in between, then wait
     # on the handles we hold.
+    #
+    # Logged because the two paths have very different costs and failure
+    # modes, and a field report cannot tell them apart from the reply alone.
+    Write-Log "Verifying the kill by process-tree walk (job assigned: $Assigned)" "WARN"
     try {
         $descendants = Get-ProcessDescendant -RootPid $Process.Id
         if ($descendants.Count -gt 0) { $result.started = $true }
@@ -843,7 +847,13 @@ function Stop-RunTree {
             }
         }
 
-        # Anything the tree spawned while we were killing it.
+        # Nothing was there to kill: no second walk, no waiting.
+        if ($targets.Count -eq 0) { return $result }
+
+        # Anything the tree spawned while we were killing it. Worth a second
+        # walk precisely because a grandchild reparented out of the tree is
+        # invisible to the handles taken above - which is the case where all
+        # of them show exited.
         foreach ($pid_ in Get-ProcessDescendant -RootPid $Process.Id) {
             if ($pid_ -eq $PID) { continue }
             try {
@@ -854,15 +864,40 @@ function Stop-RunTree {
             } catch {}
         }
 
-        foreach ($target in $targets) {
+        # One deadline for the whole tree, not one per process. Waiting
+        # `KillVerifyMs` on each in turn made a wide tree take minutes - and
+        # every second of it is spent on the agent's single dispatch thread,
+        # so the channel answers nothing, not even a status probe, until it
+        # finishes. It also overran the daemon's own deadline for the
+        # request, turning an answer the agent had into an indeterminate
+        # result for the caller. Termination is concurrent anyway; there was
+        # never a reason to observe it serially.
+        $deadline = (Get-Date).AddMilliseconds($script:KillVerifyMs)
+        $pending = New-Object System.Collections.Generic.List[object]
+        foreach ($target in $targets) { [void]$pending.Add($target) }
+        while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline) {
+            $still = New-Object System.Collections.Generic.List[object]
+            foreach ($target in $pending) {
+                try {
+                    # `HasExited` reads the handle we hold, so it is
+                    # immune to pid reuse and does not throw once exited.
+                    if (-not $target.HasExited) { [void]$still.Add($target) }
+                } catch {
+                    # A handle we can no longer query is one we cannot
+                    # vouch for; keep it and report it below.
+                    [void]$still.Add($target)
+                }
+            }
+            $pending = $still
+            if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 100 }
+        }
+
+        foreach ($target in $pending) {
             try {
-                [void]$target.WaitForExit($script:KillVerifyMs)
                 if (-not $target.HasExited) {
                     $result.survivors += "pid $($target.Id) ($($target.ProcessName))"
                 }
             } catch {
-                # A handle we can no longer query is one we cannot vouch
-                # for; say so rather than claiming success.
                 $result.survivors += "pid $($target.Id) (could not be verified)"
             }
         }

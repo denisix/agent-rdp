@@ -1406,6 +1406,60 @@ mod tests {
         assert!(!LIB_TYPES.contains("SetInformationJobObject"));
     }
 
+    /// The kill verification waits once for the whole tree, not once per
+    /// process.
+    ///
+    /// Serial waits made a wide tree take minutes, all of it on the agent's
+    /// single dispatch thread - so the channel answered nothing, not even a
+    /// status probe, until it finished. It also overran the daemon's own
+    /// deadline, turning an answer the agent had into an indeterminate
+    /// result for the caller.
+    #[test]
+    fn kill_verification_uses_one_shared_deadline_not_a_wait_per_target() {
+        let actions = lf(LIB_ACTIONS);
+        let start = actions.find("function Stop-RunTree").unwrap();
+        let body = &actions[start..];
+        let end = body.find("\n}\n").unwrap();
+        let body = &body[..end];
+
+        assert!(
+            !body.contains("WaitForExit($script:KillVerifyMs)"),
+            "the per-process wait is what made a wide tree take minutes"
+        );
+        assert!(body.contains("$deadline = (Get-Date).AddMilliseconds($script:KillVerifyMs)"));
+        assert!(body.contains("if (-not $target.HasExited) { [void]$still.Add($target) }"));
+        // Nothing to kill means nothing to walk again or wait for.
+        assert!(body.contains("if ($targets.Count -eq 0) { return $result }"));
+        // The second walk stays: a grandchild reparented out of the tree is
+        // invisible to the handles taken before the kill.
+        assert_eq!(
+            body.matches("Get-ProcessDescendant -RootPid $Process.Id").count(),
+            2,
+            "both process walks must survive"
+        );
+        // And the handles are still taken before anything is killed.
+        let handles = body.find("GetProcessById($pid_)").unwrap();
+        let kill = body.find("$target.Kill()").unwrap();
+        assert!(handles < kill, "handles must be taken before the kill");
+    }
+
+    /// The daemon's budget for a waited run has to cover what the agent
+    /// spends killing and verifying, or the reply is lost and a definite
+    /// answer is reported as indeterminate.
+    #[test]
+    fn the_kill_verify_budget_covers_the_fallback_path() {
+        let actions = lf(LIB_ACTIONS);
+        assert!(actions.contains("$script:KillVerifyMs = 2000"));
+        // Two CIM walks at 5s each, one shared 2s verification deadline,
+        // one 500ms CPU sample.
+        let worst = std::time::Duration::from_millis(5_000 + 5_000 + 2_000 + 500);
+        assert!(
+            crate::handlers::automate::KILL_VERIFY_BUDGET >= worst,
+            "the budget must cover the fallback path's worst case"
+        );
+        assert!(actions.contains("-OperationTimeoutSec 5"));
+    }
+
     /// `stale_ref_hint` matches on "not found"/"disabled"/"no longer
     /// exists" anywhere in an agent error. A kill message naming a
     /// survivor must not be decorated with "re-run `automate snapshot`".
