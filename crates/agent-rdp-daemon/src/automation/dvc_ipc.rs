@@ -183,8 +183,14 @@ impl DvcIpc {
             // read beforehand would erase a *concurrent* request's failure -
             // and a concurrent request is precisely what `busy` means, so the
             // clobber would happen exactly when it is possible.
-            self.consecutive_failures
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            // Saturating: the send can fail before it ever increments (a
+            // closed channel, no sender), and wrapping past zero would
+            // report four billion consecutive failures.
+            let _ = self.consecutive_failures.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| Some(n.saturating_sub(1)),
+            );
         }
         result
     }

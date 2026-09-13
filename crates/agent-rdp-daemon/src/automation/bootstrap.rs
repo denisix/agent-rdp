@@ -457,6 +457,11 @@ pub const WEDGE_GRACE: Duration = Duration::from_secs(120);
 /// 100% CPU, three consecutive is a pattern.
 pub const WEDGE_STRIKES: u32 = 3;
 
+/// How recently a frame must have arrived for the daemon's own side of the
+/// link to count as healthy. Comfortably more than the default keep-alive
+/// interval, so an answered keep-alive alone satisfies it.
+pub const WEDGE_TRANSPORT_FRESH: Duration = Duration::from_secs(150);
+
 /// Everything the wedge decision depends on, captured at one instant.
 #[derive(Debug, Clone, Copy)]
 pub struct WedgeSnapshot {
@@ -465,6 +470,16 @@ pub struct WedgeSnapshot {
     pub silent_for: Duration,
     pub busy_until: Option<std::time::Instant>,
     pub strikes: u32,
+    /// The daemon's own side of the link is demonstrably working: the
+    /// session is up and frames are still arriving.
+    ///
+    /// The frame processor services drive I/O synchronously, so a wedged
+    /// file operation blocks DVC, input and screenshots together for
+    /// minutes. From the agent's side that is indistinguishable from not
+    /// answering - and blaming it would relaunch a healthy agent through a
+    /// session whose input path is itself stalled. Unknown counts as false:
+    /// a Win+R on someone's desktop needs better evidence than an absence.
+    pub transport_healthy: bool,
 }
 
 /// Whether to spend a status probe on an agent that has gone quiet.
@@ -476,6 +491,7 @@ pub struct WedgeSnapshot {
 /// useful. The daemon has to ask.
 pub fn should_probe_wedge(s: &WedgeSnapshot, now: std::time::Instant) -> bool {
     s.channel_ready
+        && s.transport_healthy
         && s.pending == 0
         && s.silent_for >= WEDGE_PROBE_AFTER
         // A long `run --wait` occupies the agent for its whole budget, and
@@ -501,7 +517,24 @@ mod wedge_tests {
             silent_for: Duration::from_secs(6 * 60 * 60),
             busy_until: None,
             strikes: 0,
+            transport_healthy: true,
         }
+    }
+
+    /// The daemon's own frame loop stalls for minutes on a wedged drive
+    /// operation, and from here that is indistinguishable from a deaf
+    /// agent. Blaming the agent would relaunch it through a session whose
+    /// input path is itself stalled.
+    #[test]
+    fn a_stalled_transport_is_not_the_agents_fault() {
+        let now = std::time::Instant::now();
+        let s = WedgeSnapshot {
+            transport_healthy: false,
+            strikes: 9,
+            ..quiet()
+        };
+        assert!(!should_probe_wedge(&s, now), "probing through a stalled link proves nothing");
+        assert!(!is_wedged(&s, now));
     }
 
     /// The hole this design started with, and the reason the predicate
@@ -523,6 +556,23 @@ mod wedge_tests {
         assert!(!is_wedged(&ancient, now));
         // Probing it is fine - that is the whole point.
         assert!(should_probe_wedge(&quiet(), now));
+
+        // The shape that actually bites: a loaded host where probes are
+        // missed *hours apart*, with successful work in between. Those are
+        // not three consecutive misses and must not add up to a verdict.
+        // `check_for_wedge` clears the count as soon as the agent speaks,
+        // which is what keeps the strike run consecutive.
+        let boot = crate::automation::lf(include_str!("bootstrap.rs"));
+        let at = boot.find("\nasync fn check_for_wedge(").unwrap();
+        let body = &boot[at..];
+        let end = body.find("\n}\n").unwrap();
+        let body = &body[..end];
+        let clears = body
+            .find("if snapshot.silent_for < WEDGE_PROBE_AFTER {")
+            .expect("a recently heard agent must have its strikes cleared");
+        let probes = body.find("probe_status(").unwrap();
+        assert!(clears < probes, "clear before spending another probe");
+        assert!(body[clears..probes].contains("state.wedge_strikes = 0;"));
     }
 
     /// Silence plus strikes, and nothing less.
@@ -784,7 +834,26 @@ async fn supervisor_attempt(
 /// cannot distinguish an idle agent from a wedged one, because both are
 /// blocked in the same read. A probe that goes unanswered while nothing else
 /// is in flight can.
-async fn check_for_wedge(automation_state: &Arc<Mutex<AutomationState>>) {
+async fn check_for_wedge(
+    rdp_session: &Arc<Mutex<Option<RdpSession>>>,
+    automation_state: &Arc<Mutex<AutomationState>>,
+) {
+    // Our own side first. A stalled frame processor looks exactly like a
+    // deaf agent from here, and only one of the two is the agent's fault.
+    let transport_healthy = {
+        let session = rdp_session.lock().await;
+        match session.as_ref() {
+            Some(rdp) => {
+                rdp.drop_reason().is_none()
+                    // Keep-alive off means no steady inbound traffic to
+                    // judge by, so there is no evidence either way.
+                    && rdp.keep_alive().is_some()
+                    && rdp.last_frame_age() <= WEDGE_TRANSPORT_FRESH
+            }
+            None => false,
+        }
+    };
+
     let (ipc, snapshot) = {
         let state = automation_state.lock().await;
         let Some(ipc) = state.dvc_ipc.clone() else {
@@ -796,9 +865,24 @@ async fn check_for_wedge(automation_state: &Arc<Mutex<AutomationState>>) {
             silent_for: ipc.last_inbound_age().unwrap_or_default(),
             busy_until: ipc.busy_until(),
             strikes: state.wedge_strikes,
+            transport_healthy,
         };
         (ipc, snapshot)
     };
+
+    // The agent has spoken recently, so whatever strikes it had are spent.
+    // Without this they only ever accumulate: three probes missed hours
+    // apart, with successful commands in between, would eventually add up
+    // to a verdict against an agent that was working the whole time - and
+    // the recovery for that verdict types Win+R on the remote desktop.
+    if snapshot.silent_for < WEDGE_PROBE_AFTER {
+        let mut state = automation_state.lock().await;
+        if state.wedge_strikes > 0 || state.wedge_declared {
+            state.wedge_strikes = 0;
+            state.wedge_declared = false;
+        }
+        return;
+    }
 
     if !should_probe_wedge(&snapshot, std::time::Instant::now()) {
         return;
@@ -814,7 +898,14 @@ async fn check_for_wedge(automation_state: &Arc<Mutex<AutomationState>>) {
     let mut state = automation_state.lock().await;
     if answered {
         state.wedge_strikes = 0;
-        state.wedge_declared = false;
+        if state.wedge_declared {
+            // The verdict cleared `agent_ready`; an agent that answers is
+            // ready again. Leaving it false made `automate status` report a
+            // working agent as down, and the next command would then
+            // "adopt" it - recording a handshake that never happened.
+            state.wedge_declared = false;
+            state.agent_ready = true;
+        }
         return;
     }
     // Only count it if nothing else was in flight at the failure too: a
@@ -919,7 +1010,7 @@ pub fn spawn_relaunch_supervisor(
             }
 
             if !closed {
-                check_for_wedge(&automation_state).await;
+                check_for_wedge(&rdp_session, &automation_state).await;
             }
 
             let snapshot =
@@ -1751,6 +1842,18 @@ mod tests {
     fn the_kill_verify_budget_covers_the_fallback_path() {
         let actions = lf(LIB_ACTIONS);
         assert!(actions.contains("$script:KillVerifyMs = 2000"));
+        // The budget is only coverable because the wait is now shared. A
+        // per-process wait is unbounded in the number of processes, so no
+        // constant could have covered it - that is what made this false.
+        let start = actions.find("function Stop-RunTree").unwrap();
+        let body = &actions[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert_eq!(
+            body.matches("AddMilliseconds($script:KillVerifyMs)").count(),
+            2,
+            "one deadline for the job path, one for the fallback - not one per process"
+        );
+        assert!(!body.contains("WaitForExit($script:KillVerifyMs)"));
         // Two CIM walks at 5s each, one shared 2s verification deadline,
         // one 500ms CPU sample.
         let worst = std::time::Duration::from_millis(5_000 + 5_000 + 2_000 + 500);

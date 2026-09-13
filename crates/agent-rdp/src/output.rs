@@ -273,20 +273,27 @@ impl Output {
                          journal, so it cannot say whether it ran. Check the effect on the \
                          remote machine before retrying."
                     );
-                } else if entry.journal.as_deref() == Some("memory") {
-                    println!(
-                        "Unknown: this agent has no on-disk journal, so a record would not \
-                         have survived a restart. Check the effect on the remote machine \
-                         before retrying."
-                    );
                 } else {
+                    // Deliberately not "it never ran, retrying is safe".
+                    // That is only true if the agent answering is the one
+                    // that received the request, and a caller running this
+                    // by hand has no way to know - the id came out of an
+                    // error message, not from a handshake. The daemon's own
+                    // automatic recovery does know, and says so there.
                     println!(
-                        "The agent has no record of this request, so it never ran - retrying \
-                         is safe."
+                        "This agent has no record of that request. That means it never ran \
+                         ONLY if this is the same agent process the request was sent to - \
+                         compare the instance below with the one in the original error. If \
+                         the agent was restarted since, the outcome is unknown: check the \
+                         effect on the remote machine before retrying."
                     );
                 }
-                if let Some(ref instance) = entry.instance_id {
-                    println!("Answered by agent instance: {}", instance);
+                match entry.instance_id {
+                    Some(ref instance) => println!("Answered by agent instance: {}", instance),
+                    None => println!(
+                        "Answered by an agent too old to identify itself, so it cannot be \
+                         matched against the one that received the request."
+                    ),
                 }
             }
             ResponseData::AutomationStatus(status) => {
@@ -390,7 +397,8 @@ impl Output {
                     );
                 } else if status.wedge_strikes > 0 {
                     println!(
-                        "Missed status probes: {} (not yet a verdict; any reply clears it)",
+                        "Missed status probes: {} (not yet a verdict; the count clears once \
+                         the agent speaks again)",
                         status.wedge_strikes
                     );
                 }

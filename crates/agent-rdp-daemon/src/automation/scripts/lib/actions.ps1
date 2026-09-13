@@ -1802,6 +1802,12 @@ $script:EvictedIdLimit = 1024
 $script:EvictedIds = New-Object System.Collections.Generic.HashSet[string]
 $script:EvictedOrder = New-Object System.Collections.ArrayList
 
+# The same, for the disk tier. Its files are named by a hash of the id, so
+# the pruner never sees an id to remember - it remembers the file name, and a
+# lookup hashes the id the same way to ask. Without this, a disk entry aged
+# out by retention answers exactly like a request that never arrived.
+$script:EvictedJournalFiles = New-Object System.Collections.Generic.HashSet[string]
+
 # Disk tier bounds. Best effort: a missing or unreadable entry means "unknown",
 # and an unknown key executes.
 $script:JournalMaxEntries = 256
@@ -1938,9 +1944,19 @@ function Get-JournaledResult {
     if ($null -eq $entry) {
         # "Never saw it" is only one of the reasons an id can be unknown,
         # and it is the only one that makes a retry safe. Say which.
+        # Either tier having dropped it means the same thing to the caller:
+        # the agent had a record and no longer does, so its silence is not
+        # evidence that the request never ran.
+        $evicted = $script:EvictedIds.Contains($id)
+        if (-not $evicted) {
+            $path = Get-JournalPath -Id $id
+            if ($path) {
+                $evicted = $script:EvictedJournalFiles.Contains([System.IO.Path]::GetFileName($path))
+            }
+        }
         return @{
             known = $false
-            evicted = $script:EvictedIds.Contains($id)
+            evicted = $evicted
             instance_id = $script:InstanceId
             journal = $tier
         }
@@ -2135,6 +2151,7 @@ function Remove-ExpiredJournalEntries {
         $live = New-Object System.Collections.ArrayList
         foreach ($file in $files) {
             if ($file.LastWriteTime -lt $cutoff) {
+                [void]$script:EvictedJournalFiles.Add($file.Name)
                 Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
             } else {
                 [void]$live.Add($file)
@@ -2143,6 +2160,7 @@ function Remove-ExpiredJournalEntries {
         if ($live.Count -gt $script:JournalMaxEntries) {
             $excess = $live | Sort-Object LastWriteTime | Select-Object -First ($live.Count - $script:JournalMaxEntries)
             foreach ($file in $excess) {
+                [void]$script:EvictedJournalFiles.Add($file.Name)
                 Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
             }
         }

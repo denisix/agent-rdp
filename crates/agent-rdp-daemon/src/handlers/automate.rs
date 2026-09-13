@@ -709,17 +709,14 @@ pub fn unknown_id_verdict(facts: &UnknownIdFacts) -> UnknownId {
     match facts.same_agent {
         // The process that received it is the one saying it never arrived.
         Some(true) => UnknownId::NeverRan,
-        Some(false) => {
-            // A keyed run reaches the disk tier, which outlives the restart,
-            // so a replacement reading that tier can still answer for it.
-            if facts.keyed && facts.disk_journal {
-                UnknownId::NeverRan
-            } else {
-                UnknownId::RecordLost(
-                    "the agent was replaced and the record did not survive its restart",
-                )
-            }
-        }
+        // Not even for a keyed run whose journal reaches disk. The disk
+        // entry is written *after* the command runs, and the usual reason a
+        // reply went missing is that the agent died partway - so its absence
+        // is equally consistent with "it ran and the agent died before
+        // recording it". Claiming safety there re-applies the mutation.
+        Some(false) => UnknownId::RecordLost(
+            "the agent was replaced and the record did not survive its restart",
+        ),
         // Too old to say who answered; the record may have been lost.
         None => UnknownId::RecordLost(
             "this agent cannot confirm it is the one that received the request",
@@ -2042,8 +2039,8 @@ mod status_probe_tests {
 
         assert!(body.contains("let busy = self.pending_requests() > 0;"));
         assert!(
-            body.contains("fetch_sub(1"),
-            "it must take back only its own increment"
+            body.contains("saturating_sub(1)"),
+            "it must take back only its own increment, and not below zero"
         );
         assert!(
             !body.contains(".store("),
@@ -2076,12 +2073,13 @@ mod status_probe_tests {
             UnknownId::RecordLost(_)
         ));
 
-        // Unless the request was keyed and the journal reaches disk, which
-        // outlives the restart - then the replacement can answer for it.
-        assert_eq!(
+        // Not even for a keyed run on a disk-backed journal: that entry is
+        // written after the command runs, so its absence is equally
+        // consistent with "it ran and the agent died before recording it".
+        assert!(matches!(
             unknown_id_verdict(&facts(Some(false), false, true, true)),
-            UnknownId::NeverRan
-        );
+            UnknownId::RecordLost(_)
+        ));
         assert!(matches!(
             unknown_id_verdict(&facts(Some(false), false, false, true)),
             UnknownId::RecordLost(_)
