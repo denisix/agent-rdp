@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.21](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.20...agent-rdp-v0.7.21) (2026-09-13)
+
+
+### Features
+
+* agent-rdp automate query-result, the command the errors promised ([2c49449](https://github.com/denisix/agent-rdp/commit/2c494492de30639529c0e0c222438a7fbe76e532))
+* **daemon:** notice when the automation agent is wedged, and recover ([db5e73b](https://github.com/denisix/agent-rdp/commit/db5e73b710fdf9e947a1d49fcf4b18308440ec13))
+
 ## [0.7.20](https://github.com/denisix/agent-rdp/compare/agent-rdp-v0.7.19...agent-rdp-v0.7.20) (2026-09-08)
 
 

@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.7.21](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.20...agent-rdp-rust-v0.7.21) (2026-09-13)
+
+
+### Features
+
+* agent-rdp automate query-result, the command the errors promised ([2c49449](https://github.com/denisix/agent-rdp/commit/2c494492de30639529c0e0c222438a7fbe76e532))
+* agent-rdp status, and say plainly that long runs block the agent ([0f3da26](https://github.com/denisix/agent-rdp/commit/0f3da26c4162419a13907b359b63f3370a4be5bd))
+* **daemon:** notice when the automation agent is wedged, and recover ([db5e73b](https://github.com/denisix/agent-rdp/commit/db5e73b710fdf9e947a1d49fcf4b18308440ec13))
+
+
+### Bug Fixes
+
+* **agent:** one capability list, so a busy agent does not look different ([2ef48ba](https://github.com/denisix/agent-rdp/commit/2ef48ba585f9e40b11cc96ac81697f70aa6d3ecd))
+* **agent:** pass flag-shaped run arguments through unquoted ([fec28c8](https://github.com/denisix/agent-rdp/commit/fec28c8d7b86cbd1fae90e5b6f9063d3e3ad56ae))
+* close what an adversarial review found in the 0.7.21 work ([d702d4b](https://github.com/denisix/agent-rdp/commit/d702d4b8c043ab24c286cff7571bdac3068d1a3b))
+* **daemon:** a keep-alive that cannot be written is a dead transport ([38d63a5](https://github.com/denisix/agent-rdp/commit/38d63a53b48f92ed70f4a1b65071697372be8505))
+* **daemon:** stop the wedge watchdog suppressing its own verdict ([bbc0a6e](https://github.com/denisix/agent-rdp/commit/bbc0a6ef1f8419b7ce2216f9ffa4a48296c5d2ea))
+* never call a lost record proof that a request did not run ([7e47fb3](https://github.com/denisix/agent-rdp/commit/7e47fb3cf9696dc03e7eef62f31babb40be93985))
+
+
+### Performance Improvements
+
+* **agent:** verify a killed process tree against one deadline, not one each ([b0f73ad](https://github.com/denisix/agent-rdp/commit/b0f73ad1285aaa4f7a7d4bfc62bbded37aeac3ff))
+
 ## [0.7.20](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.19...agent-rdp-rust-v0.7.20) (2026-09-08)
 
 
