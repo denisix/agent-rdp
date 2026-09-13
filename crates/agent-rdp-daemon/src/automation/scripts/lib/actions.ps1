@@ -1794,6 +1794,14 @@ $script:ResultJournal = @{}
 $script:ResultJournalOrder = New-Object System.Collections.ArrayList
 $script:ResultJournalLimit = 64
 
+# Ids the FIFO above has dropped. Far cheaper than the entries themselves -
+# an id and nothing else - so this remembers many more of them, and it is
+# what lets a lookup say "the record was evicted" instead of the much
+# stronger, and sometimes false, "this never ran".
+$script:EvictedIdLimit = 1024
+$script:EvictedIds = New-Object System.Collections.Generic.HashSet[string]
+$script:EvictedOrder = New-Object System.Collections.ArrayList
+
 # Disk tier bounds. Best effort: a missing or unreadable entry means "unknown",
 # and an unknown key executes.
 $script:JournalMaxEntries = 256
@@ -1834,6 +1842,17 @@ function Add-JournaledResult {
         $oldest = $script:ResultJournalOrder[0]
         $script:ResultJournalOrder.RemoveAt(0)
         $script:ResultJournal.Remove($oldest)
+        # Remember that we *had* it. "No record" otherwise means both "it
+        # never arrived" - which makes a retry safe - and "it aged out",
+        # which does not. Conflating them is how a caller is told to retry a
+        # mutation that already applied.
+        [void]$script:EvictedIds.Add($oldest)
+        [void]$script:EvictedOrder.Add($oldest)
+        while ($script:EvictedOrder.Count -gt $script:EvictedIdLimit) {
+            $drop = $script:EvictedOrder[0]
+            $script:EvictedOrder.RemoveAt(0)
+            [void]$script:EvictedIds.Remove($drop)
+        }
     }
 
     if ($Persist) {
@@ -1909,12 +1928,22 @@ function Get-JournaledResult {
     $id = $Params.id
     if (-not $id) { throw "query_result requires 'id'" }
 
+    # Which process is answering, and whether its journal outlives it. The
+    # daemon needs both to know what an unknown id is worth: from the agent
+    # that received the request, it means the request never arrived; from a
+    # replacement with a memory-only journal, it means nothing at all.
+    $tier = if (Get-JournalDir) { "disk" } else { "memory" }
+
     $entry = Get-JournalEntry -Id $id -IncludeDisk
     if ($null -eq $entry) {
-        # Deliberately distinguishes "we never saw it" from "still running":
-        # the daemon only asks once the agent is answering again, so an
-        # unknown id at that point means the request never executed.
-        return @{ known = $false }
+        # "Never saw it" is only one of the reasons an id can be unknown,
+        # and it is the only one that makes a retry safe. Say which.
+        return @{
+            known = $false
+            evicted = $script:EvictedIds.Contains($id)
+            instance_id = $script:InstanceId
+            journal = $tier
+        }
     }
 
     return @{
@@ -1924,6 +1953,8 @@ function Get-JournaledResult {
         error = $entry.error
         at = $entry.at
         at_unix = $entry.at_unix
+        instance_id = $script:InstanceId
+        journal = $tier
     }
 }
 

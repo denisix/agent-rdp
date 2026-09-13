@@ -32,6 +32,13 @@ const CONSECUTIVE_FAILURE_THRESHOLD: u32 = 3;
 pub struct DvcIndeterminate {
     pub request_id: String,
     pub consecutive_failures: u32,
+    /// Which agent process the request was handed to.
+    ///
+    /// Recovery asks the agent what it did with the request; that answer is
+    /// only worth anything if the *same* process answers. A replacement has
+    /// none of its predecessor's in-memory records, so its "I have no record
+    /// of it" means "I never saw it" - not "it never ran".
+    pub agent_instance: Option<String>,
 }
 
 /// DVC-based IPC client for communicating with the PowerShell agent.
@@ -276,9 +283,14 @@ impl DvcIpc {
                 .map_err(|_| anyhow::anyhow!("Failed to send DVC command"))?;
 
             state.pending.insert(request_id.clone(), tx);
-            channel_id
+            // Captured here, under the same lock that hands the request
+            // over, so recovery can tell whether the agent that answers is
+            // the one that received it.
+            let instance = state.handshake.as_ref().and_then(|h| h.instance_id.clone());
+            (channel_id, instance)
         };
 
+        let (channel_id, agent_instance) = channel_id;
         debug!("Sent DVC request on channel {}", channel_id);
         let sent_at = std::time::Instant::now();
 
@@ -305,6 +317,7 @@ impl DvcIpc {
                 return Err(anyhow::Error::new(DvcIndeterminate {
                     request_id,
                     consecutive_failures: failures,
+                    agent_instance,
                 }));
             }
             Err(_) => {
@@ -329,6 +342,7 @@ impl DvcIpc {
                 return Err(anyhow::Error::new(DvcIndeterminate {
                     request_id,
                     consecutive_failures: failures,
+                    agent_instance,
                 }));
             }
         };

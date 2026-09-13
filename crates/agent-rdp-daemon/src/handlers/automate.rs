@@ -531,7 +531,14 @@ pub async fn handle(
                     // it would ask the agent about the lookup itself.
                     return Response::error(ErrorCode::AutomationIndeterminate, e.to_string());
                 }
-                return resolve_indeterminate(&ipc, &request, &indeterminate.request_id, &e).await;
+                return resolve_indeterminate(
+                    &ipc,
+                    &request,
+                    &indeterminate.request_id,
+                    indeterminate.agent_instance.as_deref(),
+                    &e,
+                )
+                .await;
             }
             error!("Automation request failed: {}", e);
             let message = e.to_string();
@@ -556,6 +563,7 @@ async fn resolve_indeterminate(
     ipc: &crate::automation::DvcIpc,
     request: &AutomateRequest,
     request_id: &str,
+    sent_to: Option<&str>,
     original: &anyhow::Error,
 ) -> Response {
     if !ipc.capabilities().iter().any(|c| c == "query_result") {
@@ -596,16 +604,43 @@ async fn resolve_indeterminate(
                     return Response::error(ErrorCode::AutomationError, message);
                 }
 
-                // The agent is responsive and has no record of it, so it
-                // never ran - the one case where retrying is unambiguously
-                // safe, and worth saying outright.
-                return Response::error(
-                    ErrorCode::AutomationError,
-                    format!(
-                        "The automation agent never received request {} - it did not run, so                          retrying is safe.",
-                        request_id
+                // An unknown id has more than one cause, and only one of
+                // them makes a retry safe.
+                let answered_by = value["instance_id"].as_str();
+                let lookup = UnknownIdFacts {
+                    same_agent: match (sent_to, answered_by) {
+                        (Some(sent), Some(now)) => Some(sent == now),
+                        _ => None,
+                    },
+                    evicted: value["evicted"].as_bool().unwrap_or(false),
+                    disk_journal: value["journal"].as_str() == Some("disk"),
+                    keyed: matches!(
+                        request,
+                        AutomateRequest::Run { idempotency_key: Some(_), .. }
                     ),
-                );
+                };
+                return match unknown_id_verdict(&lookup) {
+                    UnknownId::NeverRan => {
+                        info!("Request {} never reached the agent", request_id);
+                        Response::error(
+                            ErrorCode::AutomationError,
+                            format!(
+                                "The automation agent never received request {} - it did not \
+                                 run, so retrying is safe.",
+                                request_id
+                            ),
+                        )
+                    }
+                    UnknownId::RecordLost(why) => Response::error(
+                        ErrorCode::AutomationIndeterminate,
+                        format!(
+                            "The outcome of request {} cannot be recovered: {}. It may or may \
+                             not have run - check the effect on the remote machine before \
+                             retrying, because retrying may apply it twice.",
+                            request_id, why
+                        ),
+                    ),
+                };
             }
             Err(_) if attempt < QUERY_RESULT_ATTEMPTS => {
                 tokio::time::sleep(QUERY_RESULT_BACKOFF * attempt).await;
@@ -618,11 +653,69 @@ async fn resolve_indeterminate(
     Response::error(
         ErrorCode::AutomationIndeterminate,
         format!(
-            "{} The agent is still busy; once it responds, the outcome of request {} can be              recovered rather than guessed.",
+            "{} The agent is still busy; once it responds, `agent-rdp automate query-result {}` \
+             recovers the outcome rather than guessing it.",
             indeterminate_message(request, original),
             request_id
         ),
     )
+}
+
+/// What the agent's "I have no record of that id" is actually worth.
+#[derive(Debug, Clone, Copy)]
+pub struct UnknownIdFacts {
+    /// Whether the agent answering is the one the request was handed to.
+    /// `None` when either side is too old to report an instance id.
+    pub same_agent: Option<bool>,
+    /// The agent had a record and dropped it.
+    pub evicted: bool,
+    /// The answering agent's journal survives its own restart.
+    pub disk_journal: bool,
+    /// The request was a `run` carrying an idempotency key, which is the
+    /// one kind of request that reaches the disk tier.
+    pub keyed: bool,
+}
+
+/// The two things an unknown id can mean.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnknownId {
+    /// The agent never saw it. Retrying is safe.
+    NeverRan,
+    /// The agent cannot know, for the stated reason. Retrying is not safe.
+    RecordLost(&'static str),
+}
+
+/// Decide which, and refuse to guess.
+///
+/// "No record" used to mean "it never ran, retrying is safe" unconditionally.
+/// That is false whenever the *record* was lost rather than never made: the
+/// agent restarted and its memory tier died with it, or its bounded journal
+/// evicted the entry. A caller told to retry then applies the mutation a
+/// second time - the exact outcome the indeterminate error exists to
+/// prevent. Only claim safety when the evidence supports it.
+pub fn unknown_id_verdict(facts: &UnknownIdFacts) -> UnknownId {
+    if facts.evicted {
+        return UnknownId::RecordLost("the agent's journal evicted the record");
+    }
+    match facts.same_agent {
+        // The process that received it is the one saying it never arrived.
+        Some(true) => UnknownId::NeverRan,
+        Some(false) => {
+            // A keyed run reaches the disk tier, which outlives the restart,
+            // so a replacement reading that tier can still answer for it.
+            if facts.keyed && facts.disk_journal {
+                UnknownId::NeverRan
+            } else {
+                UnknownId::RecordLost(
+                    "the agent was replaced and the record did not survive its restart",
+                )
+            }
+        }
+        // Too old to say who answered; the record may have been lost.
+        None => UnknownId::RecordLost(
+            "this agent cannot confirm it is the one that received the request",
+        ),
+    }
 }
 
 /// How many times to ask the agent about a lost request before giving up.
@@ -1944,6 +2037,55 @@ mod status_probe_tests {
             !body.contains(".store("),
             "restoring a previously read value would clobber a concurrent failure"
         );
+    }
+
+    /// "No record" is not the same as "it never ran", and the difference
+    /// decides whether a caller may safely retry a mutation.
+    #[test]
+    fn a_lost_record_is_never_reported_as_a_request_that_did_not_run() {
+        let facts = |same_agent, evicted, disk_journal, keyed| UnknownIdFacts {
+            same_agent,
+            evicted,
+            disk_journal,
+            keyed,
+        };
+
+        // The process that received it says it never arrived. Only this
+        // makes a retry safe.
+        assert_eq!(
+            unknown_id_verdict(&facts(Some(true), false, true, false)),
+            UnknownId::NeverRan
+        );
+
+        // A replacement has none of its predecessor's memory. Saying "it
+        // did not run" here is how a mutation gets applied twice.
+        assert!(matches!(
+            unknown_id_verdict(&facts(Some(false), false, true, false)),
+            UnknownId::RecordLost(_)
+        ));
+
+        // Unless the request was keyed and the journal reaches disk, which
+        // outlives the restart - then the replacement can answer for it.
+        assert_eq!(
+            unknown_id_verdict(&facts(Some(false), false, true, true)),
+            UnknownId::NeverRan
+        );
+        assert!(matches!(
+            unknown_id_verdict(&facts(Some(false), false, false, true)),
+            UnknownId::RecordLost(_)
+        ));
+
+        // Eviction beats everything: the agent had it and dropped it.
+        assert!(matches!(
+            unknown_id_verdict(&facts(Some(true), true, true, true)),
+            UnknownId::RecordLost(_)
+        ));
+
+        // An agent too old to say who it is cannot vouch for the answer.
+        assert!(matches!(
+            unknown_id_verdict(&facts(None, false, true, true)),
+            UnknownId::RecordLost(_)
+        ));
     }
 
     /// The lookup's answer must reach the caller. It used to fall through

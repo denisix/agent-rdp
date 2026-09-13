@@ -1508,6 +1508,30 @@ mod tests {
         assert!(LIB_ACTIONS.contains("[AgentDesktop]::GetForegroundWindow()"));
     }
 
+    /// The agent must remember what it evicted, and say who is answering.
+    ///
+    /// Without it, a lookup for an id the bounded journal dropped answers
+    /// exactly like one for an id that never arrived - and the daemon turns
+    /// that into "retrying is safe".
+    #[test]
+    fn the_journal_records_what_it_evicted() {
+        let actions = lf(LIB_ACTIONS);
+        assert!(actions.contains("$script:EvictedIds = New-Object System.Collections.Generic.HashSet[string]"));
+        assert!(actions.contains("[void]$script:EvictedIds.Add($oldest)"));
+        // Bounded, like everything else in the journal.
+        assert!(actions.contains("$script:EvictedIdLimit = 1024"));
+        assert!(actions.contains("[void]$script:EvictedIds.Remove($drop)"));
+
+        let start = actions.find("function Get-JournaledResult").unwrap();
+        let body = &actions[start..];
+        let end = body.find("\n}\n").unwrap();
+        let body = &body[..end];
+        assert!(body.contains("evicted = $script:EvictedIds.Contains($id)"));
+        // Who answered, and whether its journal outlives it.
+        assert!(body.contains("instance_id = $script:InstanceId"));
+        assert!(body.contains("$tier = if (Get-JournalDir) { \"disk\" } else { \"memory\" }"));
+    }
+
     /// A parameter name must reach the child bare.
     ///
     /// Every argument used to be wrapped in a single-quoted literal, and a
