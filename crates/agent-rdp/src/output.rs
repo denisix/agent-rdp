@@ -168,6 +168,41 @@ impl Output {
                     println!("Daemon version: {}", info.daemon_version);
                 }
                 println!("Uptime: {}s", info.uptime_secs);
+                // The gap between the two is time the host spent asleep,
+                // which is usually why a quiet transport died.
+                let slept = info.uptime_secs.saturating_sub(info.uptime_monotonic_secs);
+                if slept > 60 {
+                    println!(
+                        "Host slept: about {}s of that (the transport does not survive sleep)",
+                        slept
+                    );
+                }
+                if let Some(ref auto) = info.auto_reconnect {
+                    if auto.enabled || auto.reconnects > 0 || auto.stopped_reason.is_some() {
+                        println!(
+                            "Auto-reconnect: {}",
+                            if auto.enabled { "on" } else { "off" }
+                        );
+                        if auto.reconnects > 0 {
+                            println!("  Sessions re-established without a human: {}", auto.reconnects);
+                        }
+                        if auto.attempts > 0 {
+                            println!("  Attempts this outage: {}", auto.attempts);
+                        }
+                        if let Some(ref began) = auto.outage_began {
+                            println!("  Outage began: {}", began);
+                        }
+                        if let Some(ref next) = auto.next_attempt_at {
+                            println!("  Next attempt: {}", next);
+                        }
+                        if let Some(ref err) = auto.last_attempt_error {
+                            println!("  Last attempt failed: {}", err);
+                        }
+                        if let Some(ref why) = auto.stopped_reason {
+                            println!("  STOPPED: {}", why);
+                        }
+                    }
+                }
                 if let Some(age_ms) = info.last_frame_age_ms {
                     match info.keep_alive_secs {
                         // With keep-alive on, a live server answers each tick,

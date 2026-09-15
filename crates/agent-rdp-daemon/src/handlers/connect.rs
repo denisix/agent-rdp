@@ -12,6 +12,19 @@ use crate::rdp_session::{RdpConfig, RdpSession};
 use crate::ws_server::{WsServer, WsServerConfig};
 
 /// Handle a connect request.
+/// Who asked for this connect.
+///
+/// The difference is what may be typed on the remote desktop. A person
+/// running `connect` is present and expects the agent to come up; an
+/// automatic reconnect at 03:00 is not, so it adopts a surviving agent and
+/// otherwise leaves the launch to the supervisor, which waits for the
+/// session to be idle first. `connect`'s own bootstrap has no such gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOrigin {
+    User,
+    AutoReconnect,
+}
+
 pub async fn handle(
     rdp_session: &Arc<Mutex<Option<RdpSession>>>,
     automation_state: &SharedAutomationState,
@@ -20,6 +33,7 @@ pub async fn handle(
     disconnect_tx: tokio::sync::mpsc::Sender<crate::rdp_session::DisconnectEvent>,
     clipboard_changed_rx: &ClipboardChangedRx,
     session_generation: &Arc<std::sync::atomic::AtomicU64>,
+    origin: ConnectOrigin,
 ) -> Response {
     // Refuse rather than reinterpret: a keep-alive interval short enough to
     // make ordinary latency look like a dead server, or a deferral of an
@@ -312,6 +326,30 @@ pub async fn handle(
                     );
                     state.next_retry_at = None;
                     state.launch_failures = 0;
+                }
+            }
+        } else if origin == ConnectOrigin::AutoReconnect {
+            // Adopt a survivor - free, silent, and the common case, since the
+            // agent outlives a drop for ten minutes. Otherwise leave the
+            // launch to the supervisor: it types Win+R too, but only after
+            // the session has been idle, and nobody is watching this one.
+            match crate::automation::adopt_only(automation_state).await {
+                true => automation_ready = Some(true),
+                false => {
+                    let mut state = automation_state.lock().await;
+                    state.last_error = Some(
+                        "the agent did not survive the outage; the supervisor relaunches it \
+                         once the session has been idle (this types Win+R on the remote \
+                         desktop)"
+                            .to_string(),
+                    );
+                    // Armed, not deferred: deferring would stop the
+                    // supervisor ever bringing it back, which is the
+                    // opposite of what an unattended session needs.
+                    state.next_retry_at = Some(std::time::Instant::now());
+                    state.launch_failures = 0;
+                    drop(state);
+                    automation_ready = Some(false);
                 }
             }
         } else {

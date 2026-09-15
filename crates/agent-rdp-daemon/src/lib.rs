@@ -10,6 +10,7 @@ pub mod ipc_server;
 pub mod keymap;
 pub mod ocr;
 pub mod rdp_session;
+pub mod reconnect;
 pub mod rdpdr;
 pub mod ws_input;
 pub mod ws_server;

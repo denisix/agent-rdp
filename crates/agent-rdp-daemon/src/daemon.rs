@@ -53,6 +53,12 @@ pub struct Daemon {
     /// Wall-clock start, so `uptime_secs` means process age rather than
     /// awake time - `Instant` does not advance while the host sleeps.
     start_wall: std::time::SystemTime,
+    /// What to reconnect with, and what reconnection has been doing.
+    auto_reconnect: crate::reconnect::SharedAutoReconnect,
+    /// Bumped by user-originated connects, disconnects and shutdowns only.
+    /// A reconnect compares it before every attempt, which is how it can
+    /// tell the operator's actions from its own.
+    connect_serial: Arc<std::sync::atomic::AtomicU64>,
 
     /// Shutdown signal sender.
     shutdown_tx: broadcast::Sender<()>,
@@ -128,6 +134,8 @@ impl Daemon {
             ipc_server,
             start_time: Instant::now(),
             start_wall: std::time::SystemTime::now(),
+            auto_reconnect: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            connect_serial: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shutdown_tx,
             disconnect_rx,
             disconnect_tx,
@@ -180,6 +188,8 @@ impl Daemon {
                             let session_name = self.session_name.clone();
                             let start_time = self.start_time;
                             let start_wall = self.start_wall;
+                            let auto_reconnect = Arc::clone(&self.auto_reconnect);
+                            let connect_serial = Arc::clone(&self.connect_serial);
                             let shutdown_tx = self.shutdown_tx.clone();
                             let disconnect_tx = self.disconnect_tx.clone();
                             let last_disconnect = Arc::clone(&self.last_disconnect);
@@ -187,7 +197,7 @@ impl Daemon {
                             let session_generation = Arc::clone(&self.session_generation);
 
                             tokio::spawn(async move {
-                                if let Err(e) = handle_client(stream, session, automation_state, ws_handle, session_name, start_time, start_wall, shutdown_tx, disconnect_tx, clipboard_changed_rx, session_generation, last_disconnect).await {
+                                if let Err(e) = handle_client(stream, session, automation_state, ws_handle, session_name, start_time, start_wall, auto_reconnect, connect_serial, shutdown_tx, disconnect_tx, clipboard_changed_rx, session_generation, last_disconnect).await {
                                     error!("Client handler error: {}", e);
                                 }
                             });
@@ -257,6 +267,20 @@ impl Daemon {
                     let clipboard_changed_rx = Arc::clone(&self.clipboard_changed_rx);
                     let automation_state = Arc::clone(&self.automation_state);
                     let session_generation = Arc::clone(&self.session_generation);
+                    let serial_at_arm =
+                        self.connect_serial.load(std::sync::atomic::Ordering::SeqCst);
+                    let reconnect_ctx = ReconnectContext {
+                        rdp_session: Arc::clone(&self.rdp_session),
+                        automation_state: Arc::clone(&self.automation_state),
+                        ws_handle: Arc::clone(&self.ws_handle),
+                        clipboard_changed_rx: Arc::clone(&self.clipboard_changed_rx),
+                        session_generation: Arc::clone(&self.session_generation),
+                        disconnect_tx: self.disconnect_tx.clone(),
+                        auto_reconnect: Arc::clone(&self.auto_reconnect),
+                        connect_serial: Arc::clone(&self.connect_serial),
+                        last_disconnect: Arc::clone(&self.last_disconnect),
+                        session_name: self.session_name.clone(),
+                    };
                     tokio::spawn(async move {
                         let superseded = || {
                             session_generation.load(std::sync::atomic::Ordering::SeqCst)
@@ -272,7 +296,16 @@ impl Daemon {
                             *session = None;
                         }
 
-                        // The stream belongs to the dead session - stop it too.
+                        // The stream belongs to the dead session - stop it
+                        // too, unless a newer connect has already taken over
+                        // in the moments since. Unguarded, these two lines
+                        // silently killed the new session's stream; with a
+                        // reconnect firing milliseconds after the drop that
+                        // stopped being a theoretical race.
+                        if superseded() {
+                            info!("Newer connect owns the stream; leaving it alone");
+                            return;
+                        }
                         *ws_handle.lock().await = None;
                         *clipboard_changed_rx.lock().await = None;
 
@@ -293,7 +326,18 @@ impl Daemon {
                         let session_dir = crate::get_session_dir("");
                         let bootstrap = AutomationBootstrap::new(session_dir);
                         let _ = bootstrap.cleanup(&mut auto_state).await;
+                        drop(auto_state);
                         info!("Dropped session torn down");
+
+                        // Sequentially, in this same task: the teardown has
+                        // finished, so a reconnect cannot race its own
+                        // cleanup.
+                        reconnect_loop(
+                            reconnect_ctx,
+                            dropped_generation,
+                            serial_at_arm,
+                        )
+                        .await;
                     });
                 }
 
@@ -404,6 +448,8 @@ async fn handle_client(
     session_name: String,
     start_time: Instant,
     start_wall: std::time::SystemTime,
+    auto_reconnect: crate::reconnect::SharedAutoReconnect,
+    connect_serial: Arc<std::sync::atomic::AtomicU64>,
     shutdown_tx: broadcast::Sender<()>,
     disconnect_tx: tokio::sync::mpsc::Sender<DisconnectEvent>,
     clipboard_changed_rx: ClipboardChangedRx,
@@ -439,12 +485,30 @@ async fn handle_client(
 
         let is_shutdown = matches!(request, Request::Shutdown);
 
+        // Every user action that changes what the session should be. A
+        // reconnect in flight compares this before each attempt, so it can
+        // tell "the operator did something" from its own activity - which a
+        // graceful-shutdown flag cannot, because a `disconnect` issued
+        // against a dying link usually loses the race to the read arm.
+        if matches!(
+            request,
+            Request::Connect(_) | Request::Disconnect | Request::Shutdown
+        ) {
+            connect_serial.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if matches!(request, Request::Disconnect | Request::Shutdown) {
+            // Forget the credentials outright: the session was closed on
+            // purpose and must not come back by itself.
+            auto_reconnect.lock().await.disarm();
+        }
+
         let started = Instant::now();
         // Taken before the request runs so a drop recorded *during* it can be
         // told from the one it was recovering from.
         let disconnect_before = last_disconnect.lock().unwrap().as_ref().map(|d| d.at);
         let mut response = process_request(
             request.clone(),
+            &auto_reconnect,
             &rdp_session,
             &automation_state,
             &ws_handle,
@@ -502,9 +566,170 @@ async fn handle_client(
     Ok(())
 }
 
+/// Everything a reconnect attempt needs. Cloned handles only; the loop runs
+/// on its own task, after the dead session has been torn down.
+struct ReconnectContext {
+    rdp_session: Arc<Mutex<Option<RdpSession>>>,
+    automation_state: SharedAutomationState,
+    ws_handle: SharedWsHandle,
+    clipboard_changed_rx: ClipboardChangedRx,
+    session_generation: Arc<std::sync::atomic::AtomicU64>,
+    disconnect_tx: tokio::sync::mpsc::Sender<DisconnectEvent>,
+    auto_reconnect: crate::reconnect::SharedAutoReconnect,
+    connect_serial: Arc<std::sync::atomic::AtomicU64>,
+    last_disconnect: SharedLastDisconnect,
+    session_name: String,
+}
+
+/// Bring the session back, if this session asked for that.
+///
+/// Runs until it succeeds, until the operator intervenes, or until it
+/// decides no further attempt can help. Every guard is re-evaluated before
+/// each attempt, because an outage lasts minutes and the operator can act at
+/// any point during one.
+async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_at_arm: u64) {
+    let outage_began = std::time::SystemTime::now();
+    {
+        let mut auto = ctx.auto_reconnect.lock().await;
+        if !auto.enabled() {
+            return;
+        }
+        if !auto.note_outage(outage_began) {
+            error!(
+                "Giving up on automatic reconnection: {}",
+                auto.stopped_reason.as_deref().unwrap_or("repeated short sessions")
+            );
+            return;
+        }
+        auto.attempts = 0;
+        auto.outage_began = Some(outage_began);
+    }
+
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+
+        let (request, snapshot) = {
+            let auto = ctx.auto_reconnect.lock().await;
+            let snapshot = crate::reconnect::ReconnectSnapshot {
+                enabled: auto.enabled(),
+                have_request: auto.request().is_some(),
+                stopped: auto.stopped_reason.is_some(),
+                in_flight: false,
+                dropped_generation,
+                current_generation: ctx
+                    .session_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                serial_at_arm,
+                serial_now: ctx.connect_serial.load(std::sync::atomic::Ordering::SeqCst),
+            };
+            (auto.request(), snapshot)
+        };
+
+        if let Err(why) = crate::reconnect::should_attempt(&snapshot) {
+            info!("Not reconnecting: {}", why);
+            return;
+        }
+        let Some(request) = request else { return };
+
+        let wait = crate::reconnect::backoff(attempt);
+        {
+            let mut auto = ctx.auto_reconnect.lock().await;
+            auto.attempts = attempt;
+            auto.next_attempt_at = Some(std::time::SystemTime::now() + wait);
+        }
+        tokio::time::sleep(wait).await;
+
+        // Re-check after sleeping: the operator has had `wait` to act.
+        {
+            let auto = ctx.auto_reconnect.lock().await;
+            let now = crate::reconnect::ReconnectSnapshot {
+                enabled: auto.enabled(),
+                have_request: auto.request().is_some(),
+                stopped: auto.stopped_reason.is_some(),
+                in_flight: false,
+                dropped_generation,
+                current_generation: ctx
+                    .session_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                serial_at_arm,
+                serial_now: ctx.connect_serial.load(std::sync::atomic::Ordering::SeqCst),
+            };
+            if let Err(why) = crate::reconnect::should_attempt(&now) {
+                info!("Abandoning the reconnect: {}", why);
+                return;
+            }
+        }
+
+        info!("Reconnecting to {} (attempt {})", request.host, attempt);
+        crate::transcript::append_event(
+            &ctx.session_name,
+            crate::reconnect::attempt_event(&request, attempt, "attempting", None),
+        );
+
+        let disconnect_before = ctx.last_disconnect.lock().unwrap().as_ref().map(|d| d.at);
+        let response = handlers::connect::handle(
+            &ctx.rdp_session,
+            &ctx.automation_state,
+            &ctx.ws_handle,
+            request.clone(),
+            ctx.disconnect_tx.clone(),
+            &ctx.clipboard_changed_rx,
+            &ctx.session_generation,
+            handlers::connect::ConnectOrigin::AutoReconnect,
+        )
+        .await;
+
+        if response.success {
+            info!("Session re-established after {} attempt(s)", attempt);
+            crate::transcript::append_event(
+                &ctx.session_name,
+                crate::reconnect::attempt_event(&request, attempt, "connected", None),
+            );
+            let mut auto = ctx.auto_reconnect.lock().await;
+            auto.note_success(std::time::SystemTime::now());
+            drop(auto);
+            // Clear the drop this recovered from - but only that one, or a
+            // drop recorded *during* the attempt is erased and every later
+            // error keeps citing a transport failure that has been healed.
+            let mut guard = ctx.last_disconnect.lock().unwrap();
+            if guard.as_ref().map(|d| d.at) == disconnect_before {
+                *guard = None;
+            }
+            return;
+        }
+
+        let (code, message) = match response.error {
+            Some(ref e) => (e.code, e.message.clone()),
+            None => (ErrorCode::ConnectionFailed, "connect failed".to_string()),
+        };
+        warn!("Reconnect attempt {} failed: {}", attempt, message);
+        crate::transcript::append_event(
+            &ctx.session_name,
+            crate::reconnect::attempt_event(&request, attempt, "failed", Some(&message)),
+        );
+
+        let mut auto = ctx.auto_reconnect.lock().await;
+        auto.last_attempt_error = Some(message.clone());
+        // Credentials the server refused will be refused again, and every
+        // attempt is another failed logon against the account.
+        if matches!(code, ErrorCode::AuthenticationFailed | ErrorCode::InvalidRequest) {
+            let why = format!(
+                "the server rejected the connection in a way retrying cannot fix ({}); \
+                 reconnect manually once it is resolved",
+                message
+            );
+            error!("Giving up on automatic reconnection: {}", why);
+            auto.stop(why);
+            return;
+        }
+    }
+}
+
 /// Process a single request and return a response.
 async fn process_request(
     request: Request,
+    auto_reconnect: &crate::reconnect::SharedAutoReconnect,
     rdp_session: &Arc<Mutex<Option<RdpSession>>>,
     automation_state: &SharedAutomationState,
     ws_handle: &SharedWsHandle,
@@ -562,7 +787,7 @@ async fn process_request(
                 // And the difference between the two is how long it slept,
                 // which is often why a quiet transport died.
                 uptime_monotonic_secs: start_time.elapsed().as_secs(),
-                auto_reconnect: None,
+                auto_reconnect: Some(auto_reconnect.lock().await.to_protocol()),
                 last_frame_age_ms,
                 keep_alive_secs,
                 // Filled in by `handle_client`, which owns the drop state.
@@ -576,7 +801,15 @@ async fn process_request(
         }
 
         Request::Connect(params) => {
-            handlers::connect::handle(rdp_session, automation_state, ws_handle, params, disconnect_tx.clone(), clipboard_changed_rx, session_generation).await
+            let retain = params.clone();
+            let response = handlers::connect::handle(rdp_session, automation_state, ws_handle, params, disconnect_tx.clone(), clipboard_changed_rx, session_generation, handlers::connect::ConnectOrigin::User).await;
+            if response.success {
+                // Captured on success only. Retaining a request that failed
+                // authentication is how an automatic retry works its way
+                // through an account lockout policy overnight.
+                auto_reconnect.lock().await.remember(retain);
+            }
+            response
         }
 
         Request::Disconnect => {
