@@ -154,6 +154,24 @@ pub struct AutomationState {
     pub wedge_declared: bool,
     /// How many times that verdict has been reached against this target.
     pub wedge_detections: u32,
+    /// Launches that typed Win+R and never produced a handshake.
+    pub launches_without_handshake: u32,
+    /// Launches abandoned because the session they belonged to went away.
+    /// Recorded against whichever state survives, which is why they are
+    /// target-scoped rather than epoch-scoped - the epoch they belonged to
+    /// is gone by definition.
+    pub launches_abandoned: u32,
+    /// Every agent pid seen against this target, oldest first. One
+    /// `previous_agent_pid` cannot describe a night with three agents.
+    pub agent_pid_history: Vec<u32>,
+    /// Why no survivor was adopted at the last connect, when none was.
+    pub survivor_outcome: Option<&'static str>,
+    /// The agent's most recent detached-process spawn time, milliseconds,
+    /// and the DVC round trip of that same request. Together they separate
+    /// "this host is slow to start PowerShell" from "the channel is dead" -
+    /// which look identical from a command that has not returned.
+    pub last_spawn_ms: Option<u64>,
+    pub last_spawn_request_ms: Option<u64>,
     /// How many times the agent process behind this channel has changed.
     /// Counted against the same target as `total_launches`: monitoring that
     /// asks "did the agent stay up all day?" needs an answer that survives
@@ -196,6 +214,12 @@ impl AutomationState {
             wedge_strikes: 0,
             wedge_declared: false,
             wedge_detections: 0,
+            launches_without_handshake: 0,
+            launches_abandoned: 0,
+            agent_pid_history: Vec::new(),
+            survivor_outcome: None,
+            last_spawn_ms: None,
+            last_spawn_request_ms: None,
         }
     }
 
@@ -213,6 +237,23 @@ impl AutomationState {
         self.adopted_replacement = false;
         self.agent_changes = 0;
         self.wedge_detections = 0;
+        self.launches_without_handshake = 0;
+        self.launches_abandoned = 0;
+        self.agent_pid_history.clear();
+        self.survivor_outcome = None;
+    }
+
+    /// Remember an agent pid, bounded. Oldest first, newest last.
+    pub fn note_agent_pid(&mut self, pid: u32) {
+        if self.agent_pid_history.last() == Some(&pid) {
+            return;
+        }
+        self.agent_pid_history.push(pid);
+        const KEEP: usize = 8;
+        if self.agent_pid_history.len() > KEEP {
+            let excess = self.agent_pid_history.len() - KEEP;
+            self.agent_pid_history.drain(..excess);
+        }
     }
 
     /// Seconds until the next automatic relaunch attempt, if one is

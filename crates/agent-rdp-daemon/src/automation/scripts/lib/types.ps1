@@ -193,6 +193,75 @@ public class AgentDesktop {
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+
+    private const int SW_RESTORE = 9;
+    public const uint GA_ROOT = 2;
+
+    // Focus a window the way a foreground application would.
+    //
+    // UI Automation's SetFocus refuses plain WinForms windows outright
+    // ("the element cannot receive focus"), which left clicking the window
+    // as the only way in. Win32 alone is not enough either: the foreground
+    // lock makes a bare SetForegroundWindow a no-op for a background
+    // process. Attaching our input queue to the *foreground* thread - not
+    // the target's - is what lifts that, and it must be undone whatever
+    // happens, or the two threads stay coupled and the desktop behaves
+    // strangely afterwards.
+    public static bool Focus(IntPtr hWnd) {
+        if (hWnd == IntPtr.Zero) { return false; }
+        uint dummy;
+        uint foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), out dummy);
+        uint ourThread = GetCurrentThreadId();
+        bool attached = false;
+        try {
+            // Attaching a thread to itself fails, and there is nothing to
+            // lift when we already own the foreground.
+            if (foregroundThread != 0 && foregroundThread != ourThread) {
+                attached = AttachThreadInput(ourThread, foregroundThread, true);
+            }
+            if (IsIconic(hWnd)) { ShowWindow(hWnd, SW_RESTORE); }
+            BringWindowToTop(hWnd);
+            return SetForegroundWindow(hWnd);
+        } finally {
+            if (attached) { AttachThreadInput(ourThread, foregroundThread, false); }
+        }
+    }
+
+    // Whether `hWnd`'s top-level window is the one in the foreground.
+    //
+    // Compared by root ancestor rather than by handle: UI Automation
+    // legitimately focuses a *child* element, and a bare handle comparison
+    // would call that a failure.
+    public static bool IsForeground(IntPtr hWnd) {
+        if (hWnd == IntPtr.Zero) { return false; }
+        IntPtr wanted = GetAncestor(hWnd, GA_ROOT);
+        IntPtr actual = GetAncestor(GetForegroundWindow(), GA_ROOT);
+        return wanted != IntPtr.Zero && wanted == actual;
+    }
+
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
 

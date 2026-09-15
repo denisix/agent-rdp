@@ -204,6 +204,12 @@ pub fn record_launch_outcome(
             state.launch_failures = 0;
         }
         Err(reason) => {
+            // The gap between "Win+R was typed" and "an agent appeared".
+            // Without it `total_launches` cannot be reconciled with the
+            // number of agents, and a field team could not account for six
+            // launches against three pids.
+            state.launches_without_handshake =
+                state.launches_without_handshake.saturating_add(1);
             state.launch_failures = state.launch_failures.saturating_add(1);
             if state.auto_relaunch_disabled {
                 state.next_retry_at = None;
@@ -272,6 +278,7 @@ pub fn note_agent(
         state.agent_changes = state.agent_changes.saturating_add(1);
         state.adopted_replacement = !launched;
     }
+    state.note_agent_pid(identity.pid);
     state.agent_pid = Some(identity.pid);
     state.agent_instance = identity.instance.clone();
     state.last_agent_identity = Some(identity);
@@ -343,6 +350,11 @@ fn finish_launch(
             "A launch from automation epoch {} resolved under epoch {}; not recording it",
             epoch, state.epoch
         );
+        // The outcome belongs to a session that is gone, but the keystrokes
+        // landed on a real desktop and were counted. Recording that here is
+        // what closes the reconciliation gap: these are exactly the launches
+        // nothing else can see.
+        state.launches_abandoned = state.launches_abandoned.saturating_add(1);
         return;
     }
     state.relaunch_in_flight = false;
@@ -1364,6 +1376,8 @@ impl AutomationBootstrap {
                         expected
                     );
                     Self::shutdown_stale_agent(dvc_state, automation_state).await;
+                    automation_state.lock().await.survivor_outcome =
+                        Some("evicted_stale_build");
                     return Adoption::None;
                 }
 
@@ -1374,8 +1388,10 @@ impl AutomationBootstrap {
                 // false`, which the next `automate status` would report.
                 if !state.enabled {
                     debug!("A survivor handshook, but the session is gone; not adopting");
+                    state.survivor_outcome = Some("session_gone");
                     return Adoption::None;
                 }
+                state.survivor_outcome = None;
                 // Nothing was typed to bring this one up.
                 Self::record_ready(&mut state, false);
                 state.adopted = true;
@@ -1408,6 +1424,17 @@ impl AutomationBootstrap {
             }
             if std::time::Instant::now() >= deadline {
                 debug!("No surviving automation agent within {:?}; launching", SURVIVOR_WAIT);
+                // "Nobody was there" and "one was there and gave up waiting"
+                // call for different reactions, and both used to look
+                // identical: `adopted: false` with no explanation. Whether
+                // one existed is already known - the identity of the last
+                // agent survives a reconnect by design.
+                let mut state = automation_state.lock().await;
+                state.survivor_outcome = Some(if state.last_agent_identity.is_some() {
+                    "expired_window"
+                } else {
+                    "never_seen"
+                });
                 return Adoption::None;
             }
             sleep(SURVIVOR_POLL).await;
@@ -1986,6 +2013,45 @@ mod tests {
         assert!(actions.contains("cmd_syntax: a cmd.exe argument cannot contain a double quote"));
     }
 
+    /// Focusing a window must report what actually happened.
+    ///
+    /// It used to call UIA's `SetFocus` and return a hardcoded success. That
+    /// method refuses plain WinForms windows outright, so a field team was
+    /// told focus had been set, found their keystrokes going nowhere, and
+    /// had to discover the click workaround themselves.
+    #[test]
+    fn focus_falls_back_to_win32_and_verifies_the_result() {
+        let actions = lf(LIB_ACTIONS);
+        let types = lf(LIB_TYPES);
+
+        // The Win32 dance, and the detach that must happen whatever else does.
+        assert!(types.contains("AttachThreadInput"));
+        assert_eq!(
+            types.matches("AttachThreadInput(ourThread, foregroundThread").count(),
+            2,
+            "attach and detach"
+        );
+        let focus_at = types.find("public static bool Focus(IntPtr hWnd)").unwrap();
+        let body = &types[focus_at..];
+        let end = body.find("\n    }").unwrap();
+        assert!(
+            body[..end].contains("} finally {"),
+            "the threads must be detached even when the attempt throws"
+        );
+        // Attached to the *foreground* thread: attaching to the target's own
+        // thread does not lift the foreground lock.
+        assert!(types.contains("GetWindowThreadProcessId(GetForegroundWindow()"));
+
+        // Verified by root ancestor - UIA may focus a child element, and a
+        // handle comparison would call that a failure.
+        assert!(types.contains("GetAncestor(hWnd, GA_ROOT)"));
+        assert!(types.contains("public static bool IsForeground"));
+
+        // And the reply says what happened rather than always succeeding.
+        assert!(actions.contains("focused = $focused; verified = $true"));
+        assert!(!actions.contains("$window.SetFocus()\n            return @{ action = \"focus\"; success = $true }"));
+    }
+
     /// One capability list, declared once and reported everywhere.
     ///
     /// The handshake list and the `status` list were separate copies and had
@@ -2557,9 +2623,84 @@ mod keep_alive_and_launch_count_tests {
         let outcome = &source[outcome_at..];
         let outcome_end = outcome.find("\n}\n").unwrap();
         assert!(
-            !outcome[..outcome_end].contains("total_launches"),
+            !outcome[..outcome_end].contains("state.total_launches ="),
             "the outcome must not touch the launch count"
         );
+    }
+
+    /// Six launches against three agent pids could not be accounted for,
+    /// because the launches that produced no agent had no counter at all.
+    ///
+    /// The identity that has to hold: every Win+R typed either produced an
+    /// agent we recorded, failed to hand shake, or was abandoned when its
+    /// session went away.
+    #[test]
+    fn the_launch_counters_reconcile() {
+        let mut st = state();
+        let now = std::time::Instant::now();
+        let id = |pid| AgentIdentity { pid, instance: None };
+
+        // A launch that worked.
+        note_launch_typed(&mut st);
+        note_agent(&mut st, id(100), true);
+        record_launch_outcome(&mut st, &Ok(()), now);
+
+        // Two that typed and produced nothing.
+        note_launch_typed(&mut st);
+        record_launch_outcome(&mut st, &Err("no handshake".into()), now);
+        note_launch_typed(&mut st);
+        record_launch_outcome(&mut st, &Err("no handshake".into()), now);
+
+        // One abandoned mid-flight by a transport drop: the keystrokes
+        // landed, the outcome belongs to a session that no longer exists.
+        note_launch_typed(&mut st);
+        let stale = st.epoch;
+        st.epoch = st.epoch.wrapping_add(2);
+        finish_launch(&mut st, &Err("dropped".into()), now, stale);
+
+        // Two more that worked, so three agents in total.
+        note_launch_typed(&mut st);
+        note_agent(&mut st, id(200), true);
+        record_launch_outcome(&mut st, &Ok(()), now);
+        note_launch_typed(&mut st);
+        note_agent(&mut st, id(300), true);
+        record_launch_outcome(&mut st, &Ok(()), now);
+
+        assert_eq!(st.total_launches, 6);
+        assert_eq!(st.launches_without_handshake, 2);
+        assert_eq!(st.launches_abandoned, 1);
+        // Three agents, so two changes - the first sighting is not a change.
+        assert_eq!(st.agent_changes, 2);
+
+        let accounted =
+            st.agent_changes + 1 + st.launches_without_handshake + st.launches_abandoned;
+        assert_eq!(
+            st.total_launches, accounted,
+            "every Win+R must be accounted for: {} typed, {} produced agents, {} produced \
+             nothing, {} abandoned",
+            st.total_launches, st.agent_changes + 1, st.launches_without_handshake,
+            st.launches_abandoned
+        );
+
+        // And all three pids are recoverable, not just the previous one.
+        assert_eq!(st.agent_pid_history, vec![100, 200, 300]);
+        assert_eq!(st.previous_agent_pid, Some(200));
+    }
+
+    /// The history is bounded, and a re-handshake by the same agent is not
+    /// a new entry.
+    #[test]
+    fn the_pid_history_is_bounded_and_deduplicated() {
+        let mut st = state();
+        st.note_agent_pid(7);
+        st.note_agent_pid(7);
+        assert_eq!(st.agent_pid_history, vec![7]);
+
+        for pid in 0..20u32 {
+            st.note_agent_pid(1000 + pid);
+        }
+        assert!(st.agent_pid_history.len() <= 8);
+        assert_eq!(*st.agent_pid_history.last().unwrap(), 1019, "newest is kept");
     }
 
     /// Which agent is on the channel, and when that changed.

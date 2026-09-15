@@ -400,6 +400,12 @@ fn fill_daemon_fields(status: &mut AutomationStatus, state: &crate::automation::
     status.wedged = state.wedge_declared;
     status.wedge_strikes = state.wedge_strikes;
     status.wedge_detections = state.wedge_detections;
+    status.launches_without_handshake = state.launches_without_handshake;
+    status.launches_abandoned = state.launches_abandoned;
+    status.agent_pid_history = state.agent_pid_history.clone();
+    status.survivor_outcome = state.survivor_outcome.map(str::to_string);
+    status.last_spawn_ms = state.last_spawn_ms;
+    status.last_spawn_request_ms = state.last_spawn_request_ms;
     if let Some(ipc) = state.dvc_ipc.as_ref() {
         status.agent_instance_id = ipc.agent_instance_id();
         status.agent_started_unix = ipc.agent_started_unix();
@@ -532,9 +538,21 @@ pub async fn handle(
     // Send request to PowerShell agent via DVC, giving commands that carry
     // their own budget the time they asked for.
     let response_timeout = request_timeout(&request, ipc.default_timeout());
+    // Timed so a spawn's cost can be attributed: the agent reports how long
+    // starting the process took, and this is how long the whole round trip
+    // took. One slow and the other fast means a loaded host; both slow means
+    // the channel.
+    let sent_at = std::time::Instant::now();
+    let is_run = matches!(request, AutomateRequest::Run { .. });
     match ipc.send_request_with_timeout(&request, response_timeout).await {
         Ok(data) => {
+            let spawn_ms = if is_run { data["spawn_ms"].as_u64() } else { None };
             let mut response = convert_response(request, data, &ipc);
+            if let Some(spawn_ms) = spawn_ms {
+                let mut state = automation_state.lock().await;
+                state.last_spawn_ms = Some(spawn_ms);
+                state.last_spawn_request_ms = Some(sent_at.elapsed().as_millis() as u64);
+            }
             if let Some(ResponseData::AutomationStatus(ref mut status)) = response.data {
                 fill_daemon_fields(status, &*automation_state.lock().await);
             }
@@ -1334,7 +1352,10 @@ fn parse_window_list_response(data: serde_json::Value) -> anyhow::Result<Vec<Win
 fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
     let exit_code = data["exit_code"].as_i64().map(|v| v as i32);
     let stdout = data["stdout"].as_str().map(|s| s.to_string());
-    let stderr = data["stderr"].as_str().map(clean_clixml);
+    let stderr = data["stderr"]
+        .as_str()
+        .map(clean_clixml)
+        .map(|s| tidy_powershell_stderr(&s));
     let pid = data["pid"].as_u64().map(|v| v as u32);
     let replayed = data["replayed"].as_bool().unwrap_or(false);
     let early_exit = data["early_exit"].as_bool().unwrap_or(false);
@@ -1396,6 +1417,102 @@ fn parse_run_poll_response(data: serde_json::Value) -> anyhow::Result<RunPollRes
 /// progress/verbose/debug records (module autoload chatter), and leaves any
 /// non-CLIXML text untouched. Best effort: a `run-poll` chunk can split the
 /// XML mid-element, and whatever cannot be parsed is passed through as-is.
+/// Environment variable that turns the stderr tidy-up off entirely.
+pub const RAW_STDERR_KILL_SWITCH: &str = "AGENT_RDP_RAW_STDERR";
+
+/// Strip PowerShell's error decoration from a run's stderr.
+///
+/// A non-terminating `Write-Error` is rendered by Windows PowerShell's
+/// default view with the position and the source line it came from - and
+/// since the command is delivered as one `-EncodedCommand` script, that
+/// echo brings the agent's whole wrapper with it. A field team measured two
+/// kilobytes of it per harmless error, which anything parsing stderr has to
+/// wade through.
+///
+/// Deliberately conservative. The two decoration lines are always
+/// recognisable and always go. The position block only goes when it is
+/// clearly one: an `At line:N char:M` header followed by `+`-prefixed lines
+/// including a squiggle. Everything else is left exactly as it was, and what
+/// was removed is announced rather than silently dropped - the wrapper's own
+/// `ERROR:` diagnostic, in particular, is the deliberate one and must
+/// survive.
+pub fn tidy_powershell_stderr(stderr: &str) -> String {
+    if std::env::var(RAW_STDERR_KILL_SWITCH).is_ok_and(|v| v == "1") {
+        return stderr.to_string();
+    }
+
+    let lines: Vec<&str> = stderr.lines().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut removed = 0usize;
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+
+        // Pure decoration: never anything the user wrote.
+        if trimmed.starts_with("+ CategoryInfo")
+            || trimmed.starts_with("+ FullyQualifiedErrorId")
+        {
+            removed += 1;
+            i += 1;
+            continue;
+        }
+
+        // A position block: the header, then a run of `+` lines. Only
+        // dropped when that run actually contains a squiggle, which is what
+        // distinguishes the rendered echo from a line that merely starts
+        // with a plus.
+        if is_position_header(trimmed) {
+            let mut end = i + 1;
+            let mut squiggle = false;
+            while end < lines.len() {
+                let candidate = lines[end].trim_start();
+                if !candidate.starts_with('+') {
+                    break;
+                }
+                let content = candidate.trim_start_matches('+').trim();
+                if !content.is_empty() && content.chars().all(|c| c == '~') {
+                    squiggle = true;
+                }
+                end += 1;
+            }
+            if squiggle {
+                removed += end - i;
+                i = end;
+                continue;
+            }
+        }
+
+        kept.push(line);
+        i += 1;
+    }
+
+    if removed == 0 {
+        return stderr.to_string();
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    // Say what was taken away. Deleting evidence silently is the one thing
+    // this must not do.
+    out.push_str(&format!(
+        "[agent-rdp: removed {} lines of PowerShell error formatting; \
+         {}=1 keeps them]",
+        removed, RAW_STDERR_KILL_SWITCH
+    ));
+    out
+}
+
+/// `At line:12 char:1`, or `At C:\path\x.ps1:12 char:1`.
+fn is_position_header(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("At ") else {
+        return false;
+    };
+    rest.contains(" char:") && rest.split(" char:").next().is_some_and(|s| s.contains(':'))
+}
+
 pub fn clean_clixml(stderr: &str) -> String {
     const MARKER: &str = "#< CLIXML";
 
@@ -2179,6 +2296,75 @@ mod status_probe_tests {
         assert_eq!(
             indeterminate_resolution_worst(),
             std::time::Duration::from_secs(36)
+        );
+    }
+}
+
+#[cfg(test)]
+mod stderr_tidy_tests {
+    use super::*;
+
+    /// The decoration a non-terminating Write-Error drags in. Because the
+    /// command is one -EncodedCommand script, the echoed source is the
+    /// agent's whole wrapper - two kilobytes per harmless error.
+    #[test]
+    fn the_position_block_and_its_decoration_are_removed() {
+        let raw = "OUT\n\
+                   Write-Error: ERR-TEST\n\
+                   At line:12 char:1\n\
+                   + Write-Error \"ERR-TEST\" -ErrorAction Continue\n\
+                   + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\
+                       + CategoryInfo          : NotSpecified: (:) [Write-Error]\n\
+                       + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException\n";
+        let tidy = tidy_powershell_stderr(raw);
+
+        assert!(tidy.contains("OUT"), "output survives");
+        assert!(tidy.contains("ERR-TEST"), "the message itself survives");
+        assert!(!tidy.contains("At line:12"), "the position block goes");
+        assert!(!tidy.contains("~~~"));
+        assert!(!tidy.contains("CategoryInfo"));
+        assert!(tidy.contains("removed 5 lines"), "and says so: {tidy}");
+        assert!(tidy.contains(RAW_STDERR_KILL_SWITCH), "and how to get them back");
+    }
+
+    /// The regression this filter is most likely to cause. The wrapper's
+    /// catch emits a deliberate, compact diagnostic - that is the one thing
+    /// a failing command has to say, and it must survive untouched.
+    #[test]
+    fn a_wrapper_error_report_is_preserved() {
+        let raw = "ERROR: System.IO.FileNotFoundException: could not find 'x'\n\
+                     caused by System.Exception: inner\n\
+                     details: something\n\
+                   At C:\\script.ps1:4 char:2\n";
+        let tidy = tidy_powershell_stderr(raw);
+        assert_eq!(tidy, raw, "no squiggle run, so nothing is decoration");
+    }
+
+    /// Anything that is not recognisably decoration is left alone.
+    #[test]
+    fn ordinary_output_is_untouched() {
+        for raw in [
+            "plain text\n",
+            "+ this line starts with a plus but is not a block\n",
+            "At the shop I bought milk\n",
+            "",
+        ] {
+            assert_eq!(tidy_powershell_stderr(raw), raw, "left alone: {raw:?}");
+        }
+    }
+
+    /// A poll consumes what it returns, so a decoration block split across
+    /// two polls would be half-filtered. Only a complete, waited stderr is
+    /// tidied.
+    #[test]
+    fn poll_chunks_are_never_tidied() {
+        let source = crate::automation::lf(include_str!("automate.rs"));
+        let at = source.find("fn parse_run_poll_response").expect("the poll parser");
+        let body = &source[at..];
+        let end = body.find("\n}\n").unwrap();
+        assert!(
+            !body[..end].contains("tidy_powershell_stderr"),
+            "a partial chunk cannot be parsed as a whole error block"
         );
     }
 }

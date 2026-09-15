@@ -416,12 +416,53 @@ impl Output {
                     (None, _) => {}
                 }
                 if status.total_launches > 0 {
-                    // `relaunches` resets on every connect, so on its own it
-                    // cannot tell "up all day" from "rebuilt an hour ago".
+                    // Counted at the keystrokes, so it includes launches
+                    // that produced no agent - which is what made six
+                    // launches against three pids impossible to reconcile.
                     println!(
-                        "Agent launches against this host: {} (includes each connect's bootstrap)",
+                        "Win+R launches typed against this host: {} (each connect's bootstrap \
+                         included)",
                         status.total_launches
                     );
+                    if status.launches_without_handshake > 0 {
+                        println!(
+                            "  of which produced no agent: {}",
+                            status.launches_without_handshake
+                        );
+                    }
+                    if status.launches_abandoned > 0 {
+                        println!(
+                            "  of which were abandoned by a transport drop: {}",
+                            status.launches_abandoned
+                        );
+                    }
+                }
+                if status.agent_pid_history.len() > 1 {
+                    let pids: Vec<String> =
+                        status.agent_pid_history.iter().map(u32::to_string).collect();
+                    println!("Agent PIDs against this host, oldest first: {}", pids.join(" -> "));
+                }
+                if let Some(ref outcome) = status.survivor_outcome {
+                    println!(
+                        "Last connect found no agent to adopt: {}",
+                        match outcome.as_str() {
+                            "expired_window" => "one was there before the drop, but it had \
+                                                 given up waiting and exited",
+                            "evicted_stale_build" => "one was there, running different scripts \
+                                                      than this daemon ships, and was evicted",
+                            "session_gone" => "the session went away while looking",
+                            _ => "there was none",
+                        }
+                    );
+                }
+                match (status.last_spawn_ms, status.last_spawn_request_ms) {
+                    (Some(spawn), Some(round_trip)) => println!(
+                        "Last process spawn: {}ms on the host, {}ms round trip (slow here is \
+                         load, not a dead channel)",
+                        spawn, round_trip
+                    ),
+                    (Some(spawn), None) => println!("Last process spawn: {}ms on the host", spawn),
+                    _ => {}
                 }
                 if status.wedged {
                     println!(

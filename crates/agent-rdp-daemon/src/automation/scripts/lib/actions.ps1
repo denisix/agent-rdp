@@ -507,8 +507,53 @@ function Invoke-Window {
 
     switch ($action) {
         "focus" {
-            $window.SetFocus()
-            return @{ action = "focus"; success = $true }
+            # Three outcomes, not two. UIA's SetFocus refuses plain WinForms
+            # windows; Win32 alone is blocked by the foreground lock; and an
+            # element with no window handle can only be tried, never
+            # verified. Returning a hardcoded $true for all of them is what
+            # sent a field team hunting a focus problem that had already
+            # been reported as success.
+            $method = "uia"
+            $attempted = $false
+            try {
+                $window.SetFocus()
+                $attempted = $true
+            } catch {
+                Write-Log "UIA SetFocus refused this element: $($_.Exception.Message)" "WARN"
+            }
+
+            $hwnd = [IntPtr]::Zero
+            try { $hwnd = [IntPtr]$window.Current.NativeWindowHandle } catch {}
+
+            if ($hwnd -eq [IntPtr]::Zero) {
+                # Nothing to verify against, and no Win32 fallback possible.
+                return @{
+                    action = "focus"; success = $attempted
+                    focused = $attempted; verified = $false; method = $method
+                }
+            }
+
+            $focused = $false
+            try { $focused = [AgentDesktop]::IsForeground($hwnd) } catch {}
+            if (-not $focused) {
+                try {
+                    [void][AgentDesktop]::Focus($hwnd)
+                    $method = if ($attempted) { "uia+win32" } else { "win32" }
+                } catch {
+                    Write-Log "Win32 focus fallback failed: $($_.Exception.Message)" "WARN"
+                }
+                # The switch is asynchronous; give it a moment rather than
+                # judging it on the same instruction.
+                for ($i = 0; $i -lt 3 -and -not $focused; $i++) {
+                    Start-Sleep -Milliseconds 100
+                    try { $focused = [AgentDesktop]::IsForeground($hwnd) } catch {}
+                }
+            }
+
+            return @{
+                action = "focus"; success = $true
+                focused = $focused; verified = $true; method = $method
+            }
         }
         "maximize" {
             $windowPattern = $window.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
@@ -695,7 +740,15 @@ function Start-RunChild {
         $startInfo.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     }
 
+    # Monotonic, and in milliseconds. `finished_unix - started_unix` is whole
+    # seconds of wall clock, which cannot answer "is this host slow right
+    # now or is the channel dead" - the question a command that has not
+    # returned actually raises.
+    $spawnWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $process = [System.Diagnostics.Process]::Start($startInfo)
+    $spawnWatch.Stop()
+    $spawnMs = [int64]$spawnWatch.ElapsedMilliseconds
+    $runWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $script:LastRunLaunched = $true
     $startedUnix = Get-UnixNow
 
@@ -732,10 +785,13 @@ function Start-RunChild {
             [void]$stdoutTask.Wait(5000)
             [void]$stderrTask.Wait(5000)
 
+            $runWatch.Stop()
             return @{
                 exit_code = $process.ExitCode
                 stdout = $stdoutTask.Result
                 stderr = $stderrTask.Result
+                spawn_ms = $spawnMs
+                duration_ms = [int64]$runWatch.ElapsedMilliseconds
                 started_unix = $startedUnix
                 # The freshness marker for this output: the caller can tell a
                 # reply produced now from one replayed out of the journal, and
@@ -748,6 +804,7 @@ function Start-RunChild {
     } else {
         $launch = Get-LaunchResult -Process $process
         $launch.started_unix = $startedUnix
+        $launch.spawn_ms = $spawnMs
         return $launch
     }
 }
