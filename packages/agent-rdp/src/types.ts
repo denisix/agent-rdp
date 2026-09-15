@@ -99,6 +99,23 @@ export interface ConnectOptions {
    * appears on a shared desktop until `automation.restart()` asks for it.
    */
   deferAgent?: boolean;
+
+  /**
+   * Re-establish the session by itself when the transport drops
+   * (default: false).
+   *
+   * Opt-in: if the agent did not survive the outage, recovery types Win+R on
+   * the remote desktop - through the supervisor's idle-gated path, but that
+   * gate only knows whether *this daemon* has typed recently.
+   */
+  autoReconnect?: boolean;
+
+  /**
+   * Accept an empty password (default: false). An empty password is nearly
+   * always a secret lookup that produced nothing, and CredSSP reports it
+   * exactly like a wrong one.
+   */
+  allowEmptyPassword?: boolean;
 }
 
 /** Result of a successful connection. */

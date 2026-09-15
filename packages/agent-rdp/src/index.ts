@@ -410,12 +410,24 @@ export class RdpSession {
    * @param options.enableWinAutomation Enable Windows UI Automation
    * @param options.keepAliveSecs Seconds between keep-alive PDUs (default: 45, 0 disables)
    * @param options.deferAgent Connect without launching the automation agent (default: false)
+   * @param options.autoReconnect Re-establish the session by itself when the transport drops (default: false)
+   * @param options.allowEmptyPassword Accept an empty password (default: false)
    */
   async connect(options: ConnectOptions): Promise<ConnectResult> {
     if (options.deferAgent && !options.enableWinAutomation) {
       throw new RdpError(
         'invalid_request',
         'deferAgent needs enableWinAutomation: without automation there is no agent to defer.',
+      );
+    }
+    if (!options.password && !options.allowEmptyPassword) {
+      // The same rule the daemon applies. CredSSP reports an empty password
+      // exactly like a wrong one, so an unset secret looks like bad
+      // credentials and costs an hour of debugging.
+      throw new RdpError(
+        'invalid_request',
+        'the password is empty - usually a secret lookup that produced nothing. ' +
+          'Pass allowEmptyPassword if the account really has none.',
       );
     }
     if (
@@ -451,6 +463,8 @@ export class RdpSession {
       serve_viewer: this.streamPort > 0,
       keep_alive_secs: options.keepAliveSecs ?? 45,
       defer_agent: options.deferAgent ?? false,
+      auto_reconnect: options.autoReconnect ?? false,
+      allow_empty_password: options.allowEmptyPassword ?? false,
     };
 
     const response = await this._send(request);

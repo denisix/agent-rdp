@@ -217,6 +217,30 @@ pub struct ConnectArgs {
     /// is no agent to defer.
     #[arg(long, requires = "enable_win_automation")]
     pub defer_agent: bool,
+
+    /// Re-establish this session by itself when the transport drops.
+    ///
+    /// The transport is the one layer that never self-heals: the agent
+    /// relaunches, adoption works, the journal survives - but a dropped
+    /// connection waits for someone to type `connect`. Overnight nobody
+    /// does, and everything in that Windows session is stranded until
+    /// morning, including work that has nothing to do with agent-rdp.
+    ///
+    /// Opt-in because recovery is not free. An agent that survived the
+    /// outage is adopted silently; one that did not is relaunched by the
+    /// supervisor, which types Win+R on the remote desktop. That path waits
+    /// for the session to be idle first, but "idle" means this daemon has
+    /// not typed recently - it cannot see a person at the console.
+    #[arg(long)]
+    pub auto_reconnect: bool,
+
+    /// Connect even though the password is empty.
+    ///
+    /// An empty password is almost always a secret lookup that produced
+    /// nothing, and the server cannot tell it from a wrong one, so it is
+    /// refused unless you say it is deliberate.
+    #[arg(long)]
+    pub allow_empty_password: bool,
 }
 
 /// Screenshot command arguments.

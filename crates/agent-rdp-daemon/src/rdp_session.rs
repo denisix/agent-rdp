@@ -658,7 +658,7 @@ impl RdpSession {
         // Begin connection (pre-TLS)
         let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
             .await
-            .map_err(|e| RdpError::ConnectionFailed(explain_connect_error(&e.to_string())))?;
+            .map_err(|e| RdpError::ConnectionFailed(explain_connect_error(&sanitize_build_paths(&e.to_string()))))?;
 
         // Perform TLS upgrade
         let initial_stream: TcpStream = framed.into_inner_no_leftover();
@@ -694,7 +694,7 @@ impl RdpSession {
             None, // No Kerberos
         )
         .await
-        .map_err(|e| RdpError::ConnectionFailed(e.to_string()))?;
+        .map_err(classify_connect_error)?;
 
         info!("RDP connection established to {}", config.host);
 
@@ -2007,6 +2007,83 @@ fn unicode_key_events(units: &[u16]) -> Vec<FastPathInputEvent> {
 /// the most common one ("standard RDP security") is a host misconfiguration
 /// that cannot be worked around client-side: IronRDP refuses that security
 /// layer outright, so no flag will make the connection succeed.
+/// Turn a connector failure into the right error *kind*, not just text.
+///
+/// CredSSP rejecting the credentials was reported as `ConnectionFailed`,
+/// which reads as "the network is broken" and is the one classification a
+/// retry loop must not treat as retryable - an automatic reconnect would
+/// spend the night re-presenting a wrong password and lock the account.
+/// Decided from ironrdp's typed error rather than its message, because the
+/// message is what a human reads and a wrong guess here disables the guard.
+fn classify_connect_error(error: ironrdp::connector::ConnectorError) -> RdpError {
+    use ironrdp::connector::sspi::ErrorKind;
+    use ironrdp::connector::ConnectorErrorKind;
+
+    let denied = match error.kind() {
+        ConnectorErrorKind::Credssp(e) => matches!(
+            e.error_type,
+            ErrorKind::LogonDenied
+                | ErrorKind::UnknownCredentials
+                | ErrorKind::NoCredentials
+                | ErrorKind::WrongPrincipalName
+        ),
+        ConnectorErrorKind::AccessDenied => true,
+        // The untyped variant carries only a string; this is the one place
+        // text matching is the best available evidence.
+        _ => {
+            let lower = error.to_string().to_lowercase();
+            lower.contains("logon denied")
+                || lower.contains("0x8009030c")
+                || lower.contains("the user name or password is incorrect")
+        }
+    };
+
+    if denied {
+        return RdpError::AuthenticationFailed;
+    }
+    RdpError::ConnectionFailed(explain_connect_error(&sanitize_build_paths(
+        &error.to_string(),
+    )))
+}
+
+/// Remove the build machine's source paths from an error a user will read.
+///
+/// ironrdp formats its errors as `[context @ file:line] kind`, where `file`
+/// is the path on whatever machine built the binary - so a failed connect
+/// showed the user a 90-character path into a CI runner's cargo registry,
+/// twice, around the one word that carried meaning.
+fn sanitize_build_paths(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+
+    while let Some(open) = rest.find('[') {
+        let (before, from_open) = rest.split_at(open);
+        out.push_str(before);
+        let Some(close) = from_open.find(']') else {
+            out.push_str(from_open);
+            return out;
+        };
+        let span = &from_open[1..close];
+        // `context @ path:line` - keep the context, drop where it was
+        // compiled. Anything else in brackets is left alone.
+        match span.split_once(" @ ") {
+            Some((context, location)) if location.contains(':') => {
+                out.push('[');
+                out.push_str(context);
+                out.push(']');
+            }
+            _ => {
+                out.push('[');
+                out.push_str(span);
+                out.push(']');
+            }
+        }
+        rest = &from_open[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn explain_connect_error(raw: &str) -> String {
     let lower = raw.to_lowercase();
 
@@ -2224,6 +2301,27 @@ mod liveness_tests {
     /// dead service.
     /// A watch that has seen a refresh answered on a quiet link, the
     /// precondition for the verdict.
+    /// A user should not be shown the path of the machine that built the
+    /// binary, twice, around the one word that meant anything.
+    #[test]
+    fn build_paths_are_stripped_from_error_text() {
+        let raw = "[CredSSP @ /Users/runner/.cargo/registry/src/index.crates.io-6f17d22bba15001f/\
+                   ironrdp-async-0.10.0/src/connector.rs:107] CredSSP";
+        let clean = sanitize_build_paths(raw);
+        assert_eq!(clean, "[CredSSP] CredSSP");
+        assert!(!clean.contains(".cargo"));
+
+        // Chained errors keep every context and lose every path.
+        let chained = "[connect @ /a/b.rs:1] [inner @ /c/d.rs:22] the reason";
+        assert_eq!(sanitize_build_paths(chained), "[connect] [inner] the reason");
+
+        // Brackets that are not a location are left alone.
+        assert_eq!(sanitize_build_paths("[not a location] x"), "[not a location] x");
+        assert_eq!(sanitize_build_paths("no brackets"), "no brackets");
+        // An unterminated bracket must not lose the rest of the message.
+        assert_eq!(sanitize_build_paths("[open @ /a.rs:1 tail"), "[open @ /a.rs:1 tail");
+    }
+
     /// A write that fails is stronger evidence than silence, and must not
     /// wait for the verdict to be armed.
     ///

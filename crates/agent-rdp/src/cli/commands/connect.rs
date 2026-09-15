@@ -54,6 +54,8 @@ pub async fn run(
         serve_viewer: stream_port > 0,
         keep_alive_secs: args.keep_alive_secs,
         defer_agent: args.defer_agent,
+        auto_reconnect: args.auto_reconnect,
+        allow_empty_password: args.allow_empty_password,
         ..Default::default()
     });
 
@@ -157,15 +159,36 @@ fn expand_tilde(path: &str) -> std::borrow::Cow<'_, str> {
 /// Get password from command line, environment, or stdin.
 fn get_password(args: &ConnectArgs, output: &Output) -> anyhow::Result<String> {
     // Priority: --password-stdin > --password/env
-    if args.password_stdin {
+    // Both paths can yield an empty string, and the likelier one in the
+    // field is an exported-but-unset AGENT_RDP_PASSWORD rather than an empty
+    // pipe. CredSSP reports either exactly like a wrong password.
+    let password = if args.password_stdin {
         let stdin = io::stdin();
         let mut line = String::new();
         stdin.lock().read_line(&mut line)?;
-        return Ok(line.trim_end().to_string());
-    }
+        Some(line.trim_end().to_string())
+    } else {
+        args.password.clone()
+    };
 
-    if let Some(ref password) = args.password {
-        return Ok(password.clone());
+    if let Some(password) = password {
+        if password.is_empty() && !args.allow_empty_password {
+            output.print_error(
+                "empty_password",
+                if args.password_stdin {
+                    "--password-stdin read no bytes, so the password is empty. That is almost \
+                     always a secret lookup that produced nothing, and the server cannot tell \
+                     it from a wrong password. Pass --allow-empty-password if the account \
+                     really has none."
+                } else {
+                    "the password is empty - usually an unset AGENT_RDP_PASSWORD. The server \
+                     cannot tell an empty password from a wrong one, so it is refused here \
+                     instead. Pass --allow-empty-password if the account really has none."
+                },
+            );
+            std::process::exit(1);
+        }
+        return Ok(password);
     }
 
     // No password provided
