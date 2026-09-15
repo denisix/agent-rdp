@@ -180,4 +180,42 @@ wedge_strikes: number,
 /**
  * How many times this agent has been found wedged against this host.
  */
-wedge_detections: number, };
+wedge_detections: number, 
+/**
+ * Launches that typed Win+R and never produced a handshake.
+ *
+ * Without this, `total_launches` cannot be reconciled with the number
+ * of agents that actually appeared: the difference is failed and
+ * abandoned launches, and neither had a counter.
+ */
+launches_without_handshake: number, 
+/**
+ * Launches abandoned mid-flight because the session they belonged to
+ * went away - typed on a real desktop, outcome never recorded.
+ */
+launches_abandoned: number, 
+/**
+ * Every agent pid seen against this host, oldest first, newest last.
+ * `previous_agent_pid` holds one; a night with three agents needs all
+ * of them to be reconstructable.
+ */
+agent_pid_history: Array<number>, 
+/**
+ * Why no surviving agent was adopted at the last connect, when none
+ * was: `never_seen`, `expired_window`, `evicted_stale_build`, or
+ * `session_gone`. Distinguishes "nobody was there" from "one was there
+ * and we refused it", which call for different actions.
+ */
+survivor_outcome?: string, 
+/**
+ * How long the agent last took to start a detached process,
+ * milliseconds. The number that separates "this host is slow" from
+ * "the channel is dead" - both look like a command that does not
+ * return.
+ */
+last_spawn_ms?: number, 
+/**
+ * The DVC round trip of that same spawn request, milliseconds. Paired
+ * with `last_spawn_ms` it says which side was slow.
+ */
+last_spawn_request_ms?: number, };

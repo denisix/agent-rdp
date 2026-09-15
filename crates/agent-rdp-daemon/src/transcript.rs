@@ -209,6 +209,8 @@ mod tests {
             serve_viewer: false,
             keep_alive_secs: 45,
             defer_agent: false,
+            auto_reconnect: false,
+            allow_empty_password: false,
         });
         let summary = summarize_request(&request);
         let text = summary.to_string();

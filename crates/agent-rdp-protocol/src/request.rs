@@ -187,6 +187,34 @@ pub struct ConnectRequest {
     /// `defer_agent` without it rather than ignoring the flag.
     #[serde(default)]
     pub defer_agent: bool,
+
+    /// Re-establish this session by itself when the transport drops
+    /// (default: false).
+    ///
+    /// The transport is the one layer that never self-heals: the agent
+    /// relaunches, the journal survives, adoption works, but a dropped
+    /// connection waits for a human to type `connect`. Overnight there is
+    /// nobody, and everything in the session - including any GUI work that
+    /// has nothing to do with agent-rdp - is stranded until morning.
+    ///
+    /// Opt-in because recovery is not free: if the agent did not survive the
+    /// outage, bringing it back types Win+R on the remote desktop. That
+    /// happens through the supervisor's gated path rather than directly, so
+    /// it waits for the session to be idle first, but "idle" there means
+    /// *this daemon* has not typed recently - it cannot see a human at the
+    /// console.
+    #[serde(default)]
+    pub auto_reconnect: bool,
+
+    /// Accept an empty password (default: false).
+    ///
+    /// An empty password is nearly always a broken secret lookup - an unset
+    /// environment variable, a `--password-stdin` pipe that produced nothing
+    /// - and CredSSP reports it the same way it reports a wrong one, which
+    /// has cost a field team an hour of debugging. Accounts that genuinely
+    /// have no password need this flag to say so.
+    #[serde(default)]
+    pub allow_empty_password: bool,
 }
 
 /// Smallest non-zero keep-alive interval accepted. Three consecutive
@@ -214,8 +242,67 @@ pub fn validate_connect_request(request: &ConnectRequest) -> Result<(), String> 
                 .to_string(),
         );
     }
+    if request.password.is_empty() && !request.allow_empty_password {
+        return Err(
+            "the password is empty - usually a secret lookup that produced nothing (an unset \
+             variable, or a --password-stdin pipe with no bytes). CredSSP reports this exactly \
+             like a wrong password, so it is refused here instead. Pass --allow-empty-password \
+             if the account really has none"
+                .to_string(),
+        );
+    }
     Ok(())
 }
+
+/// The longest a batched key sequence may occupy the session.
+///
+/// A sequence holds the session lock for its whole duration so nothing can
+/// steal focus mid-sequence, which means its worst case has to be bounded or
+/// one call could wedge every other command for minutes.
+pub const PRESS_SEQ_MAX_MS: u64 = 30_000;
+
+/// Smallest gap between keys in a batched sequence. Below this the remote
+/// app cannot reliably distinguish separate presses.
+pub const PRESS_SEQ_MIN_INTERVAL_MS: u64 = 5;
+
+/// Why a keyboard request cannot be honored as written, if it cannot.
+///
+/// Pure, and shared by the CLI, the SDK and the daemon so all three agree
+/// without a round trip - the same arrangement as `validate_connect_request`.
+pub fn validate_keyboard_request(request: &KeyboardRequest) -> Result<(), String> {
+    let KeyboardRequest::PressSeq { keys, interval_ms } = request else {
+        return Ok(());
+    };
+    if keys.is_empty() {
+        return Err("a key sequence needs at least one key".to_string());
+    }
+    let interval = interval_ms.unwrap_or(DEFAULT_PRESS_SEQ_INTERVAL_MS);
+    if interval < PRESS_SEQ_MIN_INTERVAL_MS {
+        return Err(format!(
+            "interval_ms must be at least {}: below that the remote application cannot tell \
+             two presses apart",
+            PRESS_SEQ_MIN_INTERVAL_MS
+        ));
+    }
+    // The gaps, not the keys: n keys have n-1 intervals between them.
+    let worst = (keys.len() as u64).saturating_sub(1).saturating_mul(interval);
+    if worst > PRESS_SEQ_MAX_MS {
+        return Err(format!(
+            "{} keys {}ms apart would hold the session for {}s, and the sequence holds it \
+             throughout so focus cannot move; the limit is {}s. Split it into several calls",
+            keys.len(),
+            interval,
+            worst / 1000,
+            PRESS_SEQ_MAX_MS / 1000
+        ));
+    }
+    Ok(())
+}
+
+/// Gap between keys in a batched sequence when the caller does not say.
+/// Fast enough to be useful for a game, slow enough for a WinForms message
+/// pump to keep up.
+pub const DEFAULT_PRESS_SEQ_INTERVAL_MS: u64 = 40;
 
 fn default_stream_bind() -> String {
     "127.0.0.1".to_string()
@@ -252,6 +339,8 @@ impl Default for ConnectRequest {
             serve_viewer: false,
             keep_alive_secs: default_keep_alive_secs(),
             defer_agent: false,
+            auto_reconnect: false,
+            allow_empty_password: false,
         }
     }
 }
@@ -383,6 +472,24 @@ pub enum KeyboardRequest {
 
     /// Press a key combination (e.g., "ctrl+c", "alt+tab", or single key like "enter").
     Press { keys: String },
+
+    /// Press several key combinations in order, in one call.
+    ///
+    /// Each key is a separate CLI process otherwise, so the real gap between
+    /// presses is half a second or more - fine for a form, useless for
+    /// anything that moves while you wait. This holds the session for the
+    /// whole sequence, so nothing can steal focus part-way through and the
+    /// keys cannot interleave with another command's input; that is also why
+    /// `validate_keyboard_request` bounds how long a sequence may be.
+    PressSeq {
+        /// Combinations in order, each in `Press` syntax ("left", "ctrl+c").
+        keys: Vec<String>,
+        /// Gap between keys in milliseconds; omitted means
+        /// `DEFAULT_PRESS_SEQ_INTERVAL_MS`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, type = "number")]
+        interval_ms: Option<u64>,
+    },
 
     /// Press and hold a key.
     KeyDown { key: String },
@@ -868,6 +975,67 @@ mod tests {
 }
 
 #[cfg(test)]
+mod qa_0_7_22_validation_tests {
+    use super::*;
+
+    /// An empty password is nearly always a secret lookup that produced
+    /// nothing, and CredSSP reports it exactly like a wrong one - which
+    /// cost a field team an hour.
+    #[test]
+    fn an_empty_password_is_refused_unless_it_is_deliberate() {
+        let empty = ConnectRequest::default();
+        let refused = validate_connect_request(&empty).expect_err("empty password");
+        assert!(refused.contains("--allow-empty-password"), "says the way out: {refused}");
+        assert!(refused.contains("CredSSP"), "says why it is not left to the server");
+
+        let deliberate = ConnectRequest { allow_empty_password: true, ..ConnectRequest::default() };
+        assert!(validate_connect_request(&deliberate).is_ok());
+    }
+
+    /// A sequence holds the session for its whole duration so focus cannot
+    /// move, which means one call could otherwise block everything else for
+    /// as long as it liked.
+    #[test]
+    fn a_key_sequence_is_bounded_in_how_long_it_may_hold_the_session() {
+        let seq = |n: usize, interval: Option<u64>| KeyboardRequest::PressSeq {
+            keys: vec!["left".to_string(); n],
+            interval_ms: interval,
+        };
+
+        assert!(validate_keyboard_request(&seq(20, Some(80))).is_ok());
+        assert!(validate_keyboard_request(&seq(1, None)).is_ok(), "one key has no gaps");
+
+        let refused = validate_keyboard_request(&seq(200, Some(60_000)))
+            .expect_err("200 keys a minute apart");
+        assert!(refused.contains("holds it throughout"), "says why: {refused}");
+        assert!(refused.contains("Split it"), "says what to do: {refused}");
+
+        assert!(validate_keyboard_request(&seq(0, None)).is_err(), "no keys is a mistake");
+        assert!(
+            validate_keyboard_request(&seq(3, Some(1))).is_err(),
+            "below the minimum gap the app cannot tell presses apart"
+        );
+
+        // The cap is on the gaps, not the keys: n keys have n-1 of them.
+        let exact = PRESS_SEQ_MAX_MS / 100 + 1;
+        assert!(validate_keyboard_request(&seq(exact as usize, Some(100))).is_ok());
+        assert!(validate_keyboard_request(&seq(exact as usize + 1, Some(100))).is_err());
+    }
+
+    /// Everything else is unaffected - the validator is only about
+    /// sequences.
+    #[test]
+    fn other_keyboard_requests_are_never_refused() {
+        assert!(validate_keyboard_request(&KeyboardRequest::Press { keys: "ctrl+c".into() }).is_ok());
+        assert!(validate_keyboard_request(&KeyboardRequest::Type {
+            text: "x".repeat(100_000),
+            delay_ms: None,
+        })
+        .is_ok());
+    }
+}
+
+#[cfg(test)]
 mod keep_alive_field_tests {
     use super::*;
 
@@ -896,12 +1064,18 @@ mod keep_alive_field_tests {
     /// reinterpret. Shared by the daemon, the CLI parser and the SDK.
     #[test]
     fn a_connect_request_is_validated_before_it_is_honored() {
-        let base = ConnectRequest::default();
+        // Every case below is about some *other* field, so give them all a
+        // password; the empty-password rule has its own test.
+        let with_password = || ConnectRequest {
+            password: "pw".into(),
+            ..ConnectRequest::default()
+        };
+        let base = with_password();
         assert!(validate_connect_request(&base).is_ok());
 
         // The interval is the liveness window: three ticks of 3s is not
         // evidence of a dead server.
-        let mut fast = ConnectRequest { keep_alive_secs: 3, ..ConnectRequest::default() };
+        let mut fast = ConnectRequest { keep_alive_secs: 3, ..with_password() };
         let refused = validate_connect_request(&fast).expect_err("too short");
         assert!(refused.contains("at least 10"));
         assert!(refused.contains("9s"), "says how long the window would be: {refused}");
@@ -911,14 +1085,14 @@ mod keep_alive_field_tests {
         assert!(validate_connect_request(&fast).is_ok(), "0 disables, and stays allowed");
 
         // Deferring an agent that was never asked for is a silent no-op.
-        let deferred = ConnectRequest { defer_agent: true, ..ConnectRequest::default() };
+        let deferred = ConnectRequest { defer_agent: true, ..with_password() };
         assert!(validate_connect_request(&deferred)
             .expect_err("no automation to defer")
             .contains("enable_win_automation"));
         let both = ConnectRequest {
             defer_agent: true,
             enable_win_automation: true,
-            ..ConnectRequest::default()
+            ..with_password()
         };
         assert!(validate_connect_request(&both).is_ok());
     }

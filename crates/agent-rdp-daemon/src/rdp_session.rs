@@ -93,7 +93,17 @@ use crate::automation::DvcCommandReceiver;
 
 /// Commands sent to the background frame processor.
 enum SessionCommand {
-    SendInput(Vec<FastPathInputEvent>),
+    SendInput {
+        events: Vec<FastPathInputEvent>,
+        /// Whether the frames actually reached the socket.
+        ///
+        /// Input used to be fire-and-forget: an encode failure produced no
+        /// frames and a failed write was logged and skipped, while the
+        /// caller had already been told OK. A field team lost runs of
+        /// keystrokes that way, with no error anywhere and a correctly
+        /// focused window to prove it was not their application.
+        response_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Set clipboard text and announce to remote.
     ClipboardSet {
         text: String,
@@ -358,6 +368,14 @@ impl Drop for RdpSession {
 /// Only bounded by channel capacity, so this expires solely when the
 /// processor is not draining its queue at all.
 const COMMAND_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to wait for input frames to reach the socket.
+///
+/// The frame processor services RDPDR drive I/O synchronously, so a wedged
+/// file operation can hold it for a while; this has to clear that without
+/// turning a stalled session into an unbounded wait. Waiting at all is the
+/// point: it is what turns a lost keystroke from silence into an error.
+const INPUT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long to wait for the remote to acknowledge a clipboard write.
 const CLIPBOARD_SET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -996,9 +1014,30 @@ impl RdpSession {
 
     /// Send input events to the remote desktop.
     pub async fn send_input(&self, events: Vec<FastPathInputEvent>) -> Result<(), RdpError> {
+        self.send_input_within(events, INPUT_SEND_TIMEOUT).await
+    }
+
+    /// Send input and wait, up to `limit`, for the frames to reach the
+    /// socket.
+    ///
+    /// The budget is a parameter because a caller that sends many batches -
+    /// `send_text` - must bound the *whole* call rather than each batch, or
+    /// a long string gets one timeout per batch and can outlive every layer
+    /// above it.
+    async fn send_input_within(
+        &self,
+        events: Vec<FastPathInputEvent>,
+        limit: std::time::Duration,
+    ) -> Result<(), RdpError> {
         debug!("Sending {} input events to frame processor", events.len());
         self.stamp_input_activity();
-        self.send_command(SessionCommand::SendInput(events), "input").await
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.send_command(SessionCommand::SendInput { events, response_tx }, "input")
+            .await?;
+        match Self::await_processor(response_rx, limit, "input").await? {
+            Ok(()) => Ok(()),
+            Err(e) => Err(RdpError::ProtocolError(e)),
+        }
     }
 
     /// Send a key combination (e.g., "super+r", "ctrl+c").
@@ -1051,6 +1090,11 @@ impl RdpSession {
         let units: Vec<u16> = text.encode_utf16().collect();
         let mut first = true;
 
+        // One budget for the whole call, not one per batch. A 4000-character
+        // string is 63 batches, and a per-batch timeout would let this
+        // outlive every timeout layer above it before reporting anything.
+        let deadline = std::time::Instant::now() + INPUT_SEND_TIMEOUT;
+
         for chunk in units.chunks(UNITS_PER_BATCH) {
             if !first {
                 if let Some(ms) = delay_ms {
@@ -1059,7 +1103,16 @@ impl RdpSession {
             }
             first = false;
 
-            self.send_input(unicode_key_events(chunk)).await?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(RdpError::Unresponsive(format!(
+                    "typing did not finish within {}s; {} of {} code units were sent",
+                    INPUT_SEND_TIMEOUT.as_secs(),
+                    units.len() - chunk.len(),
+                    units.len()
+                )));
+            }
+            self.send_input_within(unicode_key_events(chunk), remaining).await?;
         }
 
         Ok(())
@@ -1344,15 +1397,15 @@ async fn run_frame_processor(
             cmd = command_rx.recv() => {
                 client_sent_since_keep_alive = true;
                 match cmd {
-                    Some(SessionCommand::SendInput(events)) => {
+                    Some(SessionCommand::SendInput { events, response_tx }) => {
                         debug!("Frame processor received {} input events", events.len());
                         // Process input and collect response frames
-                        let frames_to_send: Vec<Vec<u8>> = {
+                        let encoded: Result<Vec<Vec<u8>>, String> = {
                             let mut state = shared.write();
                             match active_stage.process_fastpath_input(&mut state.image, &events) {
                                 Ok(outputs) => {
                                     debug!("Input processing generated {} outputs", outputs.len());
-                                    outputs.into_iter()
+                                    Ok(outputs.into_iter()
                                         .filter_map(|o| {
                                             if let ActiveStageOutput::ResponseFrame(frame) = o {
                                                 Some(frame)
@@ -1360,20 +1413,49 @@ async fn run_frame_processor(
                                                 None
                                             }
                                         })
-                                        .collect()
+                                        .collect())
                                 }
                                 Err(e) => {
                                     error!("Failed to process input: {}", e);
-                                    Vec::new()
+                                    Err(format!("the input could not be encoded: {}", e))
                                 }
                             }
                         };
-                        // Send frames after releasing lock
+                        let frames_to_send = match encoded {
+                            Ok(frames) => frames,
+                            Err(e) => {
+                                // Previously this produced an empty frame
+                                // list and the caller was told OK.
+                                let _ = response_tx.send(Err(e));
+                                continue;
+                            }
+                        };
                         debug!("Sending {} input response frames", frames_to_send.len());
+                        let mut write_error = None;
                         for frame in &frames_to_send {
                             debug!("Sending input frame of {} bytes", frame.len());
                             if let Err(e) = framed.write_all(frame).await {
                                 error!("Failed to send input frame: {}", e);
+                                write_error = Some(e.to_string());
+                                break;
+                            }
+                        }
+                        match write_error {
+                            None => {
+                                let _ = response_tx.send(Ok(()));
+                            }
+                            Some(e) => {
+                                // A write that fails is not something to log
+                                // and carry on from: the keep-alive path
+                                // learned that the hard way, and input had no
+                                // equivalent - it kept writing into a dead
+                                // socket indefinitely while every caller was
+                                // told its keystrokes had been sent.
+                                let _ = response_tx.send(Err(e.clone()));
+                                drop_reason =
+                                    format!("failed to write input to the RDP transport: {}", e);
+                                error!("{}", drop_reason);
+                                break;
                             }
                         }
                     }

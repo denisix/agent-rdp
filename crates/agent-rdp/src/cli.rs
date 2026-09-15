@@ -296,7 +296,7 @@ pub struct KeyboardArgs {
     pub action: KeyboardAction,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum KeyboardAction {
     /// Type a text string
     Type {
@@ -313,6 +313,22 @@ pub enum KeyboardAction {
     Press {
         /// Key combination or single key
         keys: String,
+    },
+
+    /// Press several keys in order, in one call
+    ///
+    /// Each `press` is its own process, so keys land half a second or more
+    /// apart - fine for a form, useless for anything that moves while you
+    /// wait. This sends the whole sequence over one connection and holds the
+    /// session throughout, so nothing can steal focus part-way through.
+    Send {
+        /// Keys in order, space-separated: "left left right up". Each one
+        /// takes the same syntax as `press`, so "ctrl+c" works too.
+        keys: String,
+
+        /// Milliseconds between keys (default: 40, minimum 5)
+        #[arg(long = "interval-ms")]
+        interval_ms: Option<u64>,
     },
 
     /// Press and hold a key without releasing it (for shift-click, hold-and-drag, ...)

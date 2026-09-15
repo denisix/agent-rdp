@@ -44,7 +44,11 @@ pub async fn handle(
         return handle_paste(rdp_session, text).await;
     }
 
-    // For key combinations, release lock between each key event
+    // One lock for the whole combination. Releasing it between the down and
+    // the up let another handler - a paste, the agent bootstrap's Win+R, the
+    // viewer - interleave its own input, which leaves a modifier held and
+    // turns every following key into an unhandled chord the application
+    // silently discards.
     if let KeyboardRequest::Press { ref keys } = action {
         info!("Pressing key combination: {}", keys);
         let key_infos = match parse_key_combination(keys) {
@@ -54,51 +58,65 @@ pub async fn handle(
             }
         };
 
-        // Press all keys down
-        for info in &key_infos {
-            let event = create_key_event_ext(info.scancode, info.extended, false);
-            {
-                let session = rdp_session.lock().await;
-                let rdp = match session.as_ref() {
-                    Some(rdp) => rdp,
-                    None => {
-                        return Response::error(
-                            ErrorCode::NotConnected,
-                            "Not connected to an RDP server",
-                        );
-                    }
-                };
-                if let Err(e) = rdp.send_input(vec![event]).await {
-                    return Response::error(ErrorCode::InternalError, e.to_string());
+        let session = rdp_session.lock().await;
+        let rdp = match session.as_ref() {
+            Some(rdp) => rdp,
+            None => {
+                return Response::error(ErrorCode::NotConnected, "Not connected to an RDP server");
+            }
+        };
+        return match press_combination(rdp, &key_infos).await {
+            Ok(()) => Response::ok(),
+            Err(e) => Response::error(ErrorCode::InternalError, e.to_string()),
+        };
+    }
+
+    // A whole sequence under one lock, for the same reason, and because the
+    // alternative - one CLI process per key - puts half a second between
+    // presses, which is useless for anything that moves while you wait.
+    if let KeyboardRequest::PressSeq { ref keys, interval_ms } = action {
+        if let Err(e) = agent_rdp_protocol::validate_keyboard_request(&action) {
+            return Response::error(ErrorCode::InvalidRequest, e);
+        }
+        // Parse every key before sending any: a typo in the seventh key
+        // must not leave the first six typed.
+        let mut parsed = Vec::with_capacity(keys.len());
+        for keys_text in keys {
+            match parse_key_combination(keys_text) {
+                Ok(infos) => parsed.push(infos),
+                Err(e) => {
+                    return Response::error(
+                        ErrorCode::InvalidRequest,
+                        format!("{} (nothing was sent)", e),
+                    );
                 }
             }
-            sleep(Duration::from_millis(10)).await;
         }
+        let interval = Duration::from_millis(
+            interval_ms.unwrap_or(agent_rdp_protocol::DEFAULT_PRESS_SEQ_INTERVAL_MS),
+        );
+        info!("Pressing a sequence of {} key combinations", parsed.len());
 
-        // Small delay before releasing
-        sleep(Duration::from_millis(50)).await;
-
-        // Release all keys in reverse order
-        for info in key_infos.iter().rev() {
-            let event = create_key_event_ext(info.scancode, info.extended, true);
-            {
-                let session = rdp_session.lock().await;
-                let rdp = match session.as_ref() {
-                    Some(rdp) => rdp,
-                    None => {
-                        return Response::error(
-                            ErrorCode::NotConnected,
-                            "Not connected to an RDP server",
-                        );
-                    }
-                };
-                if let Err(e) = rdp.send_input(vec![event]).await {
-                    return Response::error(ErrorCode::InternalError, e.to_string());
-                }
+        let session = rdp_session.lock().await;
+        let rdp = match session.as_ref() {
+            Some(rdp) => rdp,
+            None => {
+                return Response::error(ErrorCode::NotConnected, "Not connected to an RDP server");
             }
-            sleep(Duration::from_millis(10)).await;
+        };
+        for (i, key_infos) in parsed.iter().enumerate() {
+            if i > 0 {
+                sleep(interval).await;
+            }
+            if let Err(e) = press_combination(rdp, key_infos).await {
+                // Say how far it got: the caller has to know which keys
+                // landed before deciding what to do next.
+                return Response::error(
+                    ErrorCode::InternalError,
+                    format!("{} (sent {} of {} keys)", e, i, parsed.len()),
+                );
+            }
         }
-
         return Response::ok();
     }
 
@@ -112,7 +130,10 @@ pub async fn handle(
     };
 
     let events = match action {
-        KeyboardRequest::Type { .. } | KeyboardRequest::Press { .. } | KeyboardRequest::Paste { .. } => {
+        KeyboardRequest::Type { .. }
+        | KeyboardRequest::Press { .. }
+        | KeyboardRequest::PressSeq { .. }
+        | KeyboardRequest::Paste { .. } => {
             // Handled above
             unreachable!()
         }
@@ -213,6 +234,29 @@ struct KeyInfo {
 }
 
 /// Create a keyboard event with proper flags.
+/// Press and release one combination on an already-held session.
+///
+/// Down in order, up in reverse, with the same small gaps as before. The
+/// caller holds the session lock for the whole call, so nothing can
+/// interleave between the down and the up.
+async fn press_combination(
+    rdp: &RdpSession,
+    key_infos: &[KeyInfo],
+) -> Result<(), crate::rdp_session::RdpError> {
+    for info in key_infos {
+        rdp.send_input(vec![create_key_event_ext(info.scancode, info.extended, false)])
+            .await?;
+        sleep(Duration::from_millis(10)).await;
+    }
+    sleep(Duration::from_millis(50)).await;
+    for info in key_infos.iter().rev() {
+        rdp.send_input(vec![create_key_event_ext(info.scancode, info.extended, true)])
+            .await?;
+        sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
 fn create_key_event_ext(scancode: u8, extended: bool, release: bool) -> FastPathInputEvent {
     let mut flags = KeyboardFlags::empty();
     if release {

@@ -9,4 +9,13 @@ export type KeyboardRequest = { "action": "type", text: string,
  * remote applications that drop input arriving too quickly; omitted
  * means send as fast as the connection allows.
  */
-delay_ms?: number, } | { "action": "press", keys: string, } | { "action": "key_down", key: string, } | { "action": "key_up", key: string, } | { "action": "paste", text: string, };
+delay_ms?: number, } | { "action": "press", keys: string, } | { "action": "press_seq", 
+/**
+ * Combinations in order, each in `Press` syntax ("left", "ctrl+c").
+ */
+keys: Array<string>, 
+/**
+ * Gap between keys in milliseconds; omitted means
+ * `DEFAULT_PRESS_SEQ_INTERVAL_MS`.
+ */
+interval_ms?: number, } | { "action": "key_down", key: string, } | { "action": "key_up", key: string, } | { "action": "paste", text: string, };

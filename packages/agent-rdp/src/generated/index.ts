@@ -2,6 +2,7 @@
 
 export type { AccessibilityElement } from './AccessibilityElement.js';
 export type { AccessibilitySnapshot } from './AccessibilitySnapshot.js';
+export type { AutoReconnectInfo } from './AutoReconnectInfo.js';
 export type { AutomateRequest } from './AutomateRequest.js';
 export type { AutomationHandshake } from './AutomationHandshake.js';
 export type { AutomationScrollDirection } from './AutomationScrollDirection.js';

@@ -9,9 +9,17 @@ export type LastDisconnect = {
  */
 at: string, 
 /**
- * Seconds since then.
+ * Seconds between `at` and `as_of`.
+ *
+ * Only meaningful against `as_of`: two commands run minutes apart
+ * report the same `at` and different `seconds_ago`, which read as a
+ * contradiction when the instant each was measured from was not shown.
  */
 seconds_ago: number, 
+/**
+ * When `seconds_ago` was computed (RFC 3339, UTC, daemon host clock).
+ */
+as_of: string, 
 /**
  * What the frame processor saw (read failure, server-initiated
  * termination, ...).

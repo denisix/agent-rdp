@@ -90,4 +90,32 @@ keep_alive_secs: number,
  * meaningful with `enable_win_automation`; the daemon refuses the pair
  * `defer_agent` without it rather than ignoring the flag.
  */
-defer_agent: boolean, };
+defer_agent: boolean, 
+/**
+ * Re-establish this session by itself when the transport drops
+ * (default: false).
+ *
+ * The transport is the one layer that never self-heals: the agent
+ * relaunches, the journal survives, adoption works, but a dropped
+ * connection waits for a human to type `connect`. Overnight there is
+ * nobody, and everything in the session - including any GUI work that
+ * has nothing to do with agent-rdp - is stranded until morning.
+ *
+ * Opt-in because recovery is not free: if the agent did not survive the
+ * outage, bringing it back types Win+R on the remote desktop. That
+ * happens through the supervisor's gated path rather than directly, so
+ * it waits for the session to be idle first, but "idle" there means
+ * *this daemon* has not typed recently - it cannot see a human at the
+ * console.
+ */
+auto_reconnect: boolean, 
+/**
+ * Accept an empty password (default: false).
+ *
+ * An empty password is nearly always a broken secret lookup - an unset
+ * environment variable, a `--password-stdin` pipe that produced nothing
+ * - and CredSSP reports it the same way it reports a wrong one, which
+ * has cost a field team an hour of debugging. Accounts that genuinely
+ * have no password need this flag to say so.
+ */
+allow_empty_password: boolean, };

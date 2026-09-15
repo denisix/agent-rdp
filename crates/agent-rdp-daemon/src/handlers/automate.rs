@@ -257,6 +257,12 @@ fn handshake_view(
         wedged: false,
         wedge_strikes: 0,
         wedge_detections: 0,
+        launches_without_handshake: 0,
+        launches_abandoned: 0,
+        agent_pid_history: Vec::new(),
+        survivor_outcome: None,
+        last_spawn_ms: None,
+        last_spawn_request_ms: None,
         // The agent is not answering, so it cannot describe its desktop.
         desktop_alive: None,
         input_desktop_open: None,
@@ -370,6 +376,12 @@ fn offline_status(state: &crate::automation::AutomationState) -> Response {
         wedged: state.wedge_declared,
         wedge_strikes: state.wedge_strikes,
         wedge_detections: state.wedge_detections,
+        launches_without_handshake: 0,
+        launches_abandoned: 0,
+        agent_pid_history: Vec::new(),
+        survivor_outcome: None,
+        last_spawn_ms: None,
+        last_spawn_request_ms: None,
     }))
 }
 
@@ -1591,6 +1603,12 @@ fn parse_status_response(data: serde_json::Value) -> anyhow::Result<AutomationSt
         wedged: false,
         wedge_strikes: 0,
         wedge_detections: 0,
+        launches_without_handshake: 0,
+        launches_abandoned: 0,
+        agent_pid_history: Vec::new(),
+        survivor_outcome: None,
+        last_spawn_ms: None,
+        last_spawn_request_ms: None,
         relaunches: 0,
         uptime_secs: None,
         last_rtt_ms: None,

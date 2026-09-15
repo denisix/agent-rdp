@@ -257,12 +257,54 @@ pub struct FileStatResult {
 pub struct LastDisconnect {
     /// When the transport dropped (RFC 3339, UTC, daemon host clock).
     pub at: String,
-    /// Seconds since then.
+    /// Seconds between `at` and `as_of`.
+    ///
+    /// Only meaningful against `as_of`: two commands run minutes apart
+    /// report the same `at` and different `seconds_ago`, which read as a
+    /// contradiction when the instant each was measured from was not shown.
     #[ts(type = "number")]
     pub seconds_ago: u64,
+    /// When `seconds_ago` was computed (RFC 3339, UTC, daemon host clock).
+    #[serde(default)]
+    pub as_of: String,
     /// What the frame processor saw (read failure, server-initiated
     /// termination, ...).
     pub reason: String,
+}
+
+/// How the daemon's automatic reconnection is faring.
+///
+/// Answers, from one command after an unattended run: did the session drop,
+/// did it come back by itself, is it still trying, and if it gave up, why.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../packages/agent-rdp/src/generated/")]
+pub struct AutoReconnectInfo {
+    /// `connect --auto-reconnect` was given for this session.
+    pub enabled: bool,
+    /// Sessions re-established without a human, this daemon's lifetime.
+    #[ts(type = "number")]
+    pub reconnects: u32,
+    /// Attempts made during the current outage; 0 when connected.
+    #[ts(type = "number")]
+    pub attempts: u32,
+    /// When the current outage began (RFC 3339, UTC), if one is ongoing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub outage_began: Option<String>,
+    /// When the next attempt is due (RFC 3339, UTC), if one is scheduled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub next_attempt_at: Option<String>,
+    /// Why the most recent attempt failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub last_attempt_error: Option<String>,
+    /// Why reconnection stopped for good - a credential failure, or a host
+    /// that accepts the connection and drops it again immediately. Set means
+    /// nothing further will be attempted without a manual `connect`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stopped_reason: Option<String>,
 }
 
 /// Outcome of a file transfer in either direction.
@@ -336,9 +378,26 @@ pub struct SessionInfo {
     #[ts(optional)]
     pub cli_version: Option<String>,
 
-    /// Time since daemon started (seconds).
+    /// Wall-clock time since the daemon process started (seconds).
+    ///
+    /// Wall clock on purpose: the monotonic clock does not advance while the
+    /// host sleeps, so a laptop that dozed for four hours reported a daemon
+    /// uptime four hours short of its own process age.
     #[ts(type = "number")]
     pub uptime_secs: u64,
+
+    /// Time the daemon has been *awake* (seconds), on the monotonic clock.
+    ///
+    /// `uptime_secs` minus this is how long the host slept - which is often
+    /// the explanation for a transport that died during a quiet period.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub uptime_monotonic_secs: u64,
+
+    /// What automatic reconnection has been doing, when it is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub auto_reconnect: Option<AutoReconnectInfo>,
 
     /// Milliseconds since the last PDU was successfully read from the RDP
     /// server (only present while connected). See `Screenshot::frame_age_ms`.

@@ -50,6 +50,9 @@ pub struct Daemon {
 
     /// Time when daemon started.
     start_time: Instant,
+    /// Wall-clock start, so `uptime_secs` means process age rather than
+    /// awake time - `Instant` does not advance while the host sleeps.
+    start_wall: std::time::SystemTime,
 
     /// Shutdown signal sender.
     shutdown_tx: broadcast::Sender<()>,
@@ -124,6 +127,7 @@ impl Daemon {
             automation_state,
             ipc_server,
             start_time: Instant::now(),
+            start_wall: std::time::SystemTime::now(),
             shutdown_tx,
             disconnect_rx,
             disconnect_tx,
@@ -175,6 +179,7 @@ impl Daemon {
                             let ws_handle = Arc::clone(&self.ws_handle);
                             let session_name = self.session_name.clone();
                             let start_time = self.start_time;
+                            let start_wall = self.start_wall;
                             let shutdown_tx = self.shutdown_tx.clone();
                             let disconnect_tx = self.disconnect_tx.clone();
                             let last_disconnect = Arc::clone(&self.last_disconnect);
@@ -182,7 +187,7 @@ impl Daemon {
                             let session_generation = Arc::clone(&self.session_generation);
 
                             tokio::spawn(async move {
-                                if let Err(e) = handle_client(stream, session, automation_state, ws_handle, session_name, start_time, shutdown_tx, disconnect_tx, clipboard_changed_rx, session_generation, last_disconnect).await {
+                                if let Err(e) = handle_client(stream, session, automation_state, ws_handle, session_name, start_time, start_wall, shutdown_tx, disconnect_tx, clipboard_changed_rx, session_generation, last_disconnect).await {
                                     error!("Client handler error: {}", e);
                                 }
                             });
@@ -398,6 +403,7 @@ async fn handle_client(
     ws_handle: SharedWsHandle,
     session_name: String,
     start_time: Instant,
+    start_wall: std::time::SystemTime,
     shutdown_tx: broadcast::Sender<()>,
     disconnect_tx: tokio::sync::mpsc::Sender<DisconnectEvent>,
     clipboard_changed_rx: ClipboardChangedRx,
@@ -444,6 +450,7 @@ async fn handle_client(
             &ws_handle,
             &session_name,
             start_time,
+            start_wall,
             &disconnect_tx,
             &clipboard_changed_rx,
             &session_generation,
@@ -503,6 +510,7 @@ async fn process_request(
     ws_handle: &SharedWsHandle,
     session_name: &str,
     start_time: Instant,
+    start_wall: std::time::SystemTime,
     disconnect_tx: &tokio::sync::mpsc::Sender<DisconnectEvent>,
     clipboard_changed_rx: &ClipboardChangedRx,
     session_generation: &Arc<std::sync::atomic::AtomicU64>,
@@ -544,7 +552,17 @@ async fn process_request(
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 // Filled in by the CLI; the daemon does not know it.
                 cli_version: None,
-                uptime_secs: start_time.elapsed().as_secs(),
+                // Wall clock: a host that slept for four hours reported a
+                // daemon uptime four hours short of its own process age,
+                // because the monotonic clock stops with the machine.
+                uptime_secs: std::time::SystemTime::now()
+                    .duration_since(start_wall)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                // And the difference between the two is how long it slept,
+                // which is often why a quiet transport died.
+                uptime_monotonic_secs: start_time.elapsed().as_secs(),
+                auto_reconnect: None,
                 last_frame_age_ms,
                 keep_alive_secs,
                 // Filled in by `handle_client`, which owns the drop state.
@@ -627,14 +645,20 @@ pub struct DisconnectInfo {
 }
 
 impl DisconnectInfo {
-    fn seconds_ago(&self) -> u64 {
-        self.at.elapsed().map(|d| d.as_secs()).unwrap_or(0)
+    fn seconds_ago_at(&self, now: std::time::SystemTime) -> u64 {
+        now.duration_since(self.at).map(|d| d.as_secs()).unwrap_or(0)
     }
 
     fn to_protocol(&self) -> agent_rdp_protocol::LastDisconnect {
+        // One instant for both numbers. Reported separately they looked
+        // like a contradiction: `at` is absolute, `seconds_ago` was
+        // relative to whenever that particular command ran, and nothing
+        // said which instant that was.
+        let now = std::time::SystemTime::now();
         agent_rdp_protocol::LastDisconnect {
             at: crate::timefmt::utc_rfc3339(self.at),
-            seconds_ago: self.seconds_ago(),
+            seconds_ago: self.seconds_ago_at(now),
+            as_of: crate::timefmt::utc_rfc3339(now),
             reason: self.reason.clone(),
         }
     }
@@ -660,7 +684,7 @@ fn annotate_not_connected(response: &mut Response, last_disconnect: &SharedLastD
          for about 10 minutes), and only types Win+R to launch a new one if it is not - \
          so a prompt reconnect is the one that leaves a shared desktop alone.",
         error.message.trim_end_matches('.'),
-        info.seconds_ago(),
+        info.seconds_ago_at(std::time::SystemTime::now()),
         info.reason
     );
 }

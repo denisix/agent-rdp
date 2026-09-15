@@ -656,6 +656,41 @@ pub struct AutomationStatus {
     /// How many times this agent has been found wedged against this host.
     #[serde(default)]
     pub wedge_detections: u32,
+    /// Launches that typed Win+R and never produced a handshake.
+    ///
+    /// Without this, `total_launches` cannot be reconciled with the number
+    /// of agents that actually appeared: the difference is failed and
+    /// abandoned launches, and neither had a counter.
+    #[serde(default)]
+    pub launches_without_handshake: u32,
+    /// Launches abandoned mid-flight because the session they belonged to
+    /// went away - typed on a real desktop, outcome never recorded.
+    #[serde(default)]
+    pub launches_abandoned: u32,
+    /// Every agent pid seen against this host, oldest first, newest last.
+    /// `previous_agent_pid` holds one; a night with three agents needs all
+    /// of them to be reconstructable.
+    #[serde(default)]
+    pub agent_pid_history: Vec<u32>,
+    /// Why no surviving agent was adopted at the last connect, when none
+    /// was: `never_seen`, `expired_window`, `evicted_stale_build`, or
+    /// `session_gone`. Distinguishes "nobody was there" from "one was there
+    /// and we refused it", which call for different actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub survivor_outcome: Option<String>,
+    /// How long the agent last took to start a detached process,
+    /// milliseconds. The number that separates "this host is slow" from
+    /// "the channel is dead" - both look like a command that does not
+    /// return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub last_spawn_ms: Option<u64>,
+    /// The DVC round trip of that same spawn request, milliseconds. Paired
+    /// with `last_spawn_ms` it says which side was slow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub last_spawn_request_ms: Option<u64>,
 }
 
 /// Command run result.

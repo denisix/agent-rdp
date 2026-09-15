@@ -269,6 +269,10 @@ fn watchdog_budget_ms(cli: &Cli) -> Option<u64> {
         Commands::File(_) => cli::commands::file::TRANSFER_TIMEOUT_MS,
         // The alias budgets exactly like the command it delegates to.
         Commands::Status => 0,
+        // Keyboard input now waits for the frames to reach the socket, and a
+        // sequence or a delayed `type` can legitimately take a while. Neither
+        // had any extension at all, so both relied on the grace period.
+        Commands::Keyboard(args) => cli::commands::keyboard::budget_ms(&args.action),
         Commands::Wait { ms } => *ms,
         // Several best-effort daemon round trips (ping, info, status,
         // screenshot, remote log pull), each with its own budget.
@@ -458,6 +462,41 @@ mod watchdog_tests {
         );
         assert_eq!(
             watchdog_budget_ms(&parse(&["status"])),
+            Some(DEFAULT_TIMEOUT_MS + WATCHDOG_GRACE_MS)
+        );
+    }
+
+    /// Keyboard input now waits for its frames to reach the socket, so the
+    /// layers above it have to outlast the command. Neither the sequence nor
+    /// a delayed `type` had any extension before - they survived on the
+    /// grace period alone.
+    #[test]
+    fn keyboard_layers_are_ordered() {
+        let cases: [&[&str]; 3] = [
+            &["keyboard", "send", "left left right up", "--interval-ms", "500"],
+            &["keyboard", "send", "a b c d e f g h i j", "--interval-ms", "1000"],
+            &["keyboard", "type", "x", "--delay", "200"],
+        ];
+        for args in cases {
+            let cli = parse(args);
+            let Commands::Keyboard(ref keyboard) = cli.command else { unreachable!() };
+            let command_ms = cli::commands::keyboard::budget_ms(&keyboard.action);
+            let ipc_ms = DEFAULT_TIMEOUT_MS + command_ms;
+            let watchdog_ms = watchdog_budget_ms(&cli).unwrap();
+            assert!(
+                ipc_ms < watchdog_ms,
+                "{args:?}: the CLI socket ({ipc_ms}) must give up before the watchdog ({watchdog_ms})"
+            );
+        }
+
+        // A sequence's budget is its own gaps, so it grows with them.
+        let slow = parse(&["keyboard", "send", "a b c", "--interval-ms", "1000"]);
+        let fast = parse(&["keyboard", "send", "a b c", "--interval-ms", "10"]);
+        assert!(watchdog_budget_ms(&slow) > watchdog_budget_ms(&fast));
+
+        // And an ordinary press still costs nothing extra.
+        assert_eq!(
+            watchdog_budget_ms(&parse(&["keyboard", "press", "enter"])),
             Some(DEFAULT_TIMEOUT_MS + WATCHDOG_GRACE_MS)
         );
     }
