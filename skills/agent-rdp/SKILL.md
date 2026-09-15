@@ -6,7 +6,7 @@ allowed-tools: Bash(agent-rdp:*), Bash(npm install -g @denisixnpm/agent-rdp)
 
 # agent-rdp
 
-Tested against agent-rdp 0.7.21. Check with `agent-rdp session info` (shows
+Tested against agent-rdp 0.7.22. Check with `agent-rdp session info` (shows
 both CLI and daemon versions, also in `--json` as `cli_version` /
 `daemon_version`) — a `daemon_version_mismatch` error means an older daemon
 survived an upgrade; run `connect` again to replace it.
@@ -320,6 +320,36 @@ its timeout covers that. A third verdict, `daemon_version_mismatch`, means
 the daemon is from a different agent-rdp version than the CLI (it outlived an
 upgrade): run `connect` again, which replaces it — every other command refuses
 rather than silently driving old code.
+
+**A dropped transport can put itself back.** `connect --auto-reconnect`
+retains the request and re-establishes the session on a drop, with backoff.
+It is opt-in because recovery is not free: an agent that survived the outage
+is adopted silently, but one that did not is relaunched by the supervisor,
+which types Win+R once the session has been idle for two minutes. It stops
+for good if the server rejects the credentials, or if the session keeps
+dying within two minutes of coming back. `session info` reports all of it -
+reconnects, attempts, next attempt, and why it stopped.
+
+Worth knowing about the drops themselves: `os error 60` is usually *our* own
+socket timeout firing, not the network failing. The daemon bounds
+unacknowledged data at 30 seconds so a dead session is never mistaken for a
+live one, which means any interruption longer than that - a Wi-Fi roam, a
+VPN rehandshake, a laptop dozing - ends the session. `session info` also
+reports how long the host slept, which is often the explanation.
+
+**Keyboard input is acknowledged now.** A press that could not be written to
+the transport returns an error instead of reporting success, and a write
+failure ends the session rather than being logged and skipped. If you need
+several keys in a row, `keyboard send "left left right up" --interval-ms 80`
+sends them over one connection and holds the session throughout, so nothing
+can steal focus mid-sequence. Separate `press` calls are half a second apart
+and can interleave with other input.
+
+**`automate window focus` tells you whether it worked.** It returns
+`focused`, `verified` and `method`: UI Automation refuses plain WinForms
+windows, so there is a Win32 fallback, and the result is checked against the
+actual foreground window rather than assumed. An element with no window
+handle can only be attempted, and says so.
 
 **Reconnecting usually leaves the remote desktop alone now.** The Windows agent
 outlives a transport drop: it keeps re-opening its channel for about 10 minutes,

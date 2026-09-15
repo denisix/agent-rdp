@@ -96,6 +96,99 @@ window, so `validate_connect_request` refuses a non-zero
 `keep_alive_secs` below `KEEP_ALIVE_MIN_SECS` (10) in the daemon, the CLI
 parser and the SDK.
 
+**Auto-reconnect is opt-in, and its guards are the design.** `connect
+--auto-reconnect` retains the `ConnectRequest` (`reconnect.rs`) and re-runs
+the connect after a drop, with backoff 5/10/20/40/60s. `should_attempt` is the
+pure decision and refuses unless: enabled, a request was retained, no
+permanent stop, none in flight, the current session generation still equals
+the dropped one, and `connect_serial` is unchanged. That serial is bumped
+**only by user-originated** `Connect`/`Disconnect`/`Shutdown`, which is how the
+loop tells a user's action from its own; `Disconnect` and `Shutdown` also
+`disarm()` explicitly in `process_request` *before* dispatch, because
+`disconnect` queues onto the same channel the processor is servicing and the
+read arm usually errors first - the resulting drop event would otherwise
+resurrect the session the user just closed. It stops permanently on
+`AuthenticationFailed` (unbounded retries with a stale password locks the
+account, which is why `classify_connect_error` is a prerequisite and not a
+nicety) and on the circuit breaker (`MAX_SHORT_SESSIONS` sessions shorter than
+`HEALTHY_SESSION`).
+
+**A reconnect must never type.** The branch passes
+`ConnectOrigin::AutoReconnect` and calls `adopt_only`, never `launch_guarded`:
+a surviving agent is adopted silently, and if there is none it arms
+`next_retry_at` and leaves the launch to the **supervisor**, whose path is
+gated by `RETRY_INPUT_QUIET`. `connect`'s own bootstrap is not gated, so
+calling `handle` unmodified would type Win+R at 03:00 into whatever has focus.
+`defer_agent` is the wrong tool - it would stop the agent ever returning.
+`an_auto_reconnect_never_launches_the_agent_itself` is a source assertion
+guarding this against a later "simplification". The retained request holds a
+password, so `AutoReconnect` deliberately does not derive `Debug`, and
+`attempt_event` hand-builds its journal line: `transcript::append_event` does
+**not** redact and `agent-rdp diagnose` ships that file to us.
+
+Once a reconnect can fire milliseconds after a drop, the teardown races stop
+being theoretical: the `ws_handle` and `clipboard_changed_rx` clears are
+guarded by `superseded()`, and the reconnect runs *sequentially* in the same
+teardown task rather than as a second spawn.
+
+**Input is acknowledged.** `SessionCommand::SendInput` carries a
+`response_tx` and `send_input` awaits it, so an encode failure or a failed
+write reaches the caller instead of `Response::ok()`. The write failure was
+the larger bug: it used to log and continue, so the processor wrote input into
+a dead socket indefinitely - it now stamps `drop_reason` and ends the session,
+the same move `record_send_failure` makes for keep-alive. `send_input`
+inherits the RDPDR stall, hence `INPUT_SEND_TIMEOUT` (15s); `send_text` must
+compute **one whole-call deadline**, not one per 64-unit batch, or a
+4000-character type gets 63x that. `mouse`, `scroll`, the viewer and
+`send_key_press` share the fix, so a Win+R whose keystrokes failed to write
+now fails the launch instead of counting as typed.
+
+**`keyboard send` holds the lock for the whole sequence.** Releasing between
+keys is the interleaving defect it exists to fix, so the worst case must be
+bounded: `validate_keyboard_request` refuses a sequence longer than
+`PRESS_SEQ_MAX_MS` (30s), shared by daemon, CLI parser and SDK like the
+keep-alive rule. Plain `Press` holds the lock across the combination too. The
+watchdog had no keyboard arm at all; both `send --interval-ms` and
+`type --delay-ms` need one (`keyboard_layers_are_ordered`).
+
+**`uptime_secs` is wall clock, `uptime_monotonic_secs` is not.** `Instant`
+does not advance while macOS sleeps, so the difference between the two *is*
+how long the client host slept - the question behind a report of an 8.5h-old
+pid with 4.5h of uptime. `LastDisconnect` also carries `as_of`, so
+`seconds_ago` is relative to a printed instant rather than to whenever the
+reader does the arithmetic.
+
+**`window focus` used to report success it never checked.** It called UIA
+`SetFocus()` and returned `$true` unconditionally. Now it tries UIA, falls
+back to a Win32 dance that attaches to the **foreground** thread (the
+foreground lock is what makes a bare `SetForegroundWindow` a no-op from a
+background agent), restores if iconic, raises, and detaches in a `finally`.
+Verification compares `GetAncestor(GA_ROOT)` of the foreground window against
+the target's, because UIA legitimately focuses a *child* element and bare
+handle equality would call a real success a failure. The reply carries
+`focused`, `verified` and `method`; `success` keeps its old meaning,
+"attempted without throwing", since an element with no window handle can only
+be attempted.
+
+**The launch counters reconcile.** `total_launches = our_changes +
+launches_without_handshake + launches_abandoned`, pinned by
+`the_launch_counters_reconcile`. One counter could not close the gap:
+abandoned launches are exactly the ones `finish_launch` records nothing for.
+`agent_pid_history` is capped and deduplicated, because one
+`previous_agent_pid` cannot describe three pids over a ten-hour run, and
+`survivor_outcome` distinguishes never-seen / window-expired / evicted-for-
+stale-build / session-gone, which call for different actions.
+
+**stderr is tidied daemon-side, not by changing PowerShell's rendering**
+(CategoryView loses the message, ConciseView is PS7-only). The anchor is the
+decoration, not the wrapper markers - the position echo shows the *user's*
+line. `+ CategoryInfo` and `+ FullyQualifiedErrorId` always go; an
+`At line:N char:M` block goes only when it contains a squiggle-only line *and*
+its echoed source matches the run's own `command_line` or the embedded
+wrapper. The wrapper's deliberate `ERROR:`-prefixed blob is preserved,
+removals are announced with a count, `run-poll` chunks are never touched, and
+`AGENT_RDP_RAW_STDERR=1` opts out.
+
 **Every processor exit stamps `drop_reason`, panics included.** The task is
 wrapped in `catch_unwind`; without it a panic left the session in the slot
 as Connected forever, keep-alive stopped, every command answering from a
@@ -387,9 +480,12 @@ events.
 | `AGENT_RDP_MODELS_DIR` | OCR models directory (set by the npm wrapper; needed for standalone binary installs) |
 | `AGENT_RDP_NO_AUTO_RELAUNCH` | `1` disables the daemon's automatic relaunch of the automation agent |
 | `AGENT_RDP_NO_SILENCE_DROP` | `1` keeps the keep-alive traffic but disables the "server answered none of the last 3 refreshes" disconnect verdict |
+| `AGENT_RDP_RAW_STDERR` | `1` returns a remote command's stderr exactly as PowerShell rendered it, without stripping the error decoration |
 
 `connect --keep-alive-secs <n>` (default 45, `0` disables) sets the keep-alive
 interval; there is no environment variable for it.
+`connect --auto-reconnect`, `--allow-empty-password` and
+`keyboard send --interval-ms` likewise have no environment variables.
 
 ## Release process
 

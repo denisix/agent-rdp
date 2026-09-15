@@ -262,6 +262,49 @@ Commands use native Windows UI Automation patterns for reliable interaction:
 | `context_menu` | Focus + Shift+F10 (keyboard) | Opening context menus |
 | `fill` | ValuePattern.SetValue() | Text fields |
 
+### Focus
+
+`focus` is three-tiered, because UI Automation's `SetFocus()` silently refuses
+plain WinForms windows and the old implementation returned `success = $true`
+without ever checking.
+
+1. UI Automation `SetFocus()` on the element.
+2. If that throws or does not take, a Win32 fallback on the owning window:
+   attach to the **foreground** thread's input queue (`AttachThreadInput`) -
+   the foreground lock is what makes a bare `SetForegroundWindow` a no-op from
+   a background process - `ShowWindow(SW_RESTORE)` if iconic,
+   `BringWindowToTop`, `SetForegroundWindow`, then detach in a `finally`. The
+   attach is skipped when the foreground thread is already ours.
+3. Verify: poll the foreground window and compare `GetAncestor(..., GA_ROOT)`
+   against the target's root. Root comparison, not handle equality, because
+   UIA legitimately focuses a *child* element.
+
+The reply carries `focused`, `verified` and `method`. `success` keeps its
+existing meaning - "attempted without throwing" - because an element with no
+window handle can only be attempted and there is nothing to verify.
+
+### Launch accounting
+
+`total_launches` counts launches that typed something; it splits exactly into
+`our_changes + launches_without_handshake + launches_abandoned`
+(`the_launch_counters_reconcile`). `launches_without_handshake` is a launch
+that typed and never got an agent back; `launches_abandoned` is one superseded
+by an epoch bump before it typed - the case `finish_launch` deliberately
+records nothing for, and the reason one counter could not close the gap.
+`agent_pid_history` keeps the last 8 distinct agent pids, and
+`survivor_outcome` says why adoption found nothing: never seen, window
+expired, evicted for a stale build, or the session went away.
+
+### Timing
+
+The agent measures with a `Stopwatch` and returns `spawn_ms` (how long the
+host took to start the process) and, for waited runs, `duration_ms`. The
+former `finished_unix - started_unix` was one-second remote wall clock.
+`automate status` reports the last `spawn_ms` alongside the DVC round-trip of
+the same request, which separates "the host is slow to start PowerShell" from
+"the agent is slow to answer". `automate status` never spawns a process
+itself; that is an invariant, not an accident.
+
 ### Non-UI Commands
 
 | Command | Purpose |

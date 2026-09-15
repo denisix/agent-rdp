@@ -167,6 +167,8 @@ agent-rdp keyboard type "Hello, World!"        # Unicode, batched into one round
 agent-rdp keyboard type "text" --delay 20      # pace it if the remote app drops fast input
 agent-rdp keyboard paste "Привет, мир!"        # clipboard + Ctrl+V as one command
 agent-rdp keyboard press "ctrl+c"              # also alt+tab, enter, escape, f5, win+r
+agent-rdp keyboard send "left left right up" --interval-ms 80
+                                              # one call, one connection, focus held throughout
 agent-rdp keyboard down shift                  # hold across other commands
 agent-rdp keyboard up shift
 ```
@@ -174,6 +176,17 @@ agent-rdp keyboard up shift
 Prefer `keyboard paste` for long or non-Latin text: it cannot lose individual
 keystrokes, and leaves no gap for focus to move between setting the clipboard
 and pasting.
+
+Input is acknowledged. A keystroke that could not be encoded or written to the
+transport returns an error instead of reporting success, and a failed write
+ends the session rather than being logged while later commands keep answering
+from a dead socket. The same applies to mouse and scroll.
+
+`keyboard send` exists for sequences that have to arrive in order and on time.
+Separate `press` calls are each a process and a connection, half a second or
+more apart, and anything else driving the session can interleave between them.
+One `send` holds the session for the whole sequence. It is bounded: a sequence
+whose keys and interval would take more than 30 seconds is refused.
 
 ### Scroll
 
@@ -491,6 +504,33 @@ Once the transport is gone, `screenshot` and `locate` refuse rather than
 answer from the last frame the dead session painted, and `session info`
 reports it as disconnected.
 
+Fast detection has a cost worth stating plainly: an `os error 60` is usually
+this 30-second timer firing, not the network failing. Anything that interrupts
+the path for longer — a Wi-Fi roam, a VPN rehandshake, a laptop dozing — ends
+the session, where the operating system on its own would have waited out
+several minutes. `session info` reports wall-clock uptime alongside monotonic
+uptime, and the difference between them is how long the client host slept,
+which is often the whole explanation.
+
+**A dropped session can put itself back.** `connect --auto-reconnect` retains
+the request and re-establishes the session after a drop, backing off 5, 10,
+20, 40 then 60 seconds between attempts. `session info` gains an
+`auto_reconnect` block: whether it is armed, how many reconnects have
+succeeded, how many attempts this outage, when the outage began, when the
+next attempt is due, the last error, and why it stopped.
+
+It stops permanently on an authentication failure, rather than retrying a
+stale password until the account locks, and it gives up if the session keeps
+dying within two minutes of coming back. Disconnecting or shutting the daemon
+down disarms it; a `connect` of your own takes over from it.
+
+It is opt-in for one reason. An agent that survived the outage is adopted
+silently and nothing is typed, which covers every brief blip. But if the
+agent did not survive, the self-heal supervisor relaunches it, and that types
+Win+R into whatever has focus on the remote desktop. The supervisor waits
+until the session has been quiet for two minutes first, but that measures
+*our* input, not a person's.
+
 **The automation agent survives a reconnect.** When the transport drops, the
 agent keeps re-opening its channel for about 10 minutes rather than exiting, so
 a `connect` in that window adopts the running agent instead of launching one —
@@ -506,7 +546,25 @@ coming back from a different process taking the channel. When it is a
 different one, `adopted_replacement` is true and `previous_agent_pid` names
 the one before it; `agent_changes` counts how often that has happened against
 this host. Without those, an adoption reads as continuity, and anything the
-old agent was running is quietly gone.
+old agent was running is quietly gone. `agent_pid_history` keeps the last few,
+since one previous pid cannot describe three agents over a long run, and
+`survivor_outcome` says why no agent was adopted: none was ever seen, the
+reconnect window had expired, one was evicted for running older scripts, or
+the session went away.
+
+**The launch counters add up.** `total_launches` splits into three: launches
+that produced a working agent, `launches_without_handshake` (typed, but the
+agent never came back), and `launches_abandoned` (superseded before they
+typed anything). A test pins the identity, so a launch can no longer vanish
+between the counters the way an abandoned one used to.
+
+**Latency is measured where it happens.** A `run` reports `spawn_ms`, the time
+the remote host took to start the process, measured by the agent, and
+`duration_ms` for a waited run. `automate status` pairs the last spawn with
+the round-trip of the same request, which separates a host that is slow to
+start PowerShell from an agent that is slow to answer. The old
+`finished_unix - started_unix` was one-second remote wall clock and no use for
+benchmarking. `automate status` itself never spawns anything.
 
 **`desktop_alive` says whether there is a desktop to drive.** `State:
 Connected` does not imply it — the two drift apart, and a session has been
@@ -514,7 +572,15 @@ seen reporting Connected while its interactive desktop was dead for 25
 minutes. `automate status` reports `desktop_alive`, `input_desktop_name`
 (`Default` in ordinary use, `Winlogon` on the lock screen) and the foreground
 window title, so GUI automation can check before acting rather than after
-failing. `run` and file transfers work either way. `connect
+failing. `run` and file transfers work either way.
+
+**`automate window focus` reports what actually happened.** UI Automation
+refuses to focus plain WinForms windows, so there is a Win32 fallback that
+attaches to the foreground thread, restores the window if it is minimised and
+raises it. The result is then verified against the real foreground window,
+comparing root windows rather than exact handles, since focusing a child
+element is a legitimate success. The reply carries `focused`, `verified` and
+`method`. An element with no window handle can only be attempted, and says so. `connect
 --defer-agent` (which needs `--enable-win-automation`) skips the launch
 entirely and leaves the agent to `automate restart` — including when the
 survivor it found was running older scripts and had to be evicted, which
@@ -612,6 +678,7 @@ Add `--json` to any command:
 | `AGENT_RDP_DIAGNOSTICS` | Set to `0` to disable the request transcript and failure captures |
 | `AGENT_RDP_NO_AUTO_RELAUNCH` | Set to `1` before `connect` to stop the daemon relaunching the automation agent on its own (`automate restart` still works) |
 | `AGENT_RDP_NO_SILENCE_DROP` | `1` keeps the keep-alive traffic but disables the "server answered none of the last 3 refreshes" disconnect verdict |
+| `AGENT_RDP_RAW_STDERR` | `1` returns the remote command's stderr exactly as PowerShell rendered it, without stripping the error decoration |
 
 ## Node.js API
 

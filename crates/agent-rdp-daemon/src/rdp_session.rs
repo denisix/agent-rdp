@@ -414,17 +414,28 @@ impl RdpSession {
 
     /// Bound how long unacknowledged data may sit before the OS gives up.
     ///
-    /// Keepalive alone stopped being enough when the keep-alive PDU arrived:
-    /// keepalive probes are only sent on an *idle* connection, and a session
-    /// that writes a Refresh Rect every 45s is never idle. A black-holed path
-    /// then falls back to the OS retransmission timeout - minutes (the
-    /// reported `os error 60` after 4-5 of them) during which every
+    /// A black-holed path otherwise falls back to the OS retransmission
+    /// timeout - nine to sixteen minutes on macOS - during which every
     /// screenshot keeps succeeding against a stale framebuffer.
     ///
-    /// This is the option built for that case. It fires only when data *we*
-    /// sent goes unacknowledged for the whole window, so a server that is
-    /// merely quiet is unaffected; combined with the keep-alive the worst
-    /// case is one interval plus this timeout.
+    /// Be clear about the cost, because it is not free. Together with the
+    /// keepalive above, this compresses the OS's multi-minute tolerance to
+    /// about thirty seconds, so *any* interruption longer than that ends the
+    /// session: a Wi-Fi roam, a VPN rehandshake, a laptop dozing. A field
+    /// team saw three drops in eleven hours, all during idle periods and
+    /// none during an hour of continuous interactive use, with the network
+    /// demonstrably healthy either side of the gap - `os error 60` is this
+    /// timer firing, not the network failing. The trade is deliberate, since
+    /// a dead session must not be mistaken for a live one, but it is only
+    /// reasonable because `connect --auto-reconnect` can put the session
+    /// back without a human.
+    ///
+    /// It fires only when data *we* sent goes unacknowledged for the whole
+    /// window, so a server that is merely quiet is unaffected. Note that the
+    /// keep-alive puts data on the wire every interval, which means this
+    /// timer - and the keepalive probes, whose idle threshold is ten seconds,
+    /// not the keep-alive interval - are armed in every idle window rather
+    /// than never, as an earlier version of this comment claimed.
     fn apply_tcp_unacked_timeout(
         stream: &TcpStream,
         timeout: std::time::Duration,
