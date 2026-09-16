@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.7.22](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.21...agent-rdp-rust-v0.7.22) (2026-09-16)
+
+
+### Features
+
+* **automation:** make the agent's own numbers and its focus honest ([87625ee](https://github.com/denisix/agent-rdp/commit/87625ee54fca4b726f401fa477e01dff812ea163))
+* **daemon:** connect --auto-reconnect, so a night without a human is safe ([61ad3d3](https://github.com/denisix/agent-rdp/commit/61ad3d3a744aabe9f80dfcc1990a7b92617eff97))
+* **sdk:** expose keyboard.send, with the same bound as the CLI ([562900d](https://github.com/denisix/agent-rdp/commit/562900df07fe1bb435277bb7a8c62a3999ca9ca9))
+
+
+### Bug Fixes
+
+* close a second adversarial pass over the 0.7.22 fixes ([9d05dec](https://github.com/denisix/agent-rdp/commit/9d05dec88227064b804267351fa3468a0642710e))
+* close what an adversarial review found in the 0.7.22 work ([ebd5fcd](https://github.com/denisix/agent-rdp/commit/ebd5fcddb22e264f4bf7d37480dea02ebc599feb))
+* **daemon:** say when the credentials were rejected, and stop showing build paths ([1dfab16](https://github.com/denisix/agent-rdp/commit/1dfab168b1c23882edd7b33c8f0a333f2866a197))
+* **daemon:** stop a standing-down loop clearing a live attempt's flag ([e63ce5e](https://github.com/denisix/agent-rdp/commit/e63ce5ee0233493538c68b6d12deb96851ec35c5))
+* **daemon:** tell the caller when input never reached the socket ([3cbd9b8](https://github.com/denisix/agent-rdp/commit/3cbd9b88a3dd657e9a02efb54a25b9288f4fd408))
+
 ## [0.7.21](https://github.com/denisix/agent-rdp/compare/agent-rdp-rust-v0.7.20...agent-rdp-rust-v0.7.21) (2026-09-13)
 
 
