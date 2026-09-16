@@ -388,10 +388,10 @@ fn offline_status(state: &crate::automation::AutomationState) -> Response {
         last_spawn_request_ms: None,
     };
     fill_daemon_fields(&mut status, state);
-    // `fill_daemon_fields` reads these from the DVC state, which is exactly
-    // what is absent here; the explanation is `last_error`.
-    status.agent_instance_id = None;
-    status.agent_started_unix = None;
+    // The identity `fill_daemon_fields` reads off the DVC state is the last
+    // agent's, and while the agent is down that is worth having: it says
+    // which process went away. `agent_running: false` is what tells a caller
+    // it is historical, so it is left in place rather than blanked.
     // And it copies `state.last_error` verbatim, which would undo the
     // reasoning above: while a launch is running, "a launch is in progress"
     // is the current fact and the stale failure that preceded it is not.
@@ -1462,15 +1462,18 @@ pub fn tidy_powershell_stderr(stderr: &str, command_line: Option<&str>) -> Strin
         return stderr.to_string();
     }
 
-    let newline = if stderr.contains("\r\n") { "\r\n" } else { "\n" };
-    let lines: Vec<&str> = stderr.lines().collect();
+    // Split rather than `lines()`, so each line keeps its own `\r`. Picking
+    // one ending for the whole string rewrote a mixed-ending stderr, which
+    // is the same byte-exactness bug one size smaller. A trailing empty
+    // element is the final newline and is preserved with the rest.
+    let lines: Vec<&str> = stderr.split('\n').collect();
     let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
     let mut removed = 0usize;
     let mut i = 0;
 
     while i < lines.len() {
         let line = lines[i];
-        let trimmed = line.trim_start();
+        let trimmed = line.trim();
 
         // Pure decoration: never anything the user wrote.
         if trimmed.starts_with("+ CategoryInfo")
@@ -1490,7 +1493,7 @@ pub fn tidy_powershell_stderr(stderr: &str, command_line: Option<&str>) -> Strin
             let mut squiggle = false;
             let mut ours = false;
             while end < lines.len() {
-                let candidate = lines[end].trim_start();
+                let candidate = lines[end].trim();
                 if !candidate.starts_with('+') {
                     break;
                 }
@@ -1522,9 +1525,9 @@ pub fn tidy_powershell_stderr(stderr: &str, command_line: Option<&str>) -> Strin
     if kept.iter().all(|l| l.trim().is_empty()) {
         return String::new();
     }
-    let mut out = kept.join(newline);
-    if !out.is_empty() {
-        out.push_str(newline);
+    let mut out = kept.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
     }
     // Say what was taken away. Deleting evidence silently is the one thing
     // this must not do.
@@ -1544,11 +1547,13 @@ pub fn tidy_powershell_stderr(stderr: &str, command_line: Option<&str>) -> Strin
 fn is_echo_of_ours(content: &str, command_line: Option<&str>) -> bool {
     const MIN_MATCH: usize = 8;
     let needle = content.trim();
+    // Fails closed. A short fragment cannot be attributed, and short source
+    // lines are the common case in real PowerShell (`Get-Bad`, `exit 1`,
+    // `$x.Y()`), so treating them as ours deleted other people's
+    // diagnostics - the precise damage this check exists to prevent.
+    // Leaving a few lines of decoration in place is the cheaper mistake.
     if needle.len() < MIN_MATCH {
-        // Too short to attribute either way. The squiggle and the header
-        // already say this is a rendered position block, and a fragment this
-        // small carries no information a caller would miss.
-        return true;
+        return false;
     }
     if command_line.is_some_and(|cmd| cmd.contains(needle)) {
         return true;
@@ -2448,6 +2453,40 @@ mod stderr_tidy_tests {
         );
     }
 
+    /// The attribution check has to fail closed. Short source lines are the
+    /// common case in real PowerShell, and treating them as ours deleted
+    /// other people's diagnostics.
+    #[test]
+    fn a_short_echo_is_not_attributed_to_us() {
+        let raw = "At C:\\their\\build.ps1:3 char:5\n\
+                   +     Get-Bad\n\
+                   +     ~~~~~~~\n";
+        assert_eq!(
+            tidy_powershell_stderr(raw, Some("Start-Build")),
+            raw,
+            "seven characters cannot be attributed, so nothing is removed"
+        );
+    }
+
+    /// And the wrapper check has to be a whole line, not a substring of the
+    /// script. `actions.ps1` contains `} catch {` and `-ErrorAction Stop`
+    /// verbatim; a user script failing on such a line is not our decoration.
+    #[test]
+    fn a_common_powershell_idiom_is_not_our_wrapper() {
+        for idiom in ["$_.Exception.Message", "-ErrorAction Stop"] {
+            let raw = format!(
+                "At C:\\theirs.ps1:9 char:3\n\
+                 + {idiom}\n\
+                 + ~~~~~~~~~~~~~~~~~~~~\n"
+            );
+            assert_eq!(
+                tidy_powershell_stderr(&raw, Some("Invoke-Theirs")),
+                raw,
+                "a fragment our scripts happen to contain is not an echo of ours: {idiom}"
+            );
+        }
+    }
+
     /// Stderr that was nothing but decoration must come back empty. A
     /// caller testing `stderr.is_empty()` would otherwise see our own note
     /// and report a failure that did not happen.
@@ -2460,6 +2499,17 @@ mod stderr_tidy_tests {
 
     /// Windows sends CRLF. Silently rewriting it to LF the first time an
     /// error is tidied breaks any byte-exact comparison downstream.
+    /// Mixed endings must survive as they arrived. Choosing one ending for
+    /// the whole string was the same byte-exactness bug one size smaller.
+    #[test]
+    fn mixed_line_endings_are_not_normalised() {
+        let raw = "crlf line\r\nlf line\n\
+                   + CategoryInfo          : NotSpecified: (:) [Write-Error]\n";
+        let tidy = tidy_powershell_stderr(raw, None);
+        assert!(tidy.starts_with("crlf line\r\nlf line\n"), "{tidy:?}");
+        assert!(!tidy.contains("CategoryInfo"));
+    }
+
     #[test]
     fn crlf_survives_the_filter() {
         let raw = "OUT\r\n\

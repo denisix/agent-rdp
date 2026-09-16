@@ -694,8 +694,9 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
         let disconnect_before = ctx.last_disconnect.lock().unwrap().as_ref().map(|d| d.at);
         // Held for the whole attempt. A session that dies during the
         // bootstrap sends a drop event of its own, and the loop that event
-        // would start must see that one is already running.
-        ctx.auto_reconnect.lock().await.in_flight = true;
+        // would start must see that one is already running. The guard
+        // releases the flag however this ends, panic included.
+        let in_flight = crate::reconnect::InFlight::claim(ctx.auto_reconnect.clone()).await;
         let response = handlers::connect::handle(
             &ctx.rdp_session,
             &ctx.automation_state,
@@ -712,7 +713,7 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
         dropped_generation = ctx
             .session_generation
             .load(std::sync::atomic::Ordering::SeqCst);
-        ctx.auto_reconnect.lock().await.in_flight = false;
+        drop(in_flight);
 
         if response.success {
             info!("Session re-established after {} attempt(s)", attempt);

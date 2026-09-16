@@ -256,6 +256,41 @@ impl AutoReconnect {
 /// awaits; the accept loop must never lock it inline.
 pub type SharedAutoReconnect = Arc<tokio::sync::Mutex<AutoReconnect>>;
 
+/// Holds `in_flight` for the life of one attempt, and clears it however the
+/// attempt ends.
+///
+/// A straight-line `= true` / `.await` / `= false` pair loses the race with
+/// its own failure modes: `connect::handle` can panic - the codebase already
+/// assumes it can, which is why the frame processor is wrapped in
+/// `catch_unwind` - and the teardown task it runs in can be aborted. Either
+/// leaves the flag set for the daemon's lifetime, and with the flag set
+/// every future reconnect is refused for a reason that has not been true
+/// since. Cheaper to make the release structural than to remember it.
+pub struct InFlight(SharedAutoReconnect);
+
+impl InFlight {
+    pub async fn claim(auto: SharedAutoReconnect) -> Self {
+        auto.lock().await.in_flight = true;
+        Self(auto)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        // `Drop` cannot await. `try_lock` succeeds in every ordinary case
+        // (the attempt has finished; nothing else holds this for long), and
+        // the fallback task covers the contended one.
+        if let Ok(mut auto) = self.0.try_lock() {
+            auto.in_flight = false;
+            return;
+        }
+        let auto = self.0.clone();
+        tokio::spawn(async move {
+            auto.lock().await.in_flight = false;
+        });
+    }
+}
+
 /// What to journal about an attempt, with nothing that could carry a secret.
 ///
 /// `transcript::append_event` writes what it is given verbatim, and
@@ -360,9 +395,23 @@ mod tests {
             "the snapshot must read the flag, not assume it"
         );
         assert!(
-            body.contains("in_flight = true"),
-            "and the attempt must set it"
+            body.contains("InFlight::claim("),
+            "and the attempt must claim it"
         );
+    }
+
+    /// The flag must survive nothing. A panic inside `connect::handle` - the
+    /// codebase already assumes one can happen there - would otherwise pin
+    /// it true and refuse every later reconnect for a reason that stopped
+    /// being true minutes ago.
+    #[tokio::test]
+    async fn an_attempt_that_unwinds_still_releases_the_flag() {
+        let auto: SharedAutoReconnect = Arc::new(tokio::sync::Mutex::new(AutoReconnect::default()));
+        {
+            let _guard = InFlight::claim(auto.clone()).await;
+            assert!(auto.lock().await.in_flight, "claimed");
+        }
+        assert!(!auto.lock().await.in_flight, "released by the guard, not by a line of code");
     }
 
     /// The defect that made the whole feature one-shot. `connect::handle`

@@ -494,6 +494,29 @@ mod watchdog_tests {
         let fast = parse(&["keyboard", "send", "a b c", "--interval-ms", "10"]);
         assert!(watchdog_budget_ms(&slow) > watchdog_budget_ms(&fast));
 
+        // The ordering above is arithmetic and holds for any budget at all,
+        // so pin the budget itself: it must be the protocol's, the same
+        // number the validator used to admit the sequence. Counting only the
+        // gaps - as this did - meant the layers above agreed with each other
+        // and with nothing that actually happens on the wire.
+        let seq = parse(&["keyboard", "send", "ctrl+c a b", "--interval-ms", "70"]);
+        let Commands::Keyboard(ref keyboard) = seq.command else { unreachable!() };
+        let keys = ["ctrl+c".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(
+            cli::commands::keyboard::budget_ms(&keyboard.action),
+            agent_rdp_protocol::press_seq_hold_ms(&keys, Some(70)),
+            "the watchdog must cost the sequence the way the validator does"
+        );
+
+        // And a paced `type` is the same hazard: the session is held across
+        // its sleeps too.
+        let typed = parse(&["keyboard", "type", "y", "--delay", "200"]);
+        let Commands::Keyboard(ref keyboard) = typed.command else { unreachable!() };
+        assert_eq!(
+            cli::commands::keyboard::budget_ms(&keyboard.action),
+            agent_rdp_protocol::type_hold_ms("y", Some(200))
+        );
+
         // And an ordinary press still costs nothing extra.
         assert_eq!(
             watchdog_budget_ms(&parse(&["keyboard", "press", "enter"])),

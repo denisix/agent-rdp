@@ -1060,16 +1060,29 @@ pub fn lf(text: &str) -> String {
 }
 
 /// Embedded PowerShell agent script (main entry point).
-/// Whether a line echoed back in a PowerShell error came from the scripts
-/// we deploy, rather than from the remote command itself.
+/// Whether a line echoed back in a PowerShell error is one of ours.
 ///
 /// The command is delivered as one `-EncodedCommand` script, so PowerShell's
-/// position echo frequently shows our wrapper. Matching against the whole of
-/// `actions.ps1` rather than the wrapper heredocs alone is deliberate: every
-/// line of it is ours either way, and pulling the heredocs apart here would
-/// be one more thing to keep in step with the script.
+/// position echo frequently shows our wrapper rather than the user's
+/// command. The comparison is a **whole trimmed line**, against the lines of
+/// the script we actually deploy. A substring match over the file was far
+/// too loose: `actions.ps1` is eighteen hundred lines of ordinary
+/// PowerShell, so it contains `} catch {`, `-ErrorAction Stop` and
+/// `$_.Exception.Message` verbatim, and any user script failing on such a
+/// line had its diagnostic deleted as if it were our decoration.
 pub fn wrapper_contains(needle: &str) -> bool {
-    LIB_ACTIONS.contains(needle)
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+
+    static LINES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    let lines = LINES.get_or_init(|| {
+        LIB_ACTIONS
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.len() >= 8)
+            .collect()
+    });
+    lines.contains(needle.trim())
 }
 
 const AGENT_SCRIPT: &str = include_str!("scripts/agent.ps1");
@@ -2060,12 +2073,17 @@ mod tests {
         assert!(types.contains("public static bool IsForeground"));
 
         // And the reply says what happened rather than always succeeding.
-        assert!(actions.contains("focused = $focused; verified = $true"));
+        assert!(actions.contains("focused = $focused; verified = $attempted"));
+        // A window that was already foreground is not evidence that focusing
+        // the element worked: if UIA threw, the Win32 fallback never ran and
+        // nothing about the element was checked.
+        assert!(actions.contains("$alreadyForeground = $focused"));
+        assert!(actions.contains("already_foreground = $alreadyForeground"));
         // Including when both attempts threw. A hardcoded $true here is the
         // precise defect the rewrite exists to remove, so it must not come
         // back in the branch that replaced it.
         assert!(
-            actions.contains("success = ($attempted -or $focused)"),
+            actions.contains("action = \"focus\"; success = $attempted"),
             "nothing attempted is not a success"
         );
         assert!(

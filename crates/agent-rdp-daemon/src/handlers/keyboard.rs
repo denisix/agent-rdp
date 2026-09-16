@@ -239,6 +239,9 @@ struct KeyInfo {
 /// Down in order, up in reverse, with the same small gaps as before. The
 /// caller holds the session lock for the whole call, so nothing can
 /// interleave between the down and the up.
+/// Whole-loop budget for releasing a partially pressed combination.
+const RELEASE_BUDGET: Duration = Duration::from_secs(3);
+
 async fn press_combination(
     rdp: &RdpSession,
     key_infos: &[KeyInfo],

@@ -186,7 +186,10 @@ from a dead socket. The same applies to mouse and scroll.
 Separate `press` calls are each a process and a connection, half a second or
 more apart, and anything else driving the session can interleave between them.
 One `send` holds the session for the whole sequence. It is bounded: a sequence
-whose keys and interval would take more than 30 seconds is refused.
+whose keys and interval would take more than 30 seconds is refused, and so is
+a `type --delay-ms` whose pacing would. Both hold the session across their
+sleeps, so an unbounded one blocks screenshots and even `disconnect`. Use
+`keyboard paste` for anything long.
 
 ### Scroll
 
@@ -588,7 +591,9 @@ attaches to the foreground thread, restores the window if it is minimised and
 raises it. The result is then verified against the real foreground window,
 comparing root windows rather than exact handles, since focusing a child
 element is a legitimate success. The reply carries `focused`, `verified` and
-`method`. An element with no window handle can only be attempted, and says so. `connect
+`method` and `already_foreground`. An element with no window handle can only
+be attempted, and says so. A window that was already in the foreground is
+reported as such rather than counted as a verified success. `connect
 --defer-agent` (which needs `--enable-win-automation`) skips the launch
 entirely and leaves the agent to `automate restart` — including when the
 survivor it found was running older scripts and had to be evicted, which

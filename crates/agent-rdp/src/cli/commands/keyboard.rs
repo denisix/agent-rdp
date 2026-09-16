@@ -21,10 +21,7 @@ pub fn budget_ms(action: &KeyboardAction) -> u64 {
             let parsed: Vec<String> = keys.split_whitespace().map(str::to_string).collect();
             agent_rdp_protocol::press_seq_hold_ms(&parsed, *interval_ms)
         }
-        KeyboardAction::Type { text, delay } => {
-            let batches = (text.encode_utf16().count() as u64).div_ceil(64);
-            batches.saturating_sub(1).saturating_mul(delay.unwrap_or(0))
-        }
+        KeyboardAction::Type { text, delay } => agent_rdp_protocol::type_hold_ms(text, *delay),
         _ => 0,
     }
 }

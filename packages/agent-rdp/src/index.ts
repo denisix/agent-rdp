@@ -106,6 +106,20 @@ const PRESS_KEY_GAP_MS = 10;
 const PRESS_HOLD_MS = 50;
 
 /**
+ * How long a paced `type` holds the session. Mirrors
+ * `agent_rdp_protocol::type_hold_ms`. Unpaced typing sleeps not at all and
+ * costs nothing here.
+ */
+function typeHoldMs(text: string, delayMs?: number): number {
+  if (!delayMs) {
+    return 0;
+  }
+  // UTF-16 code units, as the wire format counts them.
+  const batches = Math.ceil(text.length / 64);
+  return Math.max(0, batches - 1) * delayMs;
+}
+
+/**
  * How long a sequence holds the session. Mirrors
  * `agent_rdp_protocol::press_seq_hold_ms`: the gaps are the smaller half,
  * since each combination also costs a hold plus a gap per key-down and
@@ -171,8 +185,7 @@ export function requestTimeout(request: Request, base: number): number {
         return base + pressSeqHoldMs(kb.keys ?? [], kb.interval_ms);
       }
       if (kb.action === 'type' && kb.delay_ms) {
-        const batches = Math.ceil([...(kb.text ?? '')].length / 64);
-        return base + Math.max(0, batches - 1) * kb.delay_ms;
+        return base + typeHoldMs(kb.text ?? '', kb.delay_ms);
       }
       return base;
     }
@@ -251,6 +264,15 @@ export class KeyboardController {
 
   /** Type a text string (Unicode). */
   async type(options: KeyboardTypeOptions): Promise<void> {
+    // The daemon holds the session across the pacing sleeps, so a large
+    // `delayMs` is a session-wide stall, not just a slow call.
+    const hold = typeHoldMs(options.text, options.delayMs);
+    if (hold > PRESS_SEQ_MAX_MS) {
+      throw new Error(
+        `that pacing would hold the session for ${Math.round(hold / 1000)}s; the limit is ` +
+          `${PRESS_SEQ_MAX_MS / 1000}s. Send it in several calls, or use paste()`,
+      );
+    }
     await this.rdp._send({
       type: 'keyboard',
       action: 'type',

@@ -1112,7 +1112,8 @@ impl RdpSession {
         // call half-typed into a live application with nothing wrong at the
         // transport at all. Each slept interval therefore pushes the
         // deadline out by exactly what it slept.
-        let mut deadline = std::time::Instant::now() + INPUT_SEND_TIMEOUT;
+        let started_at = std::time::Instant::now();
+        let mut deadline = started_at + INPUT_SEND_TIMEOUT;
 
         for chunk in units.chunks(UNITS_PER_BATCH) {
             if !first {
@@ -1125,9 +1126,15 @@ impl RdpSession {
 
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
+                // Not `INPUT_SEND_TIMEOUT`: the deadline has been extended
+                // by the caller's own pacing, so naming the constant would
+                // report a budget that is not the one that ran out.
+                let budget = deadline
+                    .saturating_duration_since(started_at)
+                    .as_secs_f64();
                 return Err(RdpError::Unresponsive(format!(
-                    "typing did not finish within {}s; {} of {} code units were sent",
-                    INPUT_SEND_TIMEOUT.as_secs(),
+                    "typing did not finish within {:.0}s; {} of {} code units were sent",
+                    budget,
                     sent,
                     units.len()
                 )));

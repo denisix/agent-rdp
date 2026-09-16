@@ -353,10 +353,12 @@ can steal focus mid-sequence. Separate `press` calls are half a second apart
 and can interleave with other input.
 
 **`automate window focus` tells you whether it worked.** It returns
-`focused`, `verified` and `method`: UI Automation refuses plain WinForms
-windows, so there is a Win32 fallback, and the result is checked against the
-actual foreground window rather than assumed. An element with no window
-handle can only be attempted, and says so.
+`focused`, `verified`, `method` and `already_foreground`: UI Automation
+refuses plain WinForms windows, so there is a Win32 fallback, and the result
+is checked against the actual foreground window rather than assumed. An
+element with no window handle can only be attempted, and says so. A window
+that was already in the foreground is reported as such rather than counted as
+a verified success.
 
 **Reconnecting usually leaves the remote desktop alone now.** The Windows agent
 outlives a transport drop: it keeps re-opening its channel for about 10 minutes,

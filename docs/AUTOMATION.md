@@ -279,9 +279,12 @@ without ever checking.
    against the target's root. Root comparison, not handle equality, because
    UIA legitimately focuses a *child* element.
 
-The reply carries `focused`, `verified` and `method`. `success` keeps its
-existing meaning - "attempted without throwing" - because an element with no
-window handle can only be attempted and there is nothing to verify.
+The reply carries `focused`, `verified`, `method` and `already_foreground`.
+`success` is `$attempted` - "attempted without throwing" - because an element
+with no window handle can only be attempted and there is nothing to verify.
+`verified` follows it: when the root window was *already* foreground the
+fallback never runs, so a UIA failure there proves nothing about the element
+and must not be reported as a verified success.
 
 ### Launch accounting
 

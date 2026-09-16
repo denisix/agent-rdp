@@ -535,6 +535,13 @@ function Invoke-Window {
 
             $focused = $false
             try { $focused = [AgentDesktop]::IsForeground($hwnd) } catch {}
+            # Whether the window was already there before we did anything.
+            # It matters: if UIA threw and the root window happens to be
+            # foreground, the fallback never runs, and reporting that as a
+            # verified success would be the same lie in a narrower branch -
+            # nothing was attempted, and nothing was checked about the
+            # element itself.
+            $alreadyForeground = $focused
             if (-not $focused) {
                 try {
                     [void][AgentDesktop]::Focus($hwnd)
@@ -560,8 +567,9 @@ function Invoke-Window {
             # to fix, so it must not creep back: if UIA refused the element
             # and the Win32 fallback threw too, nothing was attempted.
             return @{
-                action = "focus"; success = ($attempted -or $focused)
-                focused = $focused; verified = $true; method = $method
+                action = "focus"; success = $attempted
+                focused = $focused; verified = $attempted; method = $method
+                already_foreground = $alreadyForeground
             }
         }
         "maximize" {

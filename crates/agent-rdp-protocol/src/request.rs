@@ -291,13 +291,53 @@ pub fn press_seq_hold_ms(keys: &[String], interval_ms: Option<u64>) -> u64 {
         .iter()
         .map(|combo| {
             let parts = combo.split('+').filter(|p| !p.is_empty()).count().max(1) as u64;
-            PRESS_HOLD_MS + 2 * parts * PRESS_KEY_GAP_MS
+            // Two scancodes per part, not one. A shifted symbol on a US
+            // layout ("!", "?", "~") expands to SHIFT plus its base key, and
+            // the daemon sleeps `PRESS_KEY_GAP_MS` after every scancode in
+            // both directions. Counting parts let 400 shifted symbols at the
+            // minimum interval pass a 30s bound and hold the session for 38.
+            // Over-estimating an unshifted sequence costs a caller some
+            // headroom; under-estimating breaks the only guarantee here.
+            PRESS_HOLD_MS + 4 * parts * PRESS_KEY_GAP_MS
         })
         .sum();
     gaps.saturating_add(presses)
 }
 
+/// How long a paced `type` will hold the session, in milliseconds.
+///
+/// The same hazard as a key sequence, and the same lock: the handler holds
+/// the session across the whole call, so `--delay-ms 3600000` over a short
+/// string sleeps for an hour with `screenshot`, `disconnect` and the
+/// reconnect loop queued behind it. Only the sends were ever bounded.
+pub fn type_hold_ms(text: &str, delay_ms: Option<u64>) -> u64 {
+    let Some(delay) = delay_ms else {
+        return 0;
+    };
+    let batches = (text.encode_utf16().count() as u64).div_ceil(TYPE_UNITS_PER_BATCH);
+    batches.saturating_sub(1).saturating_mul(delay)
+}
+
+/// UTF-16 code units the daemon sends per input PDU. FastPath encodes the
+/// event count in one byte, and there are two events per unit.
+pub const TYPE_UNITS_PER_BATCH: u64 = 64;
+
 pub fn validate_keyboard_request(request: &KeyboardRequest) -> Result<(), String> {
+    if let KeyboardRequest::Type { text, delay_ms } = request {
+        let worst = type_hold_ms(text, *delay_ms);
+        if worst > PRESS_SEQ_MAX_MS {
+            return Err(format!(
+                "typing {} characters {}ms apart would hold the session for {}s, and nothing \
+                 else can use it meanwhile; the limit is {}s. Send it in several calls, or \
+                 use `keyboard paste`",
+                text.chars().count(),
+                delay_ms.unwrap_or(0),
+                worst / 1000,
+                PRESS_SEQ_MAX_MS / 1000
+            ));
+        }
+        return Ok(());
+    }
     let KeyboardRequest::PressSeq { keys, interval_ms } = request else {
         return Ok(());
     };
@@ -1047,7 +1087,7 @@ mod qa_0_7_22_validation_tests {
         // gaps let 6001 keys 5ms apart through, and the daemon then held
         // the session - and with it screenshots, disconnect and the
         // reconnect loop - for seven and a half minutes.
-        let per_key = PRESS_HOLD_MS + 2 * PRESS_KEY_GAP_MS;
+        let per_key = PRESS_HOLD_MS + 4 * PRESS_KEY_GAP_MS;
         let exact = (PRESS_SEQ_MAX_MS + 100) / (100 + per_key);
         assert!(validate_keyboard_request(&seq(exact as usize, Some(100))).is_ok());
         assert!(validate_keyboard_request(&seq(exact as usize + 1, Some(100))).is_err());
@@ -1069,8 +1109,49 @@ mod qa_0_7_22_validation_tests {
         );
     }
 
+    /// A paced `type` holds the session exactly as a sequence does, and was
+    /// the one path left unbounded: `--delay-ms 3600000` over a short string
+    /// slept for an hour with the session lock held, queueing `screenshot`,
+    /// `disconnect` and the reconnect loop behind it.
+    #[test]
+    fn paced_typing_is_bounded_too() {
+        let typed = |text: &str, delay: Option<u64>| KeyboardRequest::Type {
+            text: text.to_string(),
+            delay_ms: delay,
+        };
+
+        // Unpaced is free however long it is: nothing sleeps.
+        assert!(validate_keyboard_request(&typed(&"x".repeat(100_000), None)).is_ok());
+        // One batch has no gaps either.
+        assert!(validate_keyboard_request(&typed("short", Some(3_600_000))).is_ok());
+
+        let refused = validate_keyboard_request(&typed(&"x".repeat(200), Some(3_600_000)))
+            .expect_err("two batches an hour apart");
+        assert!(refused.contains("hold the session"), "says why: {refused}");
+        assert!(refused.contains("keyboard paste"), "and what to do instead: {refused}");
+
+        // The ordinary pacing a remote app needs still fits.
+        assert!(validate_keyboard_request(&typed(&"x".repeat(4_000), Some(20))).is_ok());
+    }
+
+    /// The model has to cover what the daemon actually sends. A shifted
+    /// symbol on a US layout is SHIFT plus its base key - two scancodes, two
+    /// gaps each way - so counting `+`-separated parts let 400 of them at
+    /// the minimum interval pass a 30s bound and hold the session for 38.
+    #[test]
+    fn the_hold_is_counted_in_scancodes_not_in_plus_signs() {
+        let symbols = KeyboardRequest::PressSeq {
+            keys: vec!["!".to_string(); 400],
+            interval_ms: Some(PRESS_SEQ_MIN_INTERVAL_MS),
+        };
+        assert!(
+            validate_keyboard_request(&symbols).is_err(),
+            "400 shifted symbols really hold the session for ~38s"
+        );
+    }
+
     /// Everything else is unaffected - the validator is only about
-    /// sequences.
+    /// sequences and paced typing.
     #[test]
     fn other_keyboard_requests_are_never_refused() {
         assert!(validate_keyboard_request(&KeyboardRequest::Press { keys: "ctrl+c".into() }).is_ok());

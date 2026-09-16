@@ -101,7 +101,19 @@ parser and the SDK.
 the connect after a drop, with backoff 5/10/20/40/60s. `should_attempt` is the
 pure decision and refuses unless: enabled, a request was retained, no
 permanent stop, none in flight, the current session generation still equals
-the dropped one, and `connect_serial` is unchanged. That serial is bumped
+the dropped one, and `connect_serial` is unchanged. **The generation
+baseline moves.** `connect::handle` bumps the generation before it does
+anything else, so after the loop's own failed attempt the counter is one
+ahead - comparing the outage's original value against it made the loop
+conclude it had been superseded *by itself*, giving up after exactly one
+attempt per outage and never reaching the 10/20/40/60 rungs. Adopting our own
+bump is safe only because a user's connect bumps `connect_serial` too, and
+that is a separate guard. `in_flight` is held by an `InFlight` guard rather
+than an assignment pair: `connect::handle` can panic and the task can be
+aborted, and either would pin the flag and refuse every later reconnect.
+`stand_down` deliberately does *not* clear it - the loop standing down is
+usually the one that found an attempt already running, and clearing the
+running one's flag is the opposite of the check it just made. That serial is bumped
 **only by user-originated** `Connect`/`Disconnect`/`Shutdown`, which is how the
 loop tells a user's action from its own; `Disconnect` and `Shutdown` also
 `disarm()` explicitly in `process_request` *before* dispatch, because
@@ -139,7 +151,10 @@ a dead socket indefinitely - it now stamps `drop_reason` and ends the session,
 the same move `record_send_failure` makes for keep-alive. `send_input`
 inherits the RDPDR stall, hence `INPUT_SEND_TIMEOUT` (15s); `send_text` must
 compute **one whole-call deadline**, not one per 64-unit batch, or a
-4000-character type gets 63x that. `mouse`, `scroll`, the viewer and
+4000-character type gets 63x that. That deadline budgets the *sends*, and
+each slept `delay_ms` pushes it out by what it slept - charging the caller's
+own pacing to a transport budget failed `type --delay-ms 500` over 2000
+characters half-typed into a live application with nothing wrong at all. `mouse`, `scroll`, the viewer and
 `send_key_press` share the fix, so a Win+R whose keystrokes failed to write
 now fails the launch instead of counting as typed.
 
@@ -147,7 +162,24 @@ now fails the launch instead of counting as typed.
 keys is the interleaving defect it exists to fix, so the worst case must be
 bounded: `validate_keyboard_request` refuses a sequence longer than
 `PRESS_SEQ_MAX_MS` (30s), shared by daemon, CLI parser and SDK like the
-keep-alive rule. Plain `Press` holds the lock across the combination too. The
+keep-alive rule. The bound is `press_seq_hold_ms`, the *whole* hold - gaps
+plus `PRESS_HOLD_MS` and four `PRESS_KEY_GAP_MS` per part of each
+combination, since a shifted symbol on a US layout expands to two scancodes
+and the daemon sleeps after each one in both directions. Bounding the gaps
+alone admitted 6001 keys 5ms apart and then held the session - and with it
+screenshots, `disconnect` and the reconnect loop - for seven and a half
+minutes. `type_hold_ms` bounds the paced-`type` path the same way: same lock,
+same kind of sleeps, and `--delay-ms 3600000` slept for an hour with
+everything else queued behind it. Validation runs once at the top of the
+handler for every variant, not inside one branch.
+
+`press_combination` releases whatever it managed to press before reporting a
+failure - a key-up lost to a dying transport leaves a modifier held and turns
+every later keystroke into a chord - under a whole-loop `RELEASE_BUDGET`,
+since each send can block for `INPUT_SEND_TIMEOUT` and four of them would add
+a minute to a hold certified at thirty seconds.
+
+Plain `Press` holds the lock across the combination too. The
 watchdog had no keyboard arm at all; both `send --interval-ms` and
 `type --delay-ms` need one (`keyboard_layers_are_ordered`).
 
@@ -165,12 +197,14 @@ foreground lock is what makes a bare `SetForegroundWindow` a no-op from a
 background agent), restores if iconic, raises, and detaches in a `finally`.
 Verification compares `GetAncestor(GA_ROOT)` of the foreground window against
 the target's, because UIA legitimately focuses a *child* element and bare
-handle equality would call a real success a failure. The reply carries
-`focused`, `verified` and `method`; `success` is `$attempted -or $focused`,
-keeping its old meaning of "attempted without throwing" - it must not go back
-to a hardcoded `$true`, which is what reported a focus failure as success in
-the first place, since an element with no window handle can only
-be attempted.
+handle equality would call a real success a failure. The reply carries `focused`, `verified`,
+`method` and `already_foreground`; `success` is `$attempted`, its old meaning
+of "attempted without throwing" - it must not go back to a hardcoded `$true`,
+which is what reported a focus failure as success in the first place.
+`verified` follows `$attempted` for the same reason: a window that was
+*already* foreground when UIA threw proves nothing about the element, and
+folding that into a verified success is the same lie one branch narrower. An
+element with no window handle can only be attempted.
 
 **The launch counters reconcile.** `total_launches = our_changes +
 launches_without_handshake + launches_abandoned`, pinned by
@@ -191,7 +225,12 @@ decoration, not the wrapper markers - the position echo shows the *user's*
 line. `+ CategoryInfo` and `+ FullyQualifiedErrorId` always go; an
 `At line:N char:M` block goes only when it contains a squiggle-only line *and*
 its echoed source matches the run's own `command_line` or the embedded
-wrapper (`automation::wrapper_contains`). The squiggle alone is not enough: a
+wrapper (`automation::wrapper_contains`, a **whole trimmed line** against the
+deployed script - a substring match over eighteen hundred lines of ordinary
+PowerShell matched `} catch {` and `-ErrorAction Stop`). Attribution fails
+*closed*: a fragment under eight characters is not ours, because short source
+lines are the common case and keeping some decoration is the cheaper mistake.
+The squiggle alone is not enough: a
 remote tool printing PowerShell diagnostics of its own is producing output,
 and deleting it is the damage this filter is most likely to do. Line endings
 are preserved, and stderr that was nothing but decoration comes back empty
