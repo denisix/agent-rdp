@@ -512,6 +512,14 @@ several minutes. `session info` reports wall-clock uptime alongside monotonic
 uptime, and the difference between them is how long the client host slept,
 which is often the whole explanation.
 
+**An empty password is refused.** It is almost always a secret lookup that
+returned nothing, and the server cannot tell it from a wrong one, so the
+failure arrives minutes later looking like an authentication problem.
+`--allow-empty-password` (or `allowEmptyPassword` in the SDK) is the escape
+hatch for an account that genuinely has none. Related: a rejected credential
+now reports as an authentication failure rather than a generic connection
+failure, and error messages no longer carry build paths from our own machine.
+
 **A dropped session can put itself back.** `connect --auto-reconnect` retains
 the request and re-establishes the session after a drop, backing off 5, 10,
 20, 40 then 60 seconds between attempts. `session info` gains an

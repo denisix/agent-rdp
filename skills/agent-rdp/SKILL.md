@@ -321,6 +321,13 @@ the daemon is from a different agent-rdp version than the CLI (it outlived an
 upgrade): run `connect` again, which replaces it — every other command refuses
 rather than silently driving old code.
 
+**An empty password is refused** before the connection is attempted, since
+it is nearly always a secret lookup that came back empty and the server's
+rejection arrives minutes later looking like something else. Use
+`--allow-empty-password` if the account really has none. A rejected
+credential is now reported as an authentication failure rather than a
+generic connection failure.
+
 **A dropped transport can put itself back.** `connect --auto-reconnect`
 retains the request and re-establishes the session on a drop, with backoff.
 It is opt-in because recovery is not free: an agent that survived the outage
