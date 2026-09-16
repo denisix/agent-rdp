@@ -703,6 +703,7 @@ await rdp.mouse.drag({ from: { x: 100, y: 100 }, to: { x: 500, y: 500 } });
 await rdp.keyboard.type({ text: 'Hello World' });
 await rdp.keyboard.paste('Привет, мир!');       // reliable for long/non-Latin text
 await rdp.keyboard.press({ keys: 'ctrl+c' });
+await rdp.keyboard.send({ keys: 'left left right up', intervalMs: 80 });  // one call, one connection
 await rdp.keyboard.down('shift'); await rdp.keyboard.up('shift');
 
 await rdp.scroll.down({ amount: 5 });           // default 3; { x, y } to target a point

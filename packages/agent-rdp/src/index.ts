@@ -41,6 +41,7 @@ import {
   ScrollOptions,
   KeyboardTypeOptions,
   KeyboardPressOptions,
+  KeyboardSendOptions,
   ClipboardSetOptions,
   LocateOptions,
   LocateClickResult,
@@ -93,6 +94,15 @@ const KILL_VERIFY_MS = 20_000;
  */
 const DAEMON_SLACK_MS = 30_000;
 
+/**
+ * Mirrors `agent_rdp_protocol::PRESS_SEQ_*`. A key sequence holds the session
+ * for its whole duration, so the bound is enforced here as well as in the
+ * daemon - the same arrangement as the keep-alive minimum.
+ */
+const PRESS_SEQ_MAX_MS = 30_000;
+const PRESS_SEQ_MIN_INTERVAL_MS = 5;
+const DEFAULT_PRESS_SEQ_INTERVAL_MS = 40;
+
 /** Socket timeout for one request: the base, extended per command. */
 export function requestTimeout(request: Request, base: number): number {
   switch (request.type) {
@@ -128,6 +138,27 @@ export function requestTimeout(request: Request, base: number): number {
         return Math.max(base, DAEMON_SLACK_MS) + (op.timeout_ms ?? 30_000) + INDETERMINATE_MS;
       }
       return base + INDETERMINATE_MS;
+    }
+    case 'keyboard': {
+      // The daemon holds the session for the whole sequence (or for the
+      // paced batches of a `type`), so the socket must outlast it.
+      const kb = request as {
+        action?: string;
+        keys?: string[];
+        interval_ms?: number;
+        text?: string;
+        delay_ms?: number;
+      };
+      if (kb.action === 'press_seq') {
+        const count = kb.keys?.length ?? 0;
+        const interval = kb.interval_ms ?? DEFAULT_PRESS_SEQ_INTERVAL_MS;
+        return base + Math.max(0, count - 1) * interval + count * 120;
+      }
+      if (kb.action === 'type' && kb.delay_ms) {
+        const batches = Math.ceil([...(kb.text ?? '')].length / 64);
+        return base + Math.max(0, batches - 1) * kb.delay_ms;
+      }
+      return base;
     }
     case 'locate': {
       const wait = (request as { wait_ms?: number }).wait_ms;
@@ -215,6 +246,39 @@ export class KeyboardController {
   /** Press a key combination (e.g., 'ctrl+c', 'alt+tab') or single key (e.g., 'enter'). */
   async press(options: KeyboardPressOptions): Promise<void> {
     await this.rdp._send({ type: 'keyboard', action: 'press', keys: options.keys });
+  }
+
+  /**
+   * Press several keys in order, over one connection.
+   *
+   * Separate `press` calls are separate round trips, so keys land hundreds of
+   * milliseconds apart and anything else driving the session can interleave
+   * between them. This holds the session for the whole sequence, which is why
+   * the sequence is bounded: keys and interval together may not exceed 30s.
+   */
+  async send(options: KeyboardSendOptions): Promise<void> {
+    const keys = Array.isArray(options.keys)
+      ? options.keys
+      : options.keys.split(/\s+/).filter((k) => k.length > 0);
+    if (keys.length === 0) {
+      throw new Error('keyboard send needs at least one key');
+    }
+    const interval = options.intervalMs ?? DEFAULT_PRESS_SEQ_INTERVAL_MS;
+    if (interval < PRESS_SEQ_MIN_INTERVAL_MS) {
+      throw new Error(`interval_ms must be at least ${PRESS_SEQ_MIN_INTERVAL_MS}ms`);
+    }
+    const span = (keys.length - 1) * interval;
+    if (span > PRESS_SEQ_MAX_MS) {
+      throw new Error(
+        `that sequence would hold the session for ${span}ms; the limit is ${PRESS_SEQ_MAX_MS}ms`,
+      );
+    }
+    await this.rdp._send({
+      type: 'keyboard',
+      action: 'press_seq',
+      keys,
+      interval_ms: options.intervalMs,
+    });
   }
 
   /** Press and hold a key without releasing it (for shift-click, hold-and-drag, ...). */

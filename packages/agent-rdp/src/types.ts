@@ -250,6 +250,20 @@ export interface KeyboardPressOptions {
   keys: string;
 }
 
+/** Options for sending several key presses in order, in one call. */
+export interface KeyboardSendOptions {
+  /**
+   * Keys in order. Each takes the same syntax as `press`, so 'ctrl+c' works.
+   * Accepts an array, or a space-separated string like 'left left right up'.
+   */
+  keys: string[] | string;
+  /**
+   * Milliseconds between keys (default 40, minimum 5). The whole sequence is
+   * bounded at 30s, because the session is held for its duration.
+   */
+  intervalMs?: number;
+}
+
 /** Options for clipboard set operations. */
 export interface ClipboardSetOptions {
   /** Text to set. */
