@@ -588,6 +588,16 @@ struct ReconnectContext {
 /// each attempt, because an outage lasts minutes and the operator can act at
 /// any point during one.
 async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_at_arm: u64) {
+    // Re-baselined after each of our own failed attempts. `connect::handle`
+    // bumps the session generation before it does anything else, so an
+    // attempt that fails to reach the host still leaves the counter one
+    // ahead - and comparing the *original* dropped generation against it on
+    // the next pass made the loop conclude it had been superseded by itself.
+    // One attempt per outage, then silence for the rest of the night, which
+    // is precisely the failure this module exists to prevent. Adopting our
+    // own bump is safe because a *user* connect bumps `connect_serial` too,
+    // and that guard is checked separately.
+    let mut dropped_generation = dropped_generation;
     let outage_began = std::time::SystemTime::now();
     {
         let mut auto = ctx.auto_reconnect.lock().await;
@@ -595,6 +605,7 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
             return;
         }
         if !auto.note_outage(outage_began) {
+            auto.stand_down();
             error!(
                 "Giving up on automatic reconnection: {}",
                 auto.stopped_reason.as_deref().unwrap_or("repeated short sessions")
@@ -615,7 +626,7 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
                 enabled: auto.enabled(),
                 have_request: auto.request().is_some(),
                 stopped: auto.stopped_reason.is_some(),
-                in_flight: false,
+                in_flight: auto.in_flight,
                 dropped_generation,
                 current_generation: ctx
                     .session_generation
@@ -628,9 +639,13 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
 
         if let Err(why) = crate::reconnect::should_attempt(&snapshot) {
             info!("Not reconnecting: {}", why);
+            ctx.auto_reconnect.lock().await.stand_down();
             return;
         }
-        let Some(request) = request else { return };
+        let Some(request) = request else {
+            ctx.auto_reconnect.lock().await.stand_down();
+            return;
+        };
 
         let wait = crate::reconnect::backoff(attempt);
         {
@@ -647,7 +662,7 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
                 enabled: auto.enabled(),
                 have_request: auto.request().is_some(),
                 stopped: auto.stopped_reason.is_some(),
-                in_flight: false,
+                in_flight: auto.in_flight,
                 dropped_generation,
                 current_generation: ctx
                     .session_generation
@@ -657,6 +672,8 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
             };
             if let Err(why) = crate::reconnect::should_attempt(&now) {
                 info!("Abandoning the reconnect: {}", why);
+                drop(auto);
+                ctx.auto_reconnect.lock().await.stand_down();
                 return;
             }
         }
@@ -668,6 +685,10 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
         );
 
         let disconnect_before = ctx.last_disconnect.lock().unwrap().as_ref().map(|d| d.at);
+        // Held for the whole attempt. A session that dies during the
+        // bootstrap sends a drop event of its own, and the loop that event
+        // would start must see that one is already running.
+        ctx.auto_reconnect.lock().await.in_flight = true;
         let response = handlers::connect::handle(
             &ctx.rdp_session,
             &ctx.automation_state,
@@ -679,6 +700,12 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
             handlers::connect::ConnectOrigin::AutoReconnect,
         )
         .await;
+        // Our own attempt bumped the generation; anything it did not bump is
+        // someone else's, and the serial guard covers that case.
+        dropped_generation = ctx
+            .session_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        ctx.auto_reconnect.lock().await.in_flight = false;
 
         if response.success {
             info!("Session re-established after {} attempt(s)", attempt);
@@ -723,6 +750,7 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
             auto.stop(why);
             return;
         }
+        drop(auto);
     }
 }
 

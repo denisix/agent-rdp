@@ -269,6 +269,34 @@ pub const PRESS_SEQ_MIN_INTERVAL_MS: u64 = 5;
 ///
 /// Pure, and shared by the CLI, the SDK and the daemon so all three agree
 /// without a round trip - the same arrangement as `validate_connect_request`.
+/// Gap the daemon leaves after each key-down and key-up in a combination.
+pub const PRESS_KEY_GAP_MS: u64 = 10;
+/// How long the daemon holds a combination down before releasing it.
+pub const PRESS_HOLD_MS: u64 = 50;
+
+/// How long a sequence will hold the session, in milliseconds.
+///
+/// The gaps between combinations are the smaller half. Each combination also
+/// costs a hold plus a gap per key-down and key-up, and the session lock is
+/// held across all of it - bounding only the gaps let 6001 keys 5ms apart
+/// pass validation and then hold the session for seven and a half minutes,
+/// blocking screenshots, disconnect and the reconnect loop alike.
+///
+/// Shared so the daemon, the CLI watchdog and the SDK cannot disagree about
+/// what the sequence costs.
+pub fn press_seq_hold_ms(keys: &[String], interval_ms: Option<u64>) -> u64 {
+    let interval = interval_ms.unwrap_or(DEFAULT_PRESS_SEQ_INTERVAL_MS);
+    let gaps = (keys.len() as u64).saturating_sub(1).saturating_mul(interval);
+    let presses: u64 = keys
+        .iter()
+        .map(|combo| {
+            let parts = combo.split('+').filter(|p| !p.is_empty()).count().max(1) as u64;
+            PRESS_HOLD_MS + 2 * parts * PRESS_KEY_GAP_MS
+        })
+        .sum();
+    gaps.saturating_add(presses)
+}
+
 pub fn validate_keyboard_request(request: &KeyboardRequest) -> Result<(), String> {
     let KeyboardRequest::PressSeq { keys, interval_ms } = request else {
         return Ok(());
@@ -284,8 +312,7 @@ pub fn validate_keyboard_request(request: &KeyboardRequest) -> Result<(), String
             PRESS_SEQ_MIN_INTERVAL_MS
         ));
     }
-    // The gaps, not the keys: n keys have n-1 intervals between them.
-    let worst = (keys.len() as u64).saturating_sub(1).saturating_mul(interval);
+    let worst = press_seq_hold_ms(keys, *interval_ms);
     if worst > PRESS_SEQ_MAX_MS {
         return Err(format!(
             "{} keys {}ms apart would hold the session for {}s, and the sequence holds it \
@@ -1016,10 +1043,30 @@ mod qa_0_7_22_validation_tests {
             "below the minimum gap the app cannot tell presses apart"
         );
 
-        // The cap is on the gaps, not the keys: n keys have n-1 of them.
-        let exact = PRESS_SEQ_MAX_MS / 100 + 1;
+        // The cap is on the whole hold, not the gaps alone. Bounding the
+        // gaps let 6001 keys 5ms apart through, and the daemon then held
+        // the session - and with it screenshots, disconnect and the
+        // reconnect loop - for seven and a half minutes.
+        let per_key = PRESS_HOLD_MS + 2 * PRESS_KEY_GAP_MS;
+        let exact = (PRESS_SEQ_MAX_MS + 100) / (100 + per_key);
         assert!(validate_keyboard_request(&seq(exact as usize, Some(100))).is_ok());
         assert!(validate_keyboard_request(&seq(exact as usize + 1, Some(100))).is_err());
+
+        // The case bounding the gaps alone admitted.
+        let many = validate_keyboard_request(&seq(6001, Some(PRESS_SEQ_MIN_INTERVAL_MS)))
+            .expect_err("6001 keys at the minimum interval");
+        assert!(many.contains("holds it throughout"), "says why: {many}");
+
+        // A combination costs more than a single key, and the bound knows
+        // it: the same count of chords does not fit where plain keys do.
+        let chords = KeyboardRequest::PressSeq {
+            keys: vec!["ctrl+shift+alt+c".to_string(); exact as usize],
+            interval_ms: Some(100),
+        };
+        assert!(
+            validate_keyboard_request(&chords).is_err(),
+            "four-key chords hold the session longer than single keys"
+        );
     }
 
     /// Everything else is unaffected - the validator is only about

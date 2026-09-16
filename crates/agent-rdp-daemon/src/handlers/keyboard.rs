@@ -243,18 +243,47 @@ async fn press_combination(
     rdp: &RdpSession,
     key_infos: &[KeyInfo],
 ) -> Result<(), crate::rdp_session::RdpError> {
+    // How many key-downs actually reached the transport. A modifier that
+    // went down and never came up stays logically held on the remote
+    // desktop, turning every later keystroke from any caller into a chord -
+    // so a failure part-way through releases what it pressed before it
+    // reports. Now that input is acknowledged, this failure is visible for
+    // the first time, which is also what makes leaving it unhandled a real
+    // defect rather than a theoretical one.
+    let mut down = 0usize;
+    let mut first_error = None;
     for info in key_infos {
-        rdp.send_input(vec![create_key_event_ext(info.scancode, info.extended, false)])
-            .await?;
+        if let Err(e) = rdp
+            .send_input(vec![create_key_event_ext(info.scancode, info.extended, false)])
+            .await
+        {
+            first_error = Some(e);
+            break;
+        }
+        down += 1;
         sleep(Duration::from_millis(10)).await;
     }
-    sleep(Duration::from_millis(50)).await;
-    for info in key_infos.iter().rev() {
-        rdp.send_input(vec![create_key_event_ext(info.scancode, info.extended, true)])
-            .await?;
+    if first_error.is_none() {
+        sleep(Duration::from_millis(50)).await;
+    }
+    // Best effort, in reverse order, for exactly the keys that went down.
+    // A release that fails too is not worth reporting over the first error:
+    // the transport is gone either way, and so is the remote key state.
+    for info in key_infos[..down].iter().rev() {
+        if let Err(e) = rdp
+            .send_input(vec![create_key_event_ext(info.scancode, info.extended, true)])
+            .await
+        {
+            if first_error.is_none() {
+                first_error = Some(e);
+            }
+        }
         sleep(Duration::from_millis(10)).await;
     }
-    Ok(())
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn create_key_event_ext(scancode: u8, extended: bool, release: bool) -> FastPathInputEvent {
@@ -270,6 +299,32 @@ fn create_key_event_ext(scancode: u8, extended: bool, release: bool) -> FastPath
 
 #[cfg(test)]
 mod tests {
+    /// A key-down that lands and a key-up that does not leaves the modifier
+    /// held on the remote desktop, turning every later keystroke from any
+    /// caller into a chord. Acknowledging input is what made this failure
+    /// visible; handling it is what makes the acknowledgement safe.
+    #[test]
+    fn a_failed_combination_releases_what_it_pressed() {
+        let source = crate::automation::lf(include_str!("keyboard.rs"));
+        let at = source.find("async fn press_combination(").expect("press_combination");
+        let body = &source[at..];
+        let end = body.find("\nfn create_key_event_ext(").expect("the next item");
+        let body = &body[..end];
+
+        assert!(
+            !body.contains("false)])\n            .await?;"),
+            "a key-down failure must not skip the releases"
+        );
+        assert!(
+            body.contains("key_infos[..down].iter().rev()"),
+            "release exactly the keys that went down, in reverse"
+        );
+        assert!(
+            body.contains("first_error"),
+            "and still report the failure that started it"
+        );
+    }
+
     use super::*;
 
     #[test]

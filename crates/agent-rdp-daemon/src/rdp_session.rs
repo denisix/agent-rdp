@@ -1100,16 +1100,25 @@ impl RdpSession {
         // an unrelated BMP character - the agent saw success and wrong text.
         let units: Vec<u16> = text.encode_utf16().collect();
         let mut first = true;
+        let mut sent = 0usize;
 
         // One budget for the whole call, not one per batch. A 4000-character
         // string is 63 batches, and a per-batch timeout would let this
         // outlive every timeout layer above it before reporting anything.
-        let deadline = std::time::Instant::now() + INPUT_SEND_TIMEOUT;
+        //
+        // The budget covers the *sends*, not the caller's own pacing: a
+        // `--delay-ms 500` over 2000 characters asks for 16s of deliberate
+        // sleeping, and charging that to a 15s transport budget failed the
+        // call half-typed into a live application with nothing wrong at the
+        // transport at all. Each slept interval therefore pushes the
+        // deadline out by exactly what it slept.
+        let mut deadline = std::time::Instant::now() + INPUT_SEND_TIMEOUT;
 
         for chunk in units.chunks(UNITS_PER_BATCH) {
             if !first {
                 if let Some(ms) = delay_ms {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
+                    deadline += Duration::from_millis(ms);
                 }
             }
             first = false;
@@ -1119,11 +1128,12 @@ impl RdpSession {
                 return Err(RdpError::Unresponsive(format!(
                     "typing did not finish within {}s; {} of {} code units were sent",
                     INPUT_SEND_TIMEOUT.as_secs(),
-                    units.len() - chunk.len(),
+                    sent,
                     units.len()
                 )));
             }
             self.send_input_within(unicode_key_events(chunk), remaining).await?;
+            sent += chunk.len();
         }
 
         Ok(())
@@ -2256,6 +2266,41 @@ mod tests {
 mod liveness_tests {
     use super::*;
     use std::time::Duration;
+
+    /// `send_text` needs a live session, so this reads the source. The
+    /// budget must cover the *sends*, not the caller's own pacing: a
+    /// `--delay-ms 500` over 2000 characters asks for 16s of deliberate
+    /// sleeping, and charging that to a 15s transport budget failed the call
+    /// half-typed into a live application with nothing wrong at all.
+    #[test]
+    fn the_typing_budget_is_not_spent_on_the_callers_own_delay() {
+        let source = crate::automation::lf(include_str!("rdp_session.rs"));
+        let at = source
+            .find("pub async fn send_text(")
+            .expect("send_text");
+        let body = &source[at..];
+        let end = body.find("\n    /// Set clipboard text").expect("the next item");
+        let body = &body[..end];
+
+        let slept = body.find("tokio::time::sleep(Duration::from_millis(ms))").expect("the pacing sleep");
+        assert!(
+            body[slept..].contains("deadline += Duration::from_millis(ms)"),
+            "every slept interval has to push the deadline out by what it slept"
+        );
+        assert!(
+            body.contains("let mut deadline"),
+            "which means the deadline cannot be fixed"
+        );
+        // And the progress report has to count what was sent, not what was
+        // about to be: `units.len() - chunk.len()` reported 3936 of 4000
+        // when 128 had landed - the number a caller uses to decide whether
+        // retrying is safe.
+        assert!(
+            !body.contains("units.len() - chunk.len()"),
+            "the unsent batch is not a measure of progress"
+        );
+        assert!(body.contains("sent += chunk.len()"), "count the sends");
+    }
 
     fn shared_state() -> Arc<RwLock<SharedState>> {
         Arc::new(RwLock::new(SharedState {

@@ -113,6 +113,13 @@ pub struct AutoReconnect {
     pub short_sessions: u32,
     /// When the last reconnect succeeded, to judge the next outage against.
     pub last_success: Option<SystemTime>,
+    /// An attempt is running right now.
+    ///
+    /// A `connect` can take minutes (the automation bootstrap), and the
+    /// frame processor of a session that dies during one sends its own drop
+    /// event. Without this, that event spawns a second loop which races the
+    /// first for the session slot.
+    pub in_flight: bool,
 }
 
 impl Default for AutoReconnect {
@@ -128,6 +135,7 @@ impl Default for AutoReconnect {
             stopped_reason: None,
             short_sessions: 0,
             last_success: None,
+            in_flight: false,
         }
     }
 }
@@ -160,6 +168,15 @@ impl AutoReconnect {
     pub fn stop(&mut self, why: String) {
         self.next_attempt_at = None;
         self.stopped_reason = Some(why);
+    }
+
+    /// The loop is no longer going to act. Clears the schedule it published.
+    ///
+    /// Without this, `session info` keeps reporting a "next attempt" that is
+    /// in the past and will never happen, which reads as "still trying".
+    pub fn stand_down(&mut self) {
+        self.next_attempt_at = None;
+        self.in_flight = false;
     }
 
     /// Note a new outage and say whether reconnecting is still worth it.
@@ -207,6 +224,9 @@ impl AutoReconnect {
         self.next_attempt_at = None;
         self.outage_began = None;
         self.attempts = 0;
+        // Deliberately not `in_flight`: an attempt that is mid-`connect`
+        // clears it itself, and lying about it here would let a drop event
+        // arriving during that attempt start a second loop.
     }
 
     /// What `session info` reports.
@@ -314,6 +334,62 @@ mod tests {
         let mut s = armed();
         s.in_flight = true;
         assert!(should_attempt(&s).is_err());
+    }
+
+    /// The guard above is only worth anything if the loop actually sets the
+    /// flag it reads. It was passed a hardcoded `false` at both snapshot
+    /// sites, so the test above proved nothing about production.
+    #[test]
+    fn the_loop_wires_in_flight_to_real_state() {
+        let source = crate::automation::lf(include_str!("daemon.rs"));
+        let at = source.find("async fn reconnect_loop(").expect("the loop");
+        let body = &source[at..];
+        let end = body.find("\n/// Process a single request").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            !body.contains("in_flight: false"),
+            "the snapshot must read the flag, not assume it"
+        );
+        assert!(
+            body.contains("in_flight = true"),
+            "and the attempt must set it"
+        );
+    }
+
+    /// The defect that made the whole feature one-shot. `connect::handle`
+    /// bumps the session generation before it does anything else, so after
+    /// our own failed attempt the counter is one ahead of the outage's - and
+    /// comparing the original value against it concluded we had been
+    /// superseded by ourselves, ending the loop for the night.
+    #[test]
+    fn the_loop_rebaselines_the_generation_after_its_own_attempt() {
+        let source = crate::automation::lf(include_str!("daemon.rs"));
+        let at = source.find("async fn reconnect_loop(").expect("the loop");
+        let body = &source[at..];
+        let end = body.find("\n/// Process a single request").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("let mut dropped_generation = dropped_generation;"),
+            "the baseline has to be able to move"
+        );
+        let handle_at = body.find("handlers::connect::handle(").expect("the connect call");
+        assert!(
+            body[handle_at..].contains("dropped_generation = ctx"),
+            "and it has to move after the attempt, not before"
+        );
+    }
+
+    /// A loop that has decided not to act must not leave a "next attempt"
+    /// behind it. `session info` reads that field, and one stuck in the past
+    /// reads as "still trying" forever.
+    #[test]
+    fn giving_up_clears_the_published_schedule() {
+        let mut auto = AutoReconnect::default();
+        auto.next_attempt_at = Some(SystemTime::now() + Duration::from_secs(30));
+        auto.in_flight = true;
+        auto.stand_down();
+        assert!(auto.next_attempt_at.is_none());
+        assert!(!auto.in_flight);
     }
 
     /// Long enough to ride out a laptop waking up, short enough that an

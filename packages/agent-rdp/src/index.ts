@@ -102,6 +102,24 @@ const DAEMON_SLACK_MS = 30_000;
 const PRESS_SEQ_MAX_MS = 30_000;
 const PRESS_SEQ_MIN_INTERVAL_MS = 5;
 const DEFAULT_PRESS_SEQ_INTERVAL_MS = 40;
+const PRESS_KEY_GAP_MS = 10;
+const PRESS_HOLD_MS = 50;
+
+/**
+ * How long a sequence holds the session. Mirrors
+ * `agent_rdp_protocol::press_seq_hold_ms`: the gaps are the smaller half,
+ * since each combination also costs a hold plus a gap per key-down and
+ * key-up.
+ */
+function pressSeqHoldMs(keys: string[], intervalMs?: number): number {
+  const interval = intervalMs ?? DEFAULT_PRESS_SEQ_INTERVAL_MS;
+  const gaps = Math.max(0, keys.length - 1) * interval;
+  const presses = keys.reduce((total, combo) => {
+    const parts = Math.max(1, combo.split('+').filter((p) => p.length > 0).length);
+    return total + PRESS_HOLD_MS + 2 * parts * PRESS_KEY_GAP_MS;
+  }, 0);
+  return gaps + presses;
+}
 
 /** Socket timeout for one request: the base, extended per command. */
 export function requestTimeout(request: Request, base: number): number {
@@ -150,9 +168,7 @@ export function requestTimeout(request: Request, base: number): number {
         delay_ms?: number;
       };
       if (kb.action === 'press_seq') {
-        const count = kb.keys?.length ?? 0;
-        const interval = kb.interval_ms ?? DEFAULT_PRESS_SEQ_INTERVAL_MS;
-        return base + Math.max(0, count - 1) * interval + count * 120;
+        return base + pressSeqHoldMs(kb.keys ?? [], kb.interval_ms);
       }
       if (kb.action === 'type' && kb.delay_ms) {
         const batches = Math.ceil([...(kb.text ?? '')].length / 64);
@@ -267,7 +283,7 @@ export class KeyboardController {
     if (interval < PRESS_SEQ_MIN_INTERVAL_MS) {
       throw new Error(`interval_ms must be at least ${PRESS_SEQ_MIN_INTERVAL_MS}ms`);
     }
-    const span = (keys.length - 1) * interval;
+    const span = pressSeqHoldMs(keys, options.intervalMs);
     if (span > PRESS_SEQ_MAX_MS) {
       throw new Error(
         `that sequence would hold the session for ${span}ms; the limit is ${PRESS_SEQ_MAX_MS}ms`,

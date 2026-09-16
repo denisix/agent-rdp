@@ -1060,6 +1060,18 @@ pub fn lf(text: &str) -> String {
 }
 
 /// Embedded PowerShell agent script (main entry point).
+/// Whether a line echoed back in a PowerShell error came from the scripts
+/// we deploy, rather than from the remote command itself.
+///
+/// The command is delivered as one `-EncodedCommand` script, so PowerShell's
+/// position echo frequently shows our wrapper. Matching against the whole of
+/// `actions.ps1` rather than the wrapper heredocs alone is deliberate: every
+/// line of it is ours either way, and pulling the heredocs apart here would
+/// be one more thing to keep in step with the script.
+pub fn wrapper_contains(needle: &str) -> bool {
+    LIB_ACTIONS.contains(needle)
+}
+
 const AGENT_SCRIPT: &str = include_str!("scripts/agent.ps1");
 
 /// Embedded PowerShell library files.
@@ -2049,6 +2061,17 @@ mod tests {
 
         // And the reply says what happened rather than always succeeding.
         assert!(actions.contains("focused = $focused; verified = $true"));
+        // Including when both attempts threw. A hardcoded $true here is the
+        // precise defect the rewrite exists to remove, so it must not come
+        // back in the branch that replaced it.
+        assert!(
+            actions.contains("success = ($attempted -or $focused)"),
+            "nothing attempted is not a success"
+        );
+        assert!(
+            actions.contains("if (-not $attempted) { $method = \"none\" }"),
+            "and the method must not claim uia when uia refused"
+        );
         assert!(!actions.contains("$window.SetFocus()\n            return @{ action = \"focus\"; success = $true }"));
     }
 

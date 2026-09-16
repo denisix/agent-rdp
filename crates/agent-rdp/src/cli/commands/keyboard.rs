@@ -15,10 +15,11 @@ use crate::session_manager::SessionManager;
 pub fn budget_ms(action: &KeyboardAction) -> u64 {
     match action {
         KeyboardAction::Send { keys, interval_ms } => {
-            let count = keys.split_whitespace().count() as u64;
-            let interval = interval_ms.unwrap_or(agent_rdp_protocol::DEFAULT_PRESS_SEQ_INTERVAL_MS);
-            // Gaps, plus the per-key down/up sleeps the handler applies.
-            count.saturating_sub(1).saturating_mul(interval) + count.saturating_mul(120)
+            // The protocol owns this arithmetic, so the watchdog cannot come
+            // to a different conclusion than the validator that admitted the
+            // sequence in the first place.
+            let parsed: Vec<String> = keys.split_whitespace().map(str::to_string).collect();
+            agent_rdp_protocol::press_seq_hold_ms(&parsed, *interval_ms)
         }
         KeyboardAction::Type { text, delay } => {
             let batches = (text.encode_utf16().count() as u64).div_ceil(64);

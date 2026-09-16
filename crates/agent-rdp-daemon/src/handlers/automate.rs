@@ -340,7 +340,7 @@ fn offline_status(state: &crate::automation::AutomationState) -> Response {
             "automation agent not ready (it never completed its handshake this session)".to_string(),
         ),
     };
-    Response::success(ResponseData::AutomationStatus(AutomationStatus {
+    let mut status = AutomationStatus {
         agent_running: false,
         agent_pid: None,
         capabilities: Vec::new(),
@@ -354,7 +354,7 @@ fn offline_status(state: &crate::automation::AutomationState) -> Response {
             .as_ref()
             .map(|ipc| ipc.consecutive_failures())
             .unwrap_or(0),
-        last_error,
+        last_error: None,
         next_retry_secs: state.next_retry_secs(std::time::Instant::now()),
         total_launches: state.total_launches,
         adopted: state.adopted,
@@ -376,13 +376,27 @@ fn offline_status(state: &crate::automation::AutomationState) -> Response {
         wedged: state.wedge_declared,
         wedge_strikes: state.wedge_strikes,
         wedge_detections: state.wedge_detections,
+        // Filled from `state` below, along with everything else the daemon
+        // knows. Zeroing them here made `automate status` answer "no failed
+        // launches, no survivor outcome" at the one moment those are the
+        // questions being asked - while the agent is down.
         launches_without_handshake: 0,
         launches_abandoned: 0,
         agent_pid_history: Vec::new(),
         survivor_outcome: None,
         last_spawn_ms: None,
         last_spawn_request_ms: None,
-    }))
+    };
+    fill_daemon_fields(&mut status, state);
+    // `fill_daemon_fields` reads these from the DVC state, which is exactly
+    // what is absent here; the explanation is `last_error`.
+    status.agent_instance_id = None;
+    status.agent_started_unix = None;
+    // And it copies `state.last_error` verbatim, which would undo the
+    // reasoning above: while a launch is running, "a launch is in progress"
+    // is the current fact and the stale failure that preceded it is not.
+    status.last_error = last_error;
+    Response::success(ResponseData::AutomationStatus(status))
 }
 
 /// The status fields only the daemon knows: relaunch count, the last
@@ -1355,7 +1369,7 @@ fn parse_run_response(data: serde_json::Value) -> anyhow::Result<RunResult> {
     let stderr = data["stderr"]
         .as_str()
         .map(clean_clixml)
-        .map(|s| tidy_powershell_stderr(&s));
+        .map(|s| tidy_powershell_stderr(&s, data["command_line"].as_str()));
     let pid = data["pid"].as_u64().map(|v| v as u32);
     let replayed = data["replayed"].as_bool().unwrap_or(false);
     let early_exit = data["early_exit"].as_bool().unwrap_or(false);
@@ -1429,18 +1443,26 @@ pub const RAW_STDERR_KILL_SWITCH: &str = "AGENT_RDP_RAW_STDERR";
 /// kilobytes of it per harmless error, which anything parsing stderr has to
 /// wade through.
 ///
-/// Deliberately conservative. The two decoration lines are always
-/// recognisable and always go. The position block only goes when it is
-/// clearly one: an `At line:N char:M` header followed by `+`-prefixed lines
-/// including a squiggle. Everything else is left exactly as it was, and what
-/// was removed is announced rather than silently dropped - the wrapper's own
-/// `ERROR:` diagnostic, in particular, is the deliberate one and must
-/// survive.
-pub fn tidy_powershell_stderr(stderr: &str) -> String {
+/// Deliberately conservative, in two ways. The two decoration lines are
+/// always recognisable and always go. The position block goes only when it
+/// is clearly one: an `At line:N char:M` header, `+`-prefixed lines
+/// including a squiggle, *and* an echoed source line that belongs to the
+/// command we sent or to the wrapper we wrapped it in. The squiggle alone is
+/// not enough - a remote tool that prints PowerShell diagnostics of its own
+/// would have had them deleted.
+///
+/// Everything else is left exactly as it was, and what was removed is
+/// announced rather than silently dropped - the wrapper's own `ERROR:`
+/// diagnostic, in particular, is the deliberate one and must survive. Line
+/// endings are preserved: a stderr that arrived CRLF leaves CRLF, so a
+/// byte-exact comparison downstream does not break the first time an error
+/// is tidied.
+pub fn tidy_powershell_stderr(stderr: &str, command_line: Option<&str>) -> String {
     if std::env::var(RAW_STDERR_KILL_SWITCH).is_ok_and(|v| v == "1") {
         return stderr.to_string();
     }
 
+    let newline = if stderr.contains("\r\n") { "\r\n" } else { "\n" };
     let lines: Vec<&str> = stderr.lines().collect();
     let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
     let mut removed = 0usize;
@@ -1466,6 +1488,7 @@ pub fn tidy_powershell_stderr(stderr: &str) -> String {
         if is_position_header(trimmed) {
             let mut end = i + 1;
             let mut squiggle = false;
+            let mut ours = false;
             while end < lines.len() {
                 let candidate = lines[end].trim_start();
                 if !candidate.starts_with('+') {
@@ -1474,10 +1497,12 @@ pub fn tidy_powershell_stderr(stderr: &str) -> String {
                 let content = candidate.trim_start_matches('+').trim();
                 if !content.is_empty() && content.chars().all(|c| c == '~') {
                     squiggle = true;
+                } else if is_echo_of_ours(content, command_line) {
+                    ours = true;
                 }
                 end += 1;
             }
-            if squiggle {
+            if squiggle && ours {
                 removed += end - i;
                 i = end;
                 continue;
@@ -1491,9 +1516,15 @@ pub fn tidy_powershell_stderr(stderr: &str) -> String {
     if removed == 0 {
         return stderr.to_string();
     }
-    let mut out = kept.join("\n");
+    // Whitespace-only remains are no remains: a stderr that was pure
+    // decoration must come back empty, or a caller testing `stderr.is_empty()`
+    // sees our own note and reports an error that never happened.
+    if kept.iter().all(|l| l.trim().is_empty()) {
+        return String::new();
+    }
+    let mut out = kept.join(newline);
     if !out.is_empty() {
-        out.push('\n');
+        out.push_str(newline);
     }
     // Say what was taken away. Deleting evidence silently is the one thing
     // this must not do.
@@ -1503,6 +1534,28 @@ pub fn tidy_powershell_stderr(stderr: &str) -> String {
         removed, RAW_STDERR_KILL_SWITCH
     ));
     out
+}
+
+/// Whether an echoed source line came from what we sent, rather than from
+/// something the remote command printed itself.
+///
+/// The echo is the *user's* line, so the wrapper markers are no anchor. A
+/// short fragment would match almost anything, hence the length floor.
+fn is_echo_of_ours(content: &str, command_line: Option<&str>) -> bool {
+    const MIN_MATCH: usize = 8;
+    let needle = content.trim();
+    if needle.len() < MIN_MATCH {
+        // Too short to attribute either way. The squiggle and the header
+        // already say this is a rendered position block, and a fragment this
+        // small carries no information a caller would miss.
+        return true;
+    }
+    if command_line.is_some_and(|cmd| cmd.contains(needle)) {
+        return true;
+    }
+    // The command is delivered as one `-EncodedCommand` script, so the echo
+    // often shows our wrapper rather than the user's command.
+    crate::automation::wrapper_contains(needle)
 }
 
 /// `At line:12 char:1`, or `At C:\path\x.ps1:12 char:1`.
@@ -1819,6 +1872,29 @@ mod status_and_run_field_tests {
         assert_eq!(status.last_error.as_deref(), Some("handshake timed out"));
         let secs = status.next_retry_secs.unwrap();
         assert!((85..=90).contains(&secs), "{}", secs);
+    }
+
+    /// The counters were hardcoded to zero on this path, which silenced
+    /// them at the one moment they answer the question being asked: the
+    /// agent is down, and "how many launches produced no agent?" and "why
+    /// was no survivor adopted?" are what the operator wants to know.
+    #[test]
+    fn offline_status_still_reports_the_launch_accounting() {
+        let mut state = fresh_state();
+        state.enabled = true;
+        state.launches_without_handshake = 3;
+        state.launches_abandoned = 1;
+        state.survivor_outcome = Some("window expired");
+        state.note_agent_pid(4321);
+        state.last_spawn_ms = Some(812);
+
+        let status = status_of(offline_status(&state));
+        assert_eq!(status.launches_without_handshake, 3);
+        assert_eq!(status.launches_abandoned, 1);
+        assert_eq!(status.survivor_outcome.as_deref(), Some("window expired"));
+        assert_eq!(status.agent_pid_history, vec![4321]);
+        assert_eq!(status.last_spawn_ms, Some(812));
+        assert!(!status.agent_running, "still offline, for all that");
     }
 
     #[test]
@@ -2316,7 +2392,10 @@ mod stderr_tidy_tests {
                    + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n\
                        + CategoryInfo          : NotSpecified: (:) [Write-Error]\n\
                        + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException\n";
-        let tidy = tidy_powershell_stderr(raw);
+        let tidy = tidy_powershell_stderr(
+            raw,
+            Some("Write-Error \"ERR-TEST\" -ErrorAction Continue"),
+        );
 
         assert!(tidy.contains("OUT"), "output survives");
         assert!(tidy.contains("ERR-TEST"), "the message itself survives");
@@ -2336,7 +2415,7 @@ mod stderr_tidy_tests {
                      caused by System.Exception: inner\n\
                      details: something\n\
                    At C:\\script.ps1:4 char:2\n";
-        let tidy = tidy_powershell_stderr(raw);
+        let tidy = tidy_powershell_stderr(raw, None);
         assert_eq!(tidy, raw, "no squiggle run, so nothing is decoration");
     }
 
@@ -2349,8 +2428,45 @@ mod stderr_tidy_tests {
             "At the shop I bought milk\n",
             "",
         ] {
-            assert_eq!(tidy_powershell_stderr(raw), raw, "left alone: {raw:?}");
+            assert_eq!(tidy_powershell_stderr(raw, None), raw, "left alone: {raw:?}");
         }
+    }
+
+    /// The guard the design called for and the first implementation left
+    /// out. A remote tool that prints PowerShell diagnostics of its own is
+    /// producing *output*, not decoration, and deleting it is exactly the
+    /// damage a filter like this is expected to do.
+    #[test]
+    fn someone_elses_position_block_is_output_not_decoration() {
+        let raw = "At line:3 char:5\n\
+                   + Invoke-TheirThing -Whatever 'value they chose'\n\
+                   + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n";
+        assert_eq!(
+            tidy_powershell_stderr(raw, Some("Get-Process | Out-String")),
+            raw,
+            "the echo matches neither our command nor our wrapper"
+        );
+    }
+
+    /// Stderr that was nothing but decoration must come back empty. A
+    /// caller testing `stderr.is_empty()` would otherwise see our own note
+    /// and report a failure that did not happen.
+    #[test]
+    fn stderr_that_was_all_decoration_comes_back_empty() {
+        let raw = "    + CategoryInfo          : NotSpecified: (:) [Write-Error]\n\
+                       + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException\n";
+        assert_eq!(tidy_powershell_stderr(raw, None), "");
+    }
+
+    /// Windows sends CRLF. Silently rewriting it to LF the first time an
+    /// error is tidied breaks any byte-exact comparison downstream.
+    #[test]
+    fn crlf_survives_the_filter() {
+        let raw = "OUT\r\n\
+                   + CategoryInfo          : NotSpecified: (:) [Write-Error]\r\n";
+        let tidy = tidy_powershell_stderr(raw, None);
+        assert!(tidy.starts_with("OUT\r\n"), "line endings preserved: {tidy:?}");
+        assert!(!tidy.contains("CategoryInfo"));
     }
 
     /// A poll consumes what it returns, so a decoration block split across

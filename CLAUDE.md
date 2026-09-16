@@ -166,15 +166,21 @@ background agent), restores if iconic, raises, and detaches in a `finally`.
 Verification compares `GetAncestor(GA_ROOT)` of the foreground window against
 the target's, because UIA legitimately focuses a *child* element and bare
 handle equality would call a real success a failure. The reply carries
-`focused`, `verified` and `method`; `success` keeps its old meaning,
-"attempted without throwing", since an element with no window handle can only
+`focused`, `verified` and `method`; `success` is `$attempted -or $focused`,
+keeping its old meaning of "attempted without throwing" - it must not go back
+to a hardcoded `$true`, which is what reported a focus failure as success in
+the first place, since an element with no window handle can only
 be attempted.
 
 **The launch counters reconcile.** `total_launches = our_changes +
 launches_without_handshake + launches_abandoned`, pinned by
 `the_launch_counters_reconcile`. One counter could not close the gap:
 abandoned launches are exactly the ones `finish_launch` records nothing for.
-`agent_pid_history` is capped and deduplicated, because one
+`offline_status` goes through `fill_daemon_fields` like every other
+path - hand-building the struct zeroed the new counters exactly while the
+agent was down, which is when they are asked for - and then restores its own
+`last_error`, since "a launch is in progress" outranks the failure that
+preceded it. `agent_pid_history` is capped and deduplicated, because one
 `previous_agent_pid` cannot describe three pids over a ten-hour run, and
 `survivor_outcome` distinguishes never-seen / window-expired / evicted-for-
 stale-build / session-gone, which call for different actions.
@@ -185,7 +191,12 @@ decoration, not the wrapper markers - the position echo shows the *user's*
 line. `+ CategoryInfo` and `+ FullyQualifiedErrorId` always go; an
 `At line:N char:M` block goes only when it contains a squiggle-only line *and*
 its echoed source matches the run's own `command_line` or the embedded
-wrapper. The wrapper's deliberate `ERROR:`-prefixed blob is preserved,
+wrapper (`automation::wrapper_contains`). The squiggle alone is not enough: a
+remote tool printing PowerShell diagnostics of its own is producing output,
+and deleting it is the damage this filter is most likely to do. Line endings
+are preserved, and stderr that was nothing but decoration comes back empty
+rather than as a bare removal notice. The wrapper's deliberate
+`ERROR:`-prefixed blob is preserved,
 removals are announced with a count, `run-poll` chunks are never touched, and
 `AGENT_RDP_RAW_STDERR=1` opts out.
 

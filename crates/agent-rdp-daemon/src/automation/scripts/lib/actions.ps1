@@ -538,7 +538,11 @@ function Invoke-Window {
             if (-not $focused) {
                 try {
                     [void][AgentDesktop]::Focus($hwnd)
+                    # Read $attempted before setting it: it still means "UIA
+                    # got as far as trying", which is what decides whether
+                    # this was a fallback or the only attempt.
                     $method = if ($attempted) { "uia+win32" } else { "win32" }
+                    $attempted = $true
                 } catch {
                     Write-Log "Win32 focus fallback failed: $($_.Exception.Message)" "WARN"
                 }
@@ -550,8 +554,13 @@ function Invoke-Window {
                 }
             }
 
+            if (-not $attempted) { $method = "none" }
+            # `success` means "something was attempted without throwing".
+            # Hardcoding $true here is the exact defect this rewrite exists
+            # to fix, so it must not creep back: if UIA refused the element
+            # and the Win32 fallback threw too, nothing was attempted.
             return @{
-                action = "focus"; success = $true
+                action = "focus"; success = ($attempted -or $focused)
                 focused = $focused; verified = $true; method = $method
             }
         }
