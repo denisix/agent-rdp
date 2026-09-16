@@ -153,6 +153,10 @@ impl AutoReconnect {
         self.last_success = None;
         self.outage_began = None;
         self.next_attempt_at = None;
+        // A connect that got this far means no attempt is meaningfully in
+        // flight any more, and this is the one place that can unwedge the
+        // flag if a task holding it ever died without clearing it.
+        self.in_flight = false;
     }
 
     /// The retained request, for an attempt.
@@ -174,9 +178,14 @@ impl AutoReconnect {
     ///
     /// Without this, `session info` keeps reporting a "next attempt" that is
     /// in the past and will never happen, which reads as "still trying".
+    ///
+    /// Deliberately does **not** touch `in_flight`: an attempt clears its
+    /// own flag when it finishes, and a second loop standing down *because*
+    /// one is already running would otherwise clear the running one's, which
+    /// is the opposite of what it was checking for. Callers must not call
+    /// this when the reason they are standing down is that flag.
     pub fn stand_down(&mut self) {
         self.next_attempt_at = None;
-        self.in_flight = false;
     }
 
     /// Note a new outage and say whether reconnecting is still worth it.
@@ -389,7 +398,10 @@ mod tests {
         auto.in_flight = true;
         auto.stand_down();
         assert!(auto.next_attempt_at.is_none());
-        assert!(!auto.in_flight);
+        assert!(
+            auto.in_flight,
+            "an attempt owns its own flag; standing down must not clear someone else's"
+        );
     }
 
     /// Long enough to ride out a laptop waking up, short enough that an

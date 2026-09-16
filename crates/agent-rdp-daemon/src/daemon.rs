@@ -639,7 +639,11 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
 
         if let Err(why) = crate::reconnect::should_attempt(&snapshot) {
             info!("Not reconnecting: {}", why);
-            ctx.auto_reconnect.lock().await.stand_down();
+            // Not when the reason is that another attempt is running: that
+            // one published the schedule and still owns it.
+            if !snapshot.in_flight {
+                ctx.auto_reconnect.lock().await.stand_down();
+            }
             return;
         }
         let Some(request) = request else {
@@ -672,8 +676,11 @@ async fn reconnect_loop(ctx: ReconnectContext, dropped_generation: u64, serial_a
             };
             if let Err(why) = crate::reconnect::should_attempt(&now) {
                 info!("Abandoning the reconnect: {}", why);
+                let in_flight = now.in_flight;
                 drop(auto);
-                ctx.auto_reconnect.lock().await.stand_down();
+                if !in_flight {
+                    ctx.auto_reconnect.lock().await.stand_down();
+                }
                 return;
             }
         }
